@@ -3,12 +3,13 @@ FROM ubuntu:20.04
 # Install common dependencies
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get -y update && \
-    apt-get -y install sudo \ 
+    apt-get -y install sudo \
     apt-utils \
     build-essential \
     openssl \
     clang \
     graphviz-dev \
+    libcap-dev \
     git \
     autoconf \
     libgnutls28-dev \
@@ -39,8 +40,9 @@ WORKDIR /home/ubuntu
 ARG MAKE_OPT
 
 # Set up fuzzers
-RUN git clone https://github.com/profuzzbench/aflnet.git && \
+RUN git clone https://github.com/FandangoGen/afl-driver.git aflnet && \
     cd aflnet && \
+    git checkout 96032f86d0005dfeeb41ea7b31103f1d1ff8f168 && \
     make clean all $MAKE_OPT && \
     cd llvm_mode && make $MAKE_OPT
 
