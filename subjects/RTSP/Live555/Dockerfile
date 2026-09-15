@@ -40,7 +40,7 @@ WORKDIR /home/ubuntu
 ARG MAKE_OPT
 
 # Set up fuzzers
-RUN git clone https://github.com/FandangoGen/afl-driver.git aflnet && \
+RUN git clone https://github.com/aflnet/aflnet.git && \
     cd aflnet && \
     git checkout 96032f86d0005dfeeb41ea7b31103f1d1ff8f168 && \
     make clean all $MAKE_OPT && \
@@ -50,6 +50,12 @@ RUN git clone https://github.com/profuzzbench/aflnwe.git && \
     cd aflnwe && \
     make clean all $MAKE_OPT && \
     cd llvm_mode && make $MAKE_OPT
+
+# Python 3.11 for Fandango
+RUN wget -qO- https://astral.sh/uv/install.sh | sh && \
+    /home/ubuntu/.local/bin/uv python install 3.11 && \
+    /home/ubuntu/.local/bin/uv venv --python 3.11 /home/ubuntu/fandango && \
+    /home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/fandango/bin/python "fandango-fuzzer @ git+https://github.com/fandango-fuzzer/fandango.git@90e7a744c4e176f51d74ecf1350b44cb2ba54911" faker
 
 # Set up environment variables for AFLNet
 ENV WORKDIR="/home/ubuntu/experiments"
@@ -95,8 +101,22 @@ RUN cd $WORKDIR && \
 RUN cd ${WORKDIR}/live555-cov/testProgs && \
     cp ${AFLNET}/tutorials/live555/sample_media_sources/*.* ./
 
+# Compile Live555 for the Fandango driver. \
+# Use AFL instrumentation without the response code changes of fuzzing.patch
+RUN cd $WORKDIR && \
+    git clone https://github.com/rgaufman/live555.git live555-fandango && \
+    cd live555-fandango && \
+    git checkout ceeb4f4 && \
+    patch -p1 < $WORKDIR/gcov.patch && \
+    ./genMakefiles linux && \
+    AFL_USE_ASAN=1 make C_COMPILER=afl-clang-fast CPLUSPLUS_COMPILER=afl-clang-fast++ LINK="afl-clang-fast++ -o" clean all $MAKE_OPT
+
+RUN cd ${WORKDIR}/live555-fandango/testProgs && \
+    cp ${AFLNET}/tutorials/live555/sample_media_sources/*.* ./
+
 COPY --chown=ubuntu:ubuntu kill-server.sh ${WORKDIR}/kill-server
 COPY --chown=ubuntu:ubuntu in-rtsp ${WORKDIR}/in-rtsp
+COPY --chown=ubuntu:ubuntu in-rtsp-replay ${WORKDIR}/in-rtsp-replay
 COPY --chown=ubuntu:ubuntu rtsp.dict ${WORKDIR}/rtsp.dict
 COPY --chown=ubuntu:ubuntu cov_script.sh ${WORKDIR}/cov_script
 COPY --chown=ubuntu:ubuntu run.sh ${WORKDIR}/run

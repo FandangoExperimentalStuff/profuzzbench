@@ -11,8 +11,8 @@ strstr() {
   return 0
 }
 
-#Commands for afl-based fuzzers (e.g., aflnet, aflnwe)
-if $(strstr $FUZZER "afl"); then
+#Commands for afl-based fuzzers (e.g., aflnet, aflnwe) and the fandango driver
+if $(strstr $FUZZER "afl") || [ $FUZZER == "fandango" ]; then
 
   TARGET_DIR=${TARGET_DIR:-"live555"}
   INPUTS=${WORKDIR}/in-rtsp
@@ -24,8 +24,14 @@ if $(strstr $FUZZER "afl"); then
 
   #Step-1. Do Fuzzing
   #Move to fuzzing folder
-  cd $WORKDIR/${TARGET_DIR}/testProgs
-  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/${FUZZER}/afl-fuzz -d -i ${INPUTS} -x ${WORKDIR}/rtsp.dict -o $OUTDIR -N tcp://127.0.0.1/8554 $OPTIONS ./testOnDemandRTSPServer 8554
+  if [ $FUZZER == "fandango" ]; then
+    TARGET_DIR="live555-fandango"
+    cd $WORKDIR/${TARGET_DIR}/testProgs
+    PYTHONPATH=/home/ubuntu/driver-src /home/ubuntu/fandango/bin/python -m driver --out $OUTDIR --endpoint tcp://127.0.0.1/8554 --budget $TIMEOUT $OPTIONS -- ./testOnDemandRTSPServer 8554
+  else
+    cd $WORKDIR/${TARGET_DIR}/testProgs
+    timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/${FUZZER}/afl-fuzz -d -i ${INPUTS} -x ${WORKDIR}/rtsp.dict -o $OUTDIR -N tcp://127.0.0.1/8554 $OPTIONS ./testOnDemandRTSPServer 8554
+  fi
 
   STATUS=$?
 
@@ -52,7 +58,7 @@ if $(strstr $FUZZER "afl"); then
 
   gcovr -r .. --html --html-details -o index.html
   mkdir ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_html/
-  cp *.html ${WORKDIR}/live555/testProgs/${OUTDIR}/cov_html/
+  cp *.html ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_html/
 
   #Step-3. Save the result to the ${WORKDIR} folder
   #Tar all results to a file
