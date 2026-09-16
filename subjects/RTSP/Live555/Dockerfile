@@ -30,7 +30,9 @@ RUN groupadd ubuntu && \
 
 RUN chmod 777 /tmp
 
-RUN pip3 install gcovr==4.2
+# lxml is pinned: gcovr 4.2 otherwise pulls lxml 6, which has no wheel for
+# Python 3.8 on arm64 and fails to build from source without libxml2-dev.
+RUN pip3 install gcovr==4.2 "lxml<5"
 
 # Use ubuntu as default username
 USER ubuntu
@@ -39,23 +41,27 @@ WORKDIR /home/ubuntu
 # Import environment variable to pass as parameter to make (e.g., to make parallel builds with -j)
 ARG MAKE_OPT
 
-# Set up fuzzers
+# Set up fuzzers.
+# AFL_NO_X86=1 skips the x86-only self test so the image also builds on arm64
+# hosts; the targets are instrumented with afl-clang-fast (llvm_mode) anyway.
 RUN git clone https://github.com/aflnet/aflnet.git && \
     cd aflnet && \
     git checkout 96032f86d0005dfeeb41ea7b31103f1d1ff8f168 && \
-    make clean all $MAKE_OPT && \
+    AFL_NO_X86=1 make clean all $MAKE_OPT && \
     cd llvm_mode && make $MAKE_OPT
 
 RUN git clone https://github.com/profuzzbench/aflnwe.git && \
     cd aflnwe && \
-    make clean all $MAKE_OPT && \
+    AFL_NO_X86=1 make clean all $MAKE_OPT && \
     cd llvm_mode && make $MAKE_OPT
 
-# Python 3.11 for Fandango
+# Python 3.11 for Fandango.
+# Branch feature/faster-parser of fandango-fuzzer/fandango, pinned to its head
+# commit 0bf9af8c. # TODO change to Fandango 1.3 when released
 RUN wget -qO- https://astral.sh/uv/install.sh | sh && \
     /home/ubuntu/.local/bin/uv python install 3.11 && \
     /home/ubuntu/.local/bin/uv venv --python 3.11 /home/ubuntu/fandango && \
-    /home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/fandango/bin/python "fandango-fuzzer @ git+https://github.com/fandango-fuzzer/fandango.git@90e7a744c4e176f51d74ecf1350b44cb2ba54911" faker
+    /home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/fandango/bin/python "fandango-fuzzer @ git+https://github.com/fandango-fuzzer/fandango.git@0bf9af8c00ed69f6b42e38007feced0a9a1778b5" faker
 
 # Set up environment variables for AFLNet
 ENV WORKDIR="/home/ubuntu/experiments"
