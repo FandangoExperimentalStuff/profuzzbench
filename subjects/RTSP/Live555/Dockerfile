@@ -55,14 +55,6 @@ RUN git clone https://github.com/profuzzbench/aflnwe.git && \
     AFL_NO_X86=1 make clean all $MAKE_OPT && \
     cd llvm_mode && make $MAKE_OPT
 
-# Python 3.11 for Fandango.
-# Branch feature/faster-parser of fandango-fuzzer/fandango, pinned to its head
-# commit 0bf9af8c. # TODO change to Fandango 1.3 when released
-RUN wget -qO- https://astral.sh/uv/install.sh | sh && \
-    /home/ubuntu/.local/bin/uv python install 3.11 && \
-    /home/ubuntu/.local/bin/uv venv --python 3.11 /home/ubuntu/fandango && \
-    /home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/fandango/bin/python "fandango-fuzzer @ git+https://github.com/fandango-fuzzer/fandango.git@0bf9af8c00ed69f6b42e38007feced0a9a1778b5" faker
-
 # Set up environment variables for AFLNet
 ENV WORKDIR="/home/ubuntu/experiments"
 ENV AFLNET="/home/ubuntu/aflnet"
@@ -119,6 +111,16 @@ RUN cd $WORKDIR && \
 
 RUN cd ${WORKDIR}/live555-fandango/testProgs && \
     cp ${AFLNET}/tutorials/live555/sample_media_sources/*.* ./
+
+# Python 3.11 for Fandango.
+# Branch feature/faster-parser of fandango-fuzzer/fandango, pinned to its head
+# commit 4587a43f (CoverageGoal.RANDOM, public ProtocolAlgorithm setters). # TODO change to Fandango 1.3 when released
+RUN wget -qO- https://astral.sh/uv/install.sh | sh && \
+    /home/ubuntu/.local/bin/uv python install 3.11 && \
+    /home/ubuntu/.local/bin/uv venv --python 3.11 /home/ubuntu/fandango && \
+    /home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/fandango/bin/python "fandango-fuzzer @ git+https://github.com/fandango-fuzzer/fandango.git@4587a43f327551f93c60b6aefc1861d502b73dd1" faker
+# The layer sits after the live555 builds on purpose: re-pinning Fandango
+# must not rebuild them.
 
 COPY --chown=ubuntu:ubuntu kill-server.sh ${WORKDIR}/kill-server
 COPY --chown=ubuntu:ubuntu in-rtsp ${WORKDIR}/in-rtsp
