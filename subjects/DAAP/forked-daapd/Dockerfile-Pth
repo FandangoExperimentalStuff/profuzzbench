@@ -142,4 +142,3 @@ RUN echo "ALL ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 USER ubuntu
 RUN mkdir ${WORKDIR}/db
 
-COPY --from=fandango-driver --exclude=**/__pycache__ --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver-src/fandango-driver
