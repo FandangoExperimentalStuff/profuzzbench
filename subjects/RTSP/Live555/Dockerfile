@@ -1,4 +1,4 @@
-FROM scratch AS driver
+FROM scratch AS fandango-driver
 COPY run.sh /DRIVER_NOT_INCLUDED.txt
 
 FROM ubuntu:20.04
@@ -131,4 +131,4 @@ COPY --chown=ubuntu:ubuntu rtsp.dict ${WORKDIR}/rtsp.dict
 COPY --chown=ubuntu:ubuntu cov_script.sh ${WORKDIR}/cov_script
 COPY --chown=ubuntu:ubuntu run.sh ${WORKDIR}/run
 
-COPY --from=driver --exclude=**/__pycache__ --chown=ubuntu:ubuntu . /home/ubuntu/driver-src/driver
+COPY --from=fandango-driver --exclude=**/__pycache__ --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver-src/fandango-driver
