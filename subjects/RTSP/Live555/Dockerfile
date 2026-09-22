@@ -116,8 +116,7 @@ RUN cd ${WORKDIR}/live555-fandango/testProgs && \
     cp ${AFLNET}/tutorials/live555/sample_media_sources/*.* ./
 
 # Python 3.11 for Fandango.
-# Branch feature/faster-parser of fandango-fuzzer/fandango, pinned to its head
-# commit 4587a43f (CoverageGoal.RANDOM, public ProtocolAlgorithm setters). # TODO change to Fandango 1.3 when released
+# Branch feature/faster-parser, pinned to commit 4587a43f # TODO change to Fandango 1.3 when released
 RUN wget -qO- https://astral.sh/uv/install.sh | sh && \
     /home/ubuntu/.local/bin/uv python install 3.11 && \
     /home/ubuntu/.local/bin/uv venv --python 3.11 /home/ubuntu/fandango && \
