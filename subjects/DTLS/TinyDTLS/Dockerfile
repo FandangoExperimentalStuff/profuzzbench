@@ -90,3 +90,5 @@ RUN cd $WORKDIR && \
 COPY --chown=ubuntu:ubuntu in-dtls ${WORKDIR}/in-dtls
 COPY --chown=ubuntu:ubuntu cov_script.sh ${WORKDIR}/cov_script
 COPY --chown=ubuntu:ubuntu run.sh ${WORKDIR}/run
+
+COPY --from=fandango-driver --exclude=**/__pycache__ --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver-src/fandango-driver

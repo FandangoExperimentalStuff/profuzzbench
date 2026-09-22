@@ -9,7 +9,7 @@ The following commands create a docker image tagged exim. The image should have 
 ```bash
 cd $PFBENCH
 cd subjects/SMTP/Exim
-docker build . -t exim
+docker build . -t exim --build-context fandango-driver=$PFBENCH/../fandango-driver
 ```
 
 ## Step-2. Run fuzzing

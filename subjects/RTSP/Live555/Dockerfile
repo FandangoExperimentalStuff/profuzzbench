@@ -1,6 +1,3 @@
-FROM scratch AS fandango-driver
-COPY run.sh /DRIVER_NOT_INCLUDED.txt
-
 FROM ubuntu:20.04
 
 # Install common dependencies

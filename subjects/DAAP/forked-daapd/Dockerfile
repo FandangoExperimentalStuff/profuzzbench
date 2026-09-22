@@ -132,3 +132,5 @@ COPY --chown=ubuntu:ubuntu cov_script.sh ${WORKDIR}/cov_script
 COPY --chown=ubuntu:ubuntu run.sh ${WORKDIR}/run
 COPY --chown=ubuntu:ubuntu MP3 ${WORKDIR}/MP3
 COPY --chown=ubuntu:ubuntu forked-daapd.conf ${WORKDIR}/forked-daapd.conf
+
+COPY --from=fandango-driver --exclude=**/__pycache__ --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver-src/fandango-driver

@@ -94,3 +94,5 @@ COPY --chown=ubuntu:ubuntu dnsmasq.conf ${WORKDIR}/dnsmasq.conf
 
 RUN cp ${WORKDIR}/dnsmasq.conf /etc/ && \
     echo address=/test.com/5.5.5.5 | sudo tee -a /etc/dnsmasq.conf
+
+COPY --from=fandango-driver --exclude=**/__pycache__ --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver-src/fandango-driver

@@ -95,3 +95,5 @@ COPY --chown=ubuntu:ubuntu in-tls ${WORKDIR}/in-tls
 COPY --chown=ubuntu:ubuntu tls.dict ${WORKDIR}/tls.dict
 COPY --chown=ubuntu:ubuntu cov_script.sh ${WORKDIR}/cov_script
 COPY --chown=ubuntu:ubuntu run.sh ${WORKDIR}/run
+
+COPY --from=fandango-driver --exclude=**/__pycache__ --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver-src/fandango-driver

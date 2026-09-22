@@ -17,7 +17,7 @@ The following commands create a docker image tagged forked-daapd. The image shou
 ```bash
 cd $PFBENCH
 cd subjects/DAAP/forked-daapd
-docker build . -t forked-daapd
+docker build . -t forked-daapd --build-context fandango-driver=$PFBENCH/../fandango-driver
 ```
 
 ## Step-2. Run fuzzing

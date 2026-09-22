@@ -9,7 +9,7 @@ The following commands create a docker image tagged Dnsmasq. The image should ha
 ```bash
 cd $PFBENCH
 cd subjects/DNS/Dnsmasq
-docker build . -t dnsmasq
+docker build . -t dnsmasq --build-context fandango-driver=$PFBENCH/../fandango-driver
 ```
 
 ## Step-2. Run fuzzing

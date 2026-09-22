@@ -9,7 +9,7 @@ The following commands create a docker image tagged Live555. The image should ha
 ```bash
 cd $PFBENCH
 cd subjects/RTSP/Live555
-docker build . -t live555
+docker build . -t live555 --build-context fandango-driver=$PFBENCH/../fandango-driver
 ```
 
 ## Step-2. Run fuzzing

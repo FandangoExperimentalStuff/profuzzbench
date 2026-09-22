@@ -9,7 +9,7 @@ The following commands create a docker image tagged lightftp. The image should h
 ```bash
 cd $PFBENCH
 cd subjects/FTP/LightFTP
-docker build . -t lightftp
+docker build . -t lightftp --build-context fandango-driver=$PFBENCH/../fandango-driver
 ```
 
 ## Step-2. Run fuzzing

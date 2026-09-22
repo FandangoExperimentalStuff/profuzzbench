@@ -9,7 +9,7 @@ The following commands create a docker image tagged ProFTPD. The image should ha
 ```bash
 cd $PFBENCH
 cd subjects/FTP/ProFTPD
-docker build . -t proftpd
+docker build . -t proftpd --build-context fandango-driver=$PFBENCH/../fandango-driver
 ```
 
 ## Step-2. Run fuzzing

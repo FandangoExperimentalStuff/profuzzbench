@@ -13,7 +13,7 @@ To build a target for StateAFL:
 ```bash
 cd $PFBENCH
 cd subjects/FTP/LightFTP
-docker build . -t lightftp
+docker build . -t lightftp --build-context fandango-driver=$PFBENCH/../fandango-driver
 docker build . -f Dockerfile-stateafl -t lightftp-stateafl
 ```
 

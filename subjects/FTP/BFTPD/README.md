@@ -9,7 +9,7 @@ The following commands create a docker image tagged Bftpd. The image should have
 ```bash
 cd $PFBENCH
 cd subjects/FTP/BFTPD
-docker build . -t bftpd
+docker build . -t bftpd --build-context fandango-driver=$PFBENCH/../fandango-driver
 ```
 
 ## Step-2. Run fuzzing
