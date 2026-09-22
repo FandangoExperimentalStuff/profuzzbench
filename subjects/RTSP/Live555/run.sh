@@ -27,7 +27,7 @@ if $(strstr $FUZZER "afl") || [ $FUZZER == "fandango" ]; then
   if [ $FUZZER == "fandango" ]; then
     TARGET_DIR="live555-fandango"
     cd $WORKDIR/${TARGET_DIR}/testProgs
-    PYTHONPATH=/home/ubuntu/fandango-driver-src /home/ubuntu/fandango/bin/python -m fandango-driver --out $OUTDIR --endpoint tcp://127.0.0.1/8554 --budget $TIMEOUT $OPTIONS -- ./testOnDemandRTSPServer 8554
+    PYTHONPATH=/home/ubuntu/fandango-driver/src /home/ubuntu/fandango/bin/python -m fandango-driver --out $OUTDIR --endpoint tcp://127.0.0.1/8554 --budget $TIMEOUT $OPTIONS -- ./testOnDemandRTSPServer 8554
   else
     cd $WORKDIR/${TARGET_DIR}/testProgs
     timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/${FUZZER}/afl-fuzz -d -i ${INPUTS} -x ${WORKDIR}/rtsp.dict -o $OUTDIR -N tcp://127.0.0.1/8554 $OPTIONS ./testOnDemandRTSPServer 8554
