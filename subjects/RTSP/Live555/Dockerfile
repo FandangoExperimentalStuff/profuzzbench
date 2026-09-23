@@ -117,7 +117,7 @@ RUN cd ${WORKDIR}/live555-fandango/testProgs && \
 RUN wget -qO- https://astral.sh/uv/install.sh | sh && \
     /home/ubuntu/.local/bin/uv python install 3.11 && \
     /home/ubuntu/.local/bin/uv venv --python 3.11 /home/ubuntu/fandango && \
-    /home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/fandango/bin/python "fandango-fuzzer @ git+https://github.com/fandango-fuzzer/fandango.git@4587a43f327551f93c60b6aefc1861d502b73dd1" faker
+    /home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/fandango/bin/python "fandango-fuzzer @ git+https://github.com/fandango-fuzzer/fandango.git@b95e9ea3ed5794539c09ec1d3507c977599abaae" faker
 # The layer sits after the live555 builds on purpose: re-pinning Fandango
 # must not rebuild them.
 
