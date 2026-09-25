@@ -35,16 +35,23 @@ if [ -f "$DEST" ]; then
   exit 0
 fi
 
-id=$(docker run --cpuset-cpus="$CPU" -d -it "$DOCIMAGE" /bin/bash -c \
+id=$(docker run --label pfb-campaign=1 --cpuset-cpus="$CPU" -d -it "$DOCIMAGE" /bin/bash -c \
   "cd ${WORKDIR} && run ${FUZZER} ${OUTDIR} '${OPTIONS}' ${TIMEOUT} ${SKIPCOUNT}") || exit 1
 id=${id::12}
+START=$(date +%s)
 echo "[$(date +%FT%T)] START $TARGET $FUZZER #$IDX cpu=$CPU image=$DOCIMAGE id=$id"
 
 docker wait "$id" >/dev/null
+ELAPSED=$(( $(date +%s) - START ))
+
+if [ "$ELAPSED" -lt $(( TIMEOUT * 95 / 100 )) ]; then
+  echo "[$(date +%FT%T)] FAIL  $TARGET $FUZZER #$IDX (ended after ${ELAPSED}s < TIMEOUT ${TIMEOUT}s; container $id kept, see: docker logs $id)" >&2
+  exit 1
+fi
 
 if docker cp "$id:${WORKDIR}/${OUTDIR}.tar.gz" "$DEST" >/dev/null 2>&1; then
   docker rm "$id" >/dev/null
-  echo "[$(date +%FT%T)] DONE  $TARGET $FUZZER #$IDX"
+  echo "[$(date +%FT%T)] DONE  $TARGET $FUZZER #$IDX (${ELAPSED}s)"
 else
   echo "[$(date +%FT%T)] FAIL  $TARGET $FUZZER #$IDX (container $id kept for inspection, see: docker logs $id)" >&2
   exit 1
