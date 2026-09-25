@@ -78,7 +78,7 @@ env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_a
 RUN cd ${WORKDIR} && \
     git clone https://github.com/openssl/openssl openssl && \
     cd openssl && \
-    git checkout 12ad22d && \
+    git checkout 12ad22dd16 && \
     ./Configure linux-x86_64-clang shared --prefix=$WORKDIR/openssl-install && \
     make $MAKE_OPT && \
     make install
