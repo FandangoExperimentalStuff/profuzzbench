@@ -4,7 +4,7 @@
 # Re-running resumes the campaign: run_one.sh skips runs whose result already exists.
 cd "$(dirname "$0")"
 
-TARGETS=${TARGETS:-"lightftp bftpd proftpd pure-ftpd exim dnsmasq live555 kamailio openssh dcmtk forked-daapd"}
+TARGETS=${TARGETS:-"lightftp bftpd proftpd pure-ftpd exim dnsmasq live555 kamailio openssh openssl tinydtls dcmtk forked-daapd"}
 FUZZERS=${FUZZERS:-"aflnet stateafl"}      # add aflnwe if needed
 RUNS=${RUNS:-10}
 SLOTS=${SLOTS:-44}
@@ -18,6 +18,14 @@ export TEST_TIMEOUT=${TEST_TIMEOUT:-5000}
 chmod +x run_one.sh
 mkdir -p "$RESULTS"
 LOG=$RESULTS/runs.log
+
+# Host settings required by StateAFL/AFL (containers share the host kernel)
+if [ "$(cat /proc/sys/kernel/randomize_va_space)" != "0" ]; then
+  echo "Aborting: ASLR is enabled. Run: echo 0 | sudo tee /proc/sys/kernel/randomize_va_space"; exit 1
+fi
+if grep -q '^|' /proc/sys/kernel/core_pattern; then
+  echo "Aborting: core_pattern pipes to an external tool. Run: echo core | sudo tee /proc/sys/kernel/core_pattern"; exit 1
+fi
 
 # Report missing images up front instead of hours into the campaign
 source "$CONF"
