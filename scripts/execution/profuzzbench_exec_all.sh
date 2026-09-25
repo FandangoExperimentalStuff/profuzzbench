@@ -263,54 +263,54 @@ do
 
 ##### TLS #####
 
-        if [[ $TARGET == "openssl" ]] || [[ $TARGET == "all" ]]
-        then
-
-            cd $PFBENCH
-            mkdir results-openssl
-
-            if [[ $FUZZER == "aflnet" ]] || [[ $FUZZER == "all" ]]
-            then
-                profuzzbench_exec_common.sh openssl $NUM_CONTAINERS results-openssl aflnet out-openssl-aflnet "-P TLS -D 10000 -q 3 -s 3 -E -K -R -W 100 -m none -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
-            fi
-
-            if [[ $FUZZER == "stateafl" ]] || [[ $FUZZER == "all" ]]
-            then
-                profuzzbench_exec_common.sh openssl-stateafl $NUM_CONTAINERS results-openssl stateafl out-openssl-stateafl "-P TLS -D 10000 -q 3 -s 3 -E -K -R -W 100 -m none -u /home/ubuntu/experiments/openssl/apps/openssl -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
-            fi
-
-            if [[ $FUZZER == "aflnwe" ]] || [[ $FUZZER == "all" ]]
-            then
-                profuzzbench_exec_common.sh openssl $NUM_CONTAINERS results-openssl aflnwe out-openssl-aflnwe "-D 10000 -K -W 100 -m none -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
-            fi
-
-        fi
+#        if [[ $TARGET == "openssl" ]] || [[ $TARGET == "all" ]]
+#        then
+#
+#            cd $PFBENCH
+#            mkdir results-openssl
+#
+#            if [[ $FUZZER == "aflnet" ]] || [[ $FUZZER == "all" ]]
+#            then
+#                profuzzbench_exec_common.sh openssl $NUM_CONTAINERS results-openssl aflnet out-openssl-aflnet "-P TLS -D 10000 -q 3 -s 3 -E -K -R -W 100 -m none -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
+#            fi
+#
+#            if [[ $FUZZER == "stateafl" ]] || [[ $FUZZER == "all" ]]
+#            then
+#                profuzzbench_exec_common.sh openssl-stateafl $NUM_CONTAINERS results-openssl stateafl out-openssl-stateafl "-P TLS -D 10000 -q 3 -s 3 -E -K -R -W 100 -m none -u /home/ubuntu/experiments/openssl/apps/openssl -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
+#            fi
+#
+#            if [[ $FUZZER == "aflnwe" ]] || [[ $FUZZER == "all" ]]
+#            then
+#                profuzzbench_exec_common.sh openssl $NUM_CONTAINERS results-openssl aflnwe out-openssl-aflnwe "-D 10000 -K -W 100 -m none -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
+#            fi
+#
+#        fi
 
 
 ##### DTLS #####
 
-        if [[ $TARGET == "tinydtls" ]] || [[ $TARGET == "all" ]]
-        then
-
-            cd $PFBENCH
-            mkdir results-tinydtls
-
-            if [[ $FUZZER == "aflnet" ]] || [[ $FUZZER == "all" ]]
-            then
-                profuzzbench_exec_common.sh tinydtls $NUM_CONTAINERS results-tinydtls aflnet out-tinydtls-aflnet "-P DTLS12 -D 10000 -q 3 -s 3 -E -K -W 30 -m none -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
-            fi
-
-            if [[ $FUZZER == "stateafl" ]] || [[ $FUZZER == "all" ]]
-            then
-                profuzzbench_exec_common.sh tinydtls-stateafl $NUM_CONTAINERS results-tinydtls stateafl out-tinydtls-stateafl "-P DTLS12 -D 10000 -q 3 -s 3 -E -K -W 30 -m none -u /home/ubuntu/experiments/tinydtls/tests/dtls-server -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
-            fi
-
-            if [[ $FUZZER == "aflnwe" ]] || [[ $FUZZER == "all" ]]
-            then
-                profuzzbench_exec_common.sh tinydtls $NUM_CONTAINERS results-tinydtls aflnwe out-tinydtls-aflnwe "-D 10000 -K -W 30 -m none -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
-            fi
-
-        fi
+#        if [[ $TARGET == "tinydtls" ]] || [[ $TARGET == "all" ]]
+#        then
+#
+#            cd $PFBENCH
+#            mkdir results-tinydtls
+#
+#            if [[ $FUZZER == "aflnet" ]] || [[ $FUZZER == "all" ]]
+#            then
+#                profuzzbench_exec_common.sh tinydtls $NUM_CONTAINERS results-tinydtls aflnet out-tinydtls-aflnet "-P DTLS12 -D 10000 -q 3 -s 3 -E -K -W 30 -m none -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
+#            fi
+#
+#            if [[ $FUZZER == "stateafl" ]] || [[ $FUZZER == "all" ]]
+#            then
+#                profuzzbench_exec_common.sh tinydtls-stateafl $NUM_CONTAINERS results-tinydtls stateafl out-tinydtls-stateafl "-P DTLS12 -D 10000 -q 3 -s 3 -E -K -W 30 -m none -u /home/ubuntu/experiments/tinydtls/tests/dtls-server -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
+#            fi
+#
+#            if [[ $FUZZER == "aflnwe" ]] || [[ $FUZZER == "all" ]]
+#            then
+#                profuzzbench_exec_common.sh tinydtls $NUM_CONTAINERS results-tinydtls aflnwe out-tinydtls-aflnwe "-D 10000 -K -W 30 -m none -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
+#            fi
+#
+#        fi
 
 ##### DICOM #####
 
