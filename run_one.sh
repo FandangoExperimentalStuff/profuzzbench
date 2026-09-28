@@ -36,24 +36,42 @@ if [ -f "$DEST" ]; then
   exit 0
 fi
 
-id=$(docker run --label pfb-campaign=1 --cpuset-cpus="$CPU" -d -it "$DOCIMAGE" /bin/bash -c \
-  "cd ${WORKDIR} && run ${FUZZER} ${OUTDIR} '${OPTIONS}' ${TIMEOUT} ${SKIPCOUNT}") || exit 1
-id=${id::12}
-START=$(date +%s)
-echo "[$(date +%FT%T)] START $TARGET $FUZZER #$IDX cpu=$CPU image=$DOCIMAGE id=$id"
+# Startup failures (e.g. AFLNet "states hashtable should always contain an entry of the initial
+# state" when the server did not answer in time) happen within seconds, before any fuzzing.
+# Such runs are retried; runs that end prematurely later are NOT retried, to avoid biasing results.
+MAX_ATTEMPTS=${MAX_ATTEMPTS:-3}
+STARTUP_GRACE=${STARTUP_GRACE:-600}   # seconds
 
-docker wait "$id" >/dev/null
-ELAPSED=$(( $(date +%s) - START ))
+for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
+  id=$(docker run --label pfb-campaign=1 --cpuset-cpus="$CPU" -d -it "$DOCIMAGE" /bin/bash -c \
+    "cd ${WORKDIR} && run ${FUZZER} ${OUTDIR} '${OPTIONS}' ${TIMEOUT} ${SKIPCOUNT}") || exit 1
+  id=${id::12}
+  START=$(date +%s)
+  echo "[$(date +%FT%T)] START $TARGET $FUZZER #$IDX cpu=$CPU image=$DOCIMAGE id=$id attempt=$attempt"
 
-# A run that ends well before TIMEOUT means the fuzzer aborted (e.g. ASLR check, missing binary).
-if [ "$ELAPSED" -lt $(( TIMEOUT * 95 / 100 )) ]; then
-  echo "[$(date +%FT%T)] FAIL  $TARGET $FUZZER #$IDX (ended after ${ELAPSED}s < TIMEOUT ${TIMEOUT}s; container $id kept, see: docker logs $id)" >&2
+  docker wait "$id" >/dev/null
+  ELAPSED=$(( $(date +%s) - START ))
+
+  # Completed normally: fuzzing ran for (almost) the full TIMEOUT
+  [ "$ELAPSED" -ge $(( TIMEOUT * 95 / 100 )) ] && break
+
+  # Aborted during startup: keep the log for reference, discard the container and retry
+  if [ "$ELAPSED" -lt "$STARTUP_GRACE" ] && [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+    LOGFILE=${SAVETO}/${OUTDIR}_${IDX}.attempt${attempt}.log
+    docker logs "$id" > "$LOGFILE" 2>&1
+    docker rm "$id" >/dev/null
+    echo "[$(date +%FT%T)] RETRY $TARGET $FUZZER #$IDX (aborted after ${ELAPSED}s during startup; log: $LOGFILE)"
+    sleep 5
+    continue
+  fi
+
+  echo "[$(date +%FT%T)] FAIL  $TARGET $FUZZER #$IDX (ended after ${ELAPSED}s < TIMEOUT ${TIMEOUT}s, attempt $attempt; container $id kept, see: docker logs $id)" >&2
   exit 1
-fi
+done
 
 if docker cp "$id:${WORKDIR}/${OUTDIR}.tar.gz" "$DEST" >/dev/null 2>&1; then
   docker rm "$id" >/dev/null
-  echo "[$(date +%FT%T)] DONE  $TARGET $FUZZER #$IDX (${ELAPSED}s)"
+  echo "[$(date +%FT%T)] DONE  $TARGET $FUZZER #$IDX (${ELAPSED}s, attempt $attempt)"
 else
   echo "[$(date +%FT%T)] FAIL  $TARGET $FUZZER #$IDX (container $id kept for inspection, see: docker logs $id)" >&2
   exit 1
