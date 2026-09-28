@@ -1,5 +1,6 @@
 #!/bin/bash
-
+# Executes a single fuzzing run, equivalent to one container of profuzzbench_exec_common.sh,
+# but pinned to CPU $JOBCPU (set by launch.sh) and with results collected as soon as the run finishes.
 # Usage: run_one.sh <target> <fuzzer> <run-index>
 set -u
 
@@ -14,7 +15,7 @@ export TEST_TIMEOUT=${TEST_TIMEOUT:-5000}
 RESULTS=${RESULTS:-.}
 WORKDIR=/home/ubuntu/experiments
 
-CPU=$(( ${JOBSLOT:-1} - 1 ))
+CPU=${JOBCPU:-0}
 
 source "$CONF"
 OPTIONS=${OPTS[$TARGET,$FUZZER]:-}
@@ -24,7 +25,7 @@ if [ -z "$OPTIONS" ] || [ -z "$DOCIMAGE" ]; then
   exit 1
 fi
 
-# results-<target>/out-<target>-<fuzzer>_<i>.tar.gz
+# Same layout as ProFuzzBench: results-<target>/out-<target>-<fuzzer>_<i>.tar.gz
 OUTDIR=out-${TARGET}-${FUZZER}
 SAVETO=${RESULTS}/results-${TARGET}
 DEST=${SAVETO}/${OUTDIR}_${IDX}.tar.gz
@@ -44,6 +45,7 @@ echo "[$(date +%FT%T)] START $TARGET $FUZZER #$IDX cpu=$CPU image=$DOCIMAGE id=$
 docker wait "$id" >/dev/null
 ELAPSED=$(( $(date +%s) - START ))
 
+# A run that ends well before TIMEOUT means the fuzzer aborted (e.g. ASLR check, missing binary).
 if [ "$ELAPSED" -lt $(( TIMEOUT * 95 / 100 )) ]; then
   echo "[$(date +%FT%T)] FAIL  $TARGET $FUZZER #$IDX (ended after ${ELAPSED}s < TIMEOUT ${TIMEOUT}s; container $id kept, see: docker logs $id)" >&2
   exit 1

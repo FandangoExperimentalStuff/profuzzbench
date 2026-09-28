@@ -1,13 +1,26 @@
 #!/bin/bash
 # Runs the whole campaign as a job queue in plain Bash: targets x fuzzers x runs,
-# at most SLOTS concurrently, each run pinned to CPU (slot-1). Start inside tmux.
+# one run per CPU in CPUS, each run pinned to its CPU. Start inside tmux.
 # Re-running resumes the campaign: run_one.sh skips runs whose result already exists.
 cd "$(dirname "$0")"
 
 TARGETS=${TARGETS:-"lightftp bftpd proftpd pure-ftpd exim dnsmasq live555 kamailio openssh openssl tinydtls dcmtk forked-daapd"}
 FUZZERS=${FUZZERS:-"aflnet stateafl"}      # add aflnwe if needed
 RUNS=${RUNS:-10}
-SLOTS=${SLOTS:-44}
+# CPUs to use, as a list of ranges (like taskset -c). One run per CPU; SLOTS = number of CPUs.
+# On this Threadripper, CPU n and n+24 are SMT siblings of the same physical core.
+CPUS=${CPUS:-"0-11,24-35"}   # physical cores 0-11 incl. SMT siblings; cores 12-23 reserved for a colleague
+
+CPU_LIST=()
+for part in ${CPUS//,/ }; do
+  if [[ $part == *-* ]]; then
+    for ((c=${part%-*}; c<=${part#*-}; c++)); do CPU_LIST+=("$c"); done
+  else
+    CPU_LIST+=("$part")
+  fi
+done
+SLOTS=${#CPU_LIST[@]}
+echo "Using $SLOTS slots on CPUs: ${CPU_LIST[*]}"
 
 export CONF=$PWD/jobs.conf
 export RESULTS=${RESULTS:-$PWD}
@@ -51,9 +64,9 @@ free_slot() {
 for t in $TARGETS; do for f in $FUZZERS; do for i in $(seq 1 "$RUNS"); do
   while ! slot=$(free_slot); do wait -n 2>/dev/null || sleep 5; done
   (
-    JOBSLOT=$slot ./run_one.sh "$t" "$f" "$i"
+    JOBCPU=${CPU_LIST[$((slot-1))]} ./run_one.sh "$t" "$f" "$i"
     rc=$?
-    echo -e "$(date +%FT%T)\t$t\t$f\t$i\tslot=$slot\texit=$rc" >> "$LOG"
+    echo -e "$(date +%FT%T)\t$t\t$f\t$i\tcpu=${CPU_LIST[$((slot-1))]}\texit=$rc" >> "$LOG"
   ) &
   SLOTPID[$slot]=$!
 done; done; done
