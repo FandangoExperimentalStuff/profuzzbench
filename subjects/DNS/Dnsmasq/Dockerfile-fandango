@@ -16,3 +16,7 @@ COPY --from=fandango-workspace --exclude=**/__pycache__ --exclude=.pytest_cache 
 RUN cd /home/ubuntu/fandango-workspace && \
     uv sync --frozen --no-dev --python 3.11 --package fandango-driver --no-editable
 USER root
+
+# Replace the run and coverage scripts of the base image with their Fandango versions
+COPY --chown=ubuntu:ubuntu fandango-run.sh ${WORKDIR}/run
+COPY --chown=ubuntu:ubuntu fandango-cov_script.sh ${WORKDIR}/cov_script
