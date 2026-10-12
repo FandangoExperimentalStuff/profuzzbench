@@ -1,5 +1,18 @@
 # syntax=docker/dockerfile:1-labs
 FROM dcmtk
 
-# Set up the Fandango driver
-COPY --from=fandango-driver --exclude=**/__pycache__ --exclude=.pytest_cache --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver
+# Set up Fandango in a Python 3.11 venv with the versions locked in uv.lock of the uv workspace
+COPY --from=ghcr.io/astral-sh/uv:0.13.0 /uv /uvx /bin/
+COPY --from=fandango-workspace --chown=ubuntu:ubuntu pyproject.toml uv.lock /home/ubuntu/fandango-workspace/
+COPY --from=fandango-workspace --chown=ubuntu:ubuntu fandango-driver/pyproject.toml /home/ubuntu/fandango-workspace/fandango-driver/
+COPY --from=fandango-workspace --chown=ubuntu:ubuntu spec-generator/pyproject.toml /home/ubuntu/fandango-workspace/spec-generator/
+ENV UV_PROJECT_ENVIRONMENT=/home/ubuntu/fandango
+USER ubuntu
+RUN cd /home/ubuntu/fandango-workspace && \
+    uv sync --frozen --no-dev --python 3.11 --package fandango-driver --no-install-workspace
+
+# Install the Fandango driver into the venv
+COPY --from=fandango-workspace --exclude=**/__pycache__ --exclude=.pytest_cache --chown=ubuntu:ubuntu fandango-driver /home/ubuntu/fandango-workspace/fandango-driver
+RUN cd /home/ubuntu/fandango-workspace && \
+    uv sync --frozen --no-dev --python 3.11 --package fandango-driver --no-editable
+USER root
