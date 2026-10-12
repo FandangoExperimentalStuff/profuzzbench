@@ -6,13 +6,8 @@ OPTIONS=$3    #all configured options -- to make it flexible, we only fix some o
 TIMEOUT=$4    #time for fuzzing
 SKIPCOUNT=$5  #used for calculating cov over time. e.g., SKIPCOUNT=5 means we run gcovr after every 5 test cases
 
-strstr() {
-  [ "${1#*$2*}" = "$1" ] && return 1
-  return 0
-}
-
-#Commands for afl-based fuzzers (e.g., aflnet, aflnwe)
-if $(strstr $FUZZER "afl"); then
+#Commands for the fandango driver
+if [ $FUZZER = "fandango" ]; then
 
   # Run fuzzer-specific commands (if any)
   if [ -e ${WORKDIR}/run-${FUZZER} ]; then
@@ -26,7 +21,7 @@ if $(strstr $FUZZER "afl"); then
   #Move to fuzzing folder
   cd $WORKDIR/${TARGET_DIR}/Source/Release
   echo "$WORKDIR/${TARGET_DIR}/Source/Release"
-  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/${FUZZER}/afl-fuzz -d -i ${INPUTS} -x ${WORKDIR}/ftp.dict -o $OUTDIR -N tcp://127.0.0.1/2200 $OPTIONS -c ${WORKDIR}/ftpclean ./fftp fftp.conf 2200
+  /home/ubuntu/fandango/bin/fandango-driver --out $OUTDIR --endpoint tcp://127.0.0.1/2200 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/ftpclean -- ./fftp fftp.conf 2200
 
   STATUS=$?
 
@@ -37,11 +32,7 @@ if $(strstr $FUZZER "afl"); then
   #The last argument passed to cov_script should be 0 if the fuzzer is afl/nwe and it should be 1 if the fuzzer is based on aflnet
   #0: the test case is a concatenated message sequence -- there is no message boundary
   #1: the test case is a structured file keeping several request messages
-  if [ $FUZZER = "aflnwe" ]; then
-    cov_script ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/ 2200 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/cov_over_time.csv 0
-  else
-    cov_script ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/ 2200 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/cov_over_time.csv 1
-  fi
+  cov_script ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/ 2200 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/cov_over_time.csv 1
 
   gcovr -r .. --html --html-details -o index.html
   mkdir ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/cov_html/

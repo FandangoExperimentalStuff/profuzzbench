@@ -30,7 +30,7 @@ else
 fi
 
 #process seeds first
-for f in $(echo $folder/$testdir/*.raw); do 
+for f in $(echo $folder/$testdir/*.raw | grep -v "\*"); do   #skip when there is no seed file
   time=$(stat -c %Y $f)
     
   $replayer $f TLS $pno 100 > /dev/null 2>&1 &

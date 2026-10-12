@@ -31,7 +31,7 @@ fi
 
 
 #process initial seed corpus first
-for f in $(echo $folder/$testdir/*.raw); do
+for f in $(echo $folder/$testdir/*.raw | grep -v "\*"); do   #skip when there is no seed file
   time=$(stat -c %Y $f)
 
   $replayer $f DICOM $pno 1 > /dev/null 2>&1 &
