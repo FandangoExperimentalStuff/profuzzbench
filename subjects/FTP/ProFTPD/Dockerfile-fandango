@@ -1,0 +1,5 @@
+# syntax=docker/dockerfile:1-labs
+FROM proftpd
+
+# Set up the Fandango driver
+COPY --from=fandango-driver --exclude=**/__pycache__ --exclude=.pytest_cache --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver
