@@ -9,7 +9,7 @@ The following commands create a docker image tagged kamailio. The image should h
 ```bash
 cd $PFBENCH
 cd subjects/SIP/Kamailio
-docker build . -t kamailio --build-context fandango-driver=$PFBENCH/../fandango-driver
+docker build . -t kamailio
 ```
 
 ## Step-2. Run fuzzing

@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1-labs
 FROM ubuntu:20.04
 
 # Install common dependencies
@@ -95,5 +94,3 @@ COPY --chown=ubuntu:ubuntu dnsmasq.conf ${WORKDIR}/dnsmasq.conf
 
 RUN cp ${WORKDIR}/dnsmasq.conf /etc/ && \
     echo address=/test.com/5.5.5.5 | sudo tee -a /etc/dnsmasq.conf
-
-COPY --from=fandango-driver --exclude=**/__pycache__ --exclude=.pytest_cache --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver

@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1-labs
 FROM ubuntu:20.04
 
 # Install common dependencies
@@ -107,5 +106,3 @@ COPY --chown=ubuntu:ubuntu run.sh ${WORKDIR}/run
 COPY --chown=ubuntu:ubuntu run_pjsip.sh ${WORKDIR}/run_pjsip
 COPY --chown=ubuntu:ubuntu kamailio-basic.cfg ${WORKDIR}/kamailio-basic.cfg
 COPY --chown=ubuntu:ubuntu StarWars3.wav ${WORKDIR}/StarWars3.wav
-
-COPY --from=fandango-driver --exclude=**/__pycache__ --exclude=.pytest_cache --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver

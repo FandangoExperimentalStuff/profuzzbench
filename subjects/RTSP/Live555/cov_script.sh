@@ -30,7 +30,7 @@ else
 fi
 
 #process initial seed corpus first
-for f in $(echo $folder/$testdir/*.raw | grep -v "\*"); do   #skip when there is no seed file
+for f in $(echo $folder/$testdir/*.raw); do 
   time=$(stat -c %Y $f)
 
   #terminate running server(s)

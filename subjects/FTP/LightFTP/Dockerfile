@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1-labs
 FROM ubuntu:20.04
 
 # Install common dependencies
@@ -110,5 +109,3 @@ COPY --chown=ubuntu:ubuntu clean.sh ${WORKDIR}/ftpclean
 USER root
 RUN apt-get -y install ftp
 USER ubuntu
-
-COPY --from=fandango-driver --exclude=**/__pycache__ --exclude=.pytest_cache --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver

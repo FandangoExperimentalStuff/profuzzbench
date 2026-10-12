@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1-labs
 FROM ubuntu:20.04
 
 # Install common dependencies
@@ -106,5 +105,3 @@ RUN useradd -rm -d /home/fuzzing -s /bin/bash -g ubuntu -G sudo -u 1001 fuzzing 
 
 # For debugging purposes
 RUN apt-get -y install ftp
-
-COPY --from=fandango-driver --exclude=**/__pycache__ --exclude=.pytest_cache --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver

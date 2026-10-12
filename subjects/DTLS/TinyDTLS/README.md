@@ -9,7 +9,7 @@ The following commands create a docker image tagged tinyDTLS. The image should h
 ```bash
 cd $PFBENCH
 cd subjects/DTLS/TinyDTLS
-docker build . -t tinydtls --build-context fandango-driver=$PFBENCH/../fandango-driver
+docker build . -t tinydtls
 ```
 
 ## Step-2. Run fuzzing

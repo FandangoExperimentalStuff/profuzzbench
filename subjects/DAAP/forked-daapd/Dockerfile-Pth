@@ -141,4 +141,3 @@ RUN echo "ALL ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 # Switch back to ubuntu account
 USER ubuntu
 RUN mkdir ${WORKDIR}/db
-

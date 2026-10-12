@@ -9,7 +9,7 @@ The following commands create a docker image tagged PureFTPD. The image should h
 ```bash
 cd $PFBENCH
 cd subjects/FTP/PureFTPD
-docker build . -t pure-ftpd --build-context fandango-driver=$PFBENCH/../fandango-driver
+docker build . -t pure-ftpd
 ```
 
 ## Step-2. Run fuzzing

@@ -9,7 +9,7 @@ The following commands create a docker image tagged dcmtk. The image should have
 ```bash
 cd $PFBENCH
 cd subjects/DICOM/Dcmtk
-docker build . -t dcmtk --build-context fandango-driver=$PFBENCH/../fandango-driver
+docker build . -t dcmtk
 ```
 
 ## Step-2. Run fuzzing

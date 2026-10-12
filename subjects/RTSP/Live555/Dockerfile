@@ -1,16 +1,14 @@
-# syntax=docker/dockerfile:1-labs
 FROM ubuntu:20.04
 
 # Install common dependencies
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get -y update && \
-    apt-get -y install sudo \
+    apt-get -y install sudo \ 
     apt-utils \
     build-essential \
     openssl \
     clang \
     graphviz-dev \
-    libcap-dev \
     git \
     autoconf \
     libgnutls28-dev \
@@ -31,9 +29,7 @@ RUN groupadd ubuntu && \
 
 RUN chmod 777 /tmp
 
-# lxml is pinned: gcovr 4.2 otherwise pulls lxml 6, which has no wheel for
-# Python 3.8 on arm64 and fails to build from source without libxml2-dev.
-RUN pip3 install gcovr==4.2 "lxml<5"
+RUN pip3 install gcovr==4.2
 
 # Use ubuntu as default username
 USER ubuntu
@@ -42,18 +38,15 @@ WORKDIR /home/ubuntu
 # Import environment variable to pass as parameter to make (e.g., to make parallel builds with -j)
 ARG MAKE_OPT
 
-# Set up fuzzers.
-# AFL_NO_X86=1 skips the x86-only self test so the image also builds on arm64
-# hosts; the targets are instrumented with afl-clang-fast (llvm_mode) anyway.
-RUN git clone https://github.com/aflnet/aflnet.git && \
+# Set up fuzzers
+RUN git clone https://github.com/profuzzbench/aflnet.git && \
     cd aflnet && \
-    git checkout 96032f86d0005dfeeb41ea7b31103f1d1ff8f168 && \
-    AFL_NO_X86=1 make clean all $MAKE_OPT && \
+    make clean all $MAKE_OPT && \
     cd llvm_mode && make $MAKE_OPT
 
 RUN git clone https://github.com/profuzzbench/aflnwe.git && \
     cd aflnwe && \
-    AFL_NO_X86=1 make clean all $MAKE_OPT && \
+    make clean all $MAKE_OPT && \
     cd llvm_mode && make $MAKE_OPT
 
 # Set up environment variables for AFLNet
@@ -100,33 +93,8 @@ RUN cd $WORKDIR && \
 RUN cd ${WORKDIR}/live555-cov/testProgs && \
     cp ${AFLNET}/tutorials/live555/sample_media_sources/*.* ./
 
-# Compile Live555 for the Fandango driver. \
-# Use AFL instrumentation without the response code changes of fuzzing.patch
-RUN cd $WORKDIR && \
-    git clone https://github.com/rgaufman/live555.git live555-fandango && \
-    cd live555-fandango && \
-    git checkout ceeb4f4 && \
-    patch -p1 < $WORKDIR/gcov.patch && \
-    ./genMakefiles linux && \
-    AFL_USE_ASAN=1 make C_COMPILER=afl-clang-fast CPLUSPLUS_COMPILER=afl-clang-fast++ LINK="afl-clang-fast++ -o" clean all $MAKE_OPT
-
-RUN cd ${WORKDIR}/live555-fandango/testProgs && \
-    cp ${AFLNET}/tutorials/live555/sample_media_sources/*.* ./
-
-# Python 3.11 for Fandango.
-# Branch feature/faster-parser, pinned to commit 4587a43f # TODO change to Fandango 1.3 when released
-RUN wget -qO- https://astral.sh/uv/install.sh | sh && \
-    /home/ubuntu/.local/bin/uv python install 3.11 && \
-    /home/ubuntu/.local/bin/uv venv --python 3.11 /home/ubuntu/fandango && \
-    /home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/fandango/bin/python "fandango-fuzzer @ git+https://github.com/fandango-fuzzer/fandango.git@b95e9ea3ed5794539c09ec1d3507c977599abaae" faker
-# The layer sits after the live555 builds on purpose: re-pinning Fandango
-# must not rebuild them.
-
 COPY --chown=ubuntu:ubuntu kill-server.sh ${WORKDIR}/kill-server
 COPY --chown=ubuntu:ubuntu in-rtsp ${WORKDIR}/in-rtsp
-COPY --chown=ubuntu:ubuntu in-rtsp-replay ${WORKDIR}/in-rtsp-replay
 COPY --chown=ubuntu:ubuntu rtsp.dict ${WORKDIR}/rtsp.dict
 COPY --chown=ubuntu:ubuntu cov_script.sh ${WORKDIR}/cov_script
 COPY --chown=ubuntu:ubuntu run.sh ${WORKDIR}/run
-
-COPY --from=fandango-driver --exclude=**/__pycache__ --exclude=.pytest_cache --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver

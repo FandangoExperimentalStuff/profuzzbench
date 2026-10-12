@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1-labs
 FROM ubuntu:20.04
 
 # Install common dependencies
@@ -111,5 +110,3 @@ RUN cd $WORKDIR/dcmtk/build/bin && \
 RUN cd $WORKDIR/dcmtk-gcov/build/bin && \
     mkdir ACME_STORE && \
     cp $WORKDIR/dcmqrscp.cfg ./
-
-COPY --from=fandango-driver --exclude=**/__pycache__ --exclude=.pytest_cache --chown=ubuntu:ubuntu . /home/ubuntu/fandango-driver
