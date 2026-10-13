@@ -21,7 +21,7 @@ if [ $FUZZER = "fandango" ]; then
   #Move to fuzzing folder
   cd $WORKDIR/${TARGET_DIR}
   cp ./src/build-Linux-x86_64/exim /usr/exim/bin/exim
-  /home/ubuntu/fandango/bin/fandango-driver --out $OUTDIR --endpoint tcp://127.0.0.1/25 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/clean -- exim -bd -d -oX 25 -oP /var/lock/exim.pid
+  /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/25 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/clean -- exim -bd -d -oX 25 -oP /var/lock/exim.pid
 
   STATUS=$?
 

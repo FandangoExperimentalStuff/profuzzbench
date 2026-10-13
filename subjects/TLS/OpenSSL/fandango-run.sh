@@ -19,7 +19,7 @@ if [ $FUZZER = "fandango" ]; then
   #Step-1. Do Fuzzing
   #Move to fuzzing folder
   cd $WORKDIR/${TARGET_DIR}
-  /home/ubuntu/fandango/bin/fandango-driver --out $OUTDIR --endpoint tcp://127.0.0.1/4433 --budget $TIMEOUT $OPTIONS -- ./apps/openssl s_server -key key.pem -cert cert.pem -4 -naccept 1 -no_anti_replay
+  /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/4433 --budget $TIMEOUT $OPTIONS -- ./apps/openssl s_server -key key.pem -cert cert.pem -4 -naccept 1 -no_anti_replay
 
   STATUS=$?
 

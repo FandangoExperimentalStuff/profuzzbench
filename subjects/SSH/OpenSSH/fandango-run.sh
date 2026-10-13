@@ -27,7 +27,7 @@ if [ $FUZZER = "fandango" ]; then
   sleep 5
   sshpass -p "ubuntu" ssh -oStrictHostKeyChecking=no ubuntu@127.0.0.1 -p 22 "exit"
 
-  /home/ubuntu/fandango/bin/fandango-driver --out $OUTDIR --endpoint tcp://127.0.0.1/22 --budget $TIMEOUT $OPTIONS -- ./sshd -d -e -p 22 -r -f sshd_config
+  /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/22 --budget $TIMEOUT $OPTIONS -- ./sshd -d -e -p 22 -r -f sshd_config
 
   STATUS=$?
 
