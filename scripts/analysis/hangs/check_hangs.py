@@ -1,5 +1,4 @@
-"""
-Checks for every hang that AFLNet or StateAFL reported whether the server really hangs.
+"""Checks for every hang reported whether the server really hangs.
 
 Takes the results directory of a campaign (results-<target>/out-<target>-<fuzzer>_<run>.tar.gz), replays the hang
 files of every run against the fuzzing build in the base image of the target with classify_hangs.py, and prints
@@ -8,30 +7,43 @@ how many hangs are real per target and fuzzer. Needs the base images (e.g. 'ligh
 python3 check_hangs.py <results dir> <out dir> [--jobs 12] [--cpus 0-11,24-35] [--sample 0] [--targets ...]
 """
 import argparse, collections, concurrent.futures, csv, json, pathlib, re, subprocess, tarfile
+from typing import NamedTuple
 
 HERE = pathlib.Path(__file__).resolve().parent
 W = "$WORKDIR"
 DAAPD_DAEMONS = "sudo /etc/init.d/dbus start >/dev/null; sudo /etc/init.d/avahi-daemon start >/dev/null;"
-# Per target, as the fuzzing command line in run.sh: port, transport, cwd, command, cleanup, options, commands before
+
+
+class Target(NamedTuple):
+    port: int
+    transport: str
+    cwd: str
+    command: str
+    cleanup: str = ""
+    options: str = ""  # further options of classify_hangs.py
+    before: str = ""   # shell commands before the server starts
+
+
 TARGETS = {
-    "lightftp": (2200, "tcp", f"{W}/LightFTP/Source/Release", "./fftp fftp.conf 2200", f"{W}/ftpclean", "", ""),
-    "bftpd": (21, "tcp", f"{W}/bftpd", f"./bftpd -D -c {W}/basic.conf", f"{W}/clean", "", ""),
-    "proftpd": (21, "tcp", f"{W}/proftpd", f"./proftpd -n -c {W}/basic.conf -X", f"{W}/clean", "", ""),
-    "pure-ftpd": (21, "tcp", f"{W}/pure-ftpd", "src/pure-ftpd -A", f"{W}/clean", "", ""),
-    "exim": (25, "tcp", f"{W}/exim", "exim -bd -d -oX 25 -oP /var/lock/exim.pid", f"{W}/clean", "",
-             f"cp {W}/exim/src/build-Linux-x86_64/exim /usr/exim/bin/exim;"),
-    "dnsmasq": (5353, "udp", f"{W}/dnsmasq/src", "./dnsmasq", "", "", ""),
-    "live555": (8554, "tcp", f"{W}/live555/testProgs", "./testOnDemandRTSPServer 8554", "", "", ""),
-    "kamailio": (5060, "udp", f"{W}/kamailio",
-                 f"KAMAILIO_MODULES=src/modules KAMAILIO_RUNTIME_DIR=runtime_dir ./src/kamailio -f {W}/kamailio-basic.cfg "
-                 "-L src/modules -Y runtime_dir -n 1 -D -E", f"{W}/run_pjsip", "--local-port 5061", ""),
-    "openssh": (22, "tcp", f"{W}/openssh", "./sshd -d -e -p 22 -r -f sshd_config", "", "", ""),
-    "openssl": (4433, "tcp", f"{W}/openssl",
-                "./apps/openssl s_server -key key.pem -cert cert.pem -4 -naccept 1 -no_anti_replay", "", "", ""),
-    "tinydtls": (20220, "udp", W, "./tinydtls/tests/dtls-server", "", "", ""),
-    "dcmtk": (5158, "tcp", f"{W}/dcmtk/build/bin", "./dcmqrscp --single-process", f"{W}/clean", "", ""),
-    "forked-daapd": (3689, "tcp", W, f"{W}/forked-daapd/src/forked-daapd -d 0 -c {W}/forked-daapd.conf -f", "",
-                     "--settle-s 20", DAAPD_DAEMONS),
+    "lightftp": Target(2200, "tcp", f"{W}/LightFTP/Source/Release", "./fftp fftp.conf 2200", cleanup=f"{W}/ftpclean"),
+    "bftpd": Target(21, "tcp", f"{W}/bftpd", f"./bftpd -D -c {W}/basic.conf", cleanup=f"{W}/clean"),
+    "proftpd": Target(21, "tcp", f"{W}/proftpd", f"./proftpd -n -c {W}/basic.conf -X", cleanup=f"{W}/clean"),
+    "pure-ftpd": Target(21, "tcp", f"{W}/pure-ftpd", "src/pure-ftpd -A", cleanup=f"{W}/clean"),
+    "exim": Target(25, "tcp", f"{W}/exim", "exim -bd -d -oX 25 -oP /var/lock/exim.pid", cleanup=f"{W}/clean",
+                   before=f"cp {W}/exim/src/build-Linux-x86_64/exim /usr/exim/bin/exim;"),
+    "dnsmasq": Target(5353, "udp", f"{W}/dnsmasq/src", "./dnsmasq"),
+    "live555": Target(8554, "tcp", f"{W}/live555/testProgs", "./testOnDemandRTSPServer 8554"),
+    "kamailio": Target(5060, "udp", f"{W}/kamailio",
+                       f"KAMAILIO_MODULES=src/modules KAMAILIO_RUNTIME_DIR=runtime_dir ./src/kamailio "
+                       f"-f {W}/kamailio-basic.cfg -L src/modules -Y runtime_dir -n 1 -D -E",
+                       cleanup=f"{W}/run_pjsip", options="--local-port 5061"),
+    "openssh": Target(22, "tcp", f"{W}/openssh", "./sshd -d -e -p 22 -r -f sshd_config"),
+    "openssl": Target(4433, "tcp", f"{W}/openssl",
+                      "./apps/openssl s_server -key key.pem -cert cert.pem -4 -naccept 1 -no_anti_replay"),
+    "tinydtls": Target(20220, "udp", W, "./tinydtls/tests/dtls-server"),
+    "dcmtk": Target(5158, "tcp", f"{W}/dcmtk/build/bin", "./dcmqrscp --single-process", cleanup=f"{W}/clean"),
+    "forked-daapd": Target(3689, "tcp", W, f"{W}/forked-daapd/src/forked-daapd -d 0 -c {W}/forked-daapd.conf -f",
+                           options="--settle-s 20", before=DAAPD_DAEMONS),
 }
 REAL = ("busy", "slow")
 CLASSES = ("busy", "slow", "fast", "silent", "closed", "crashed")
@@ -45,12 +57,12 @@ def cpu_list(text):
     return cpus
 
 
-def extract_hangs(results, work, sample):
+def extract_hangs(results, work, sample, targets):
     """Hang files per run, as (target, fuzzer, run, directory)."""
     runs = []
     for archive in sorted(results.glob("results-*/out-*.tar.gz")):
         m = re.match(r"out-(.+)-(aflnet|stateafl)_(\d+)\.tar\.gz", archive.name)
-        if not m or m.group(1) not in TARGETS:
+        if not m or m.group(1) not in targets:
             continue
         directory = work / f"{m.group(1)}-{m.group(2)}_{m.group(3)}"
         if not directory.exists():
@@ -68,14 +80,17 @@ def extract_hangs(results, work, sample):
 
 def check_run(run, out, cpu, wait_s, slow_s):
     target, fuzzer, number, directory = run
-    port, transport, cwd, command, cleanup, options, before = TARGETS[target]
-    cleanup_option = f"--cleanup {cleanup}" if cleanup else ""
+    config = TARGETS[target]
+    cleanup_option = f"--cleanup {config.cleanup}" if config.cleanup else ""
     classify = (f"python3 /hangs-tool/classify_hangs.py --hangs /hangs --out /out/{directory.name}.jsonl "
-                f"--cwd {cwd} --command \"{command}\" {cleanup_option} --transport {transport} --port {port} "
-                f"--wait-s {wait_s} --slow-s {slow_s} {options}")
-    subprocess.run(["docker", "run", "--rm", "--cpuset-cpus", str(cpu), "-v", f"{HERE}:/hangs-tool:ro",
+                f"--cwd {config.cwd} --command \"{config.command}\" {cleanup_option} --transport {config.transport} "
+                f"--port {config.port} --wait-s {wait_s} --slow-s {slow_s} {config.options}")
+    completed = subprocess.run(["docker", "run", "--rm", "--cpuset-cpus", str(cpu), "-v", f"{HERE}:/hangs-tool:ro",
                     "-v", f"{directory.resolve()}:/hangs:ro", "-v", f"{out.resolve()}:/out", target,
-                    "/bin/bash", "-c", before + classify], capture_output=True)
+                    "/bin/bash", "-c", config.before + classify], capture_output=True, text=True)
+    if completed.returncode != 0:
+        error = (completed.stderr.strip().splitlines() or ["no output"])[-1]
+        print(f"WARNING {directory.name}: container ended with {completed.returncode}: {error}", flush=True)
     return run
 
 
@@ -111,7 +126,7 @@ parser.add_argument("--wait-s", type=float, default=6.0, help="wait this long fo
 parser.add_argument("--slow-s", type=float, default=5.0, help="an answer this late is a real hang, like TEST_TIMEOUT")
 args = parser.parse_args()
 args.out.mkdir(parents=True, exist_ok=True)
-runs = [run for run in extract_hangs(args.results, args.out / "hangs", args.sample) if run[0] in args.targets]
+runs = extract_hangs(args.results, args.out / "hangs", args.sample, args.targets)
 cpus = cpu_list(args.cpus)
 print(f"{len(runs)} runs with hangs, {sum(len(list(r[3].iterdir())) for r in runs)} hang files")
 with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.jobs, len(cpus))) as pool:
