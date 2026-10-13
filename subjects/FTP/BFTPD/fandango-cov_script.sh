@@ -51,8 +51,11 @@ for f in $(echo $folder/$testdir/*.raw | grep -v "\*"); do   #skip when there is
   chown -R ubuntu:ubuntu /home/ubuntu/ftpshare/home
   chmod -R go+w /home/ubuntu/ftpshare/home
 
-  $replayer $f FTP $pno 1 > /dev/null 2>&1 &
-  GCOV_PREFIX=/home/ubuntu/ftpshare timeout -k 0 3s ./bftpd -D -c ${WORKDIR}/basic.conf
+  GCOV_PREFIX=/home/ubuntu/ftpshare ./bftpd -D -c ${WORKDIR}/basic.conf &
+  server=$!
+  $replayer $f FTP $pno 1 > /dev/null 2>&1
+  #the server gets 3s to exit by itself after the replay, then it is stopped with SIGTERM
+  timeout 3s tail --pid=$server -f /dev/null || kill -SIGTERM $server
   
   wait
   cp /home/ubuntu/ftpshare/home/ubuntu/experiments/bftpd-gcov/*.gcda /home/ubuntu/experiments/bftpd-gcov/ > /dev/null 2>&1
@@ -77,8 +80,11 @@ for f in $(echo $folder/$testdir/id*); do
   chown -R ubuntu:ubuntu /home/ubuntu/ftpshare/home
   chmod -R go+w /home/ubuntu/ftpshare/home
   
-  $replayer $f FTP $pno 1 > /dev/null 2>&1 &
-  GCOV_PREFIX=/home/ubuntu/ftpshare timeout -k 0 3s ./bftpd -D -c ${WORKDIR}/basic.conf
+  GCOV_PREFIX=/home/ubuntu/ftpshare ./bftpd -D -c ${WORKDIR}/basic.conf &
+  server=$!
+  $replayer $f FTP $pno 1 > /dev/null 2>&1
+  #the server gets 3s to exit by itself after the replay, then it is stopped with SIGTERM
+  timeout 3s tail --pid=$server -f /dev/null || kill -SIGTERM $server
 
   wait
   cp /home/ubuntu/ftpshare/home/ubuntu/experiments/bftpd-gcov/*.gcda /home/ubuntu/experiments/bftpd-gcov/ > /dev/null 2>&1

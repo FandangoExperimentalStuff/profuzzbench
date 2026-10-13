@@ -36,8 +36,11 @@ for f in $(echo $folder/$testdir/*.raw); do
   #terminate running server(s)
   pkill pure-ftpd
 
-  $replayer $f FTP $pno 1 > /dev/null 2>&1 &
-  GCOV_PREFIX=/home/fuzzing/ timeout -k 0 3s src/pure-ftpd -A
+  GCOV_PREFIX=/home/fuzzing/ src/pure-ftpd -A &
+  server=$!
+  $replayer $f FTP $pno 1 > /dev/null 2>&1
+  #the server gets 3s to exit by itself after the replay, then it is stopped with SIGTERM
+  timeout 3s tail --pid=$server -f /dev/null || kill -SIGTERM $server
   
   wait
   cp /home/fuzzing/home/ubuntu/experiments/pure-ftpd-gcov/src/*.gcda /home/ubuntu/experiments/pure-ftpd-gcov/src/ > /dev/null 2>&1
@@ -58,8 +61,11 @@ for f in $(echo $folder/$testdir/id*); do
   #terminate running server(s)
   pkill pure-ftpd
   
-  $replayer $f FTP $pno 1 > /dev/null 2>&1 &
-  GCOV_PREFIX=/home/fuzzing/ timeout -k 0 3s src/pure-ftpd -A
+  GCOV_PREFIX=/home/fuzzing/ src/pure-ftpd -A &
+  server=$!
+  $replayer $f FTP $pno 1 > /dev/null 2>&1
+  #the server gets 3s to exit by itself after the replay, then it is stopped with SIGTERM
+  timeout 3s tail --pid=$server -f /dev/null || kill -SIGTERM $server
 
   wait
   cp /home/fuzzing/home/ubuntu/experiments/pure-ftpd-gcov/src/*.gcda /home/ubuntu/experiments/pure-ftpd-gcov/src/ > /dev/null 2>&1

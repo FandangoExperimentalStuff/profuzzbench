@@ -33,8 +33,12 @@ fi
 for f in $(echo $folder/$testdir/*.raw); do 
   time=$(stat -c %Y $f)
 
-  (sleep 1 && $replayer $f HTTP $pno 100 10000 > /dev/null 2>&1) &
-  timeout -k 0 -s SIGUSR1 10s ./forked-daapd-gcov/src/forked-daapd -d 0 -c ./forked-daapd.conf -f > /dev/null 2>&1
+  ./forked-daapd-gcov/src/forked-daapd -d 0 -c ./forked-daapd.conf -f > /dev/null 2>&1 &
+  server=$!
+  sleep 1
+  $replayer $f HTTP $pno 100 10000 > /dev/null 2>&1
+  #the server gets 10s to exit by itself after the replay, then it is stopped with SIGUSR1
+  timeout 10s tail --pid=$server -f /dev/null || kill -SIGUSR1 $server
   
   wait
   cov_data=$(gcovr -r forked-daapd-gcov -s | grep "[lb][a-z]*:")
@@ -51,8 +55,12 @@ count=0
 for f in $(echo $folder/$testdir/id*); do 
   time=$(stat -c %Y $f)
 
-  (sleep 1 && $replayer $f HTTP $pno 100 10000 > /dev/null 2>&1) &
-  timeout -k 0 -s SIGUSR1 10s ./forked-daapd-gcov/src/forked-daapd -d 0 -c ./forked-daapd.conf -f > /dev/null 2>&1
+  ./forked-daapd-gcov/src/forked-daapd -d 0 -c ./forked-daapd.conf -f > /dev/null 2>&1 &
+  server=$!
+  sleep 1
+  $replayer $f HTTP $pno 100 10000 > /dev/null 2>&1
+  #the server gets 10s to exit by itself after the replay, then it is stopped with SIGUSR1
+  timeout 10s tail --pid=$server -f /dev/null || kill -SIGUSR1 $server
 
   wait
   count=$(expr $count + 1)

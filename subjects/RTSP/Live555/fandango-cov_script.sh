@@ -36,8 +36,11 @@ for f in $(echo $folder/$testdir/*.raw | grep -v "\*"); do   #skip when there is
   #terminate running server(s)
   pkill testOnDemandR
     
-  $replayer $f RTSP $pno 1 > /dev/null 2>&1 &
-  timeout -k 0 -s SIGUSR1 3s ./testOnDemandRTSPServer $pno > /dev/null 2>&1
+  ./testOnDemandRTSPServer $pno > /dev/null 2>&1 &
+  server=$!
+  $replayer $f RTSP $pno 1 > /dev/null 2>&1
+  #the server gets 3s to exit by itself after the replay, then it is stopped with SIGUSR1
+  timeout 3s tail --pid=$server -f /dev/null || kill -SIGUSR1 $server
 
   wait
   cov_data=$(gcovr -r .. -s | grep "[lb][a-z]*:")
@@ -57,8 +60,11 @@ for f in $(echo $folder/$testdir/id*); do
   #terminate running server(s)
   pkill testOnDemandR
   
-  $replayer $f RTSP $pno 1 > /dev/null 2>&1 &
-  timeout -k 0 -s SIGUSR1 3s ./testOnDemandRTSPServer $pno > /dev/null 2>&1
+  ./testOnDemandRTSPServer $pno > /dev/null 2>&1 &
+  server=$!
+  $replayer $f RTSP $pno 1 > /dev/null 2>&1
+  #the server gets 3s to exit by itself after the replay, then it is stopped with SIGUSR1
+  timeout 3s tail --pid=$server -f /dev/null || kill -SIGUSR1 $server
 
   wait
   count=$(expr $count + 1)

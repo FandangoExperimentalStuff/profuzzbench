@@ -34,8 +34,11 @@ fi
 for f in $(echo $folder/$testdir/*.raw | grep -v "\*"); do   #skip when there is no seed file
   time=$(stat -c %Y $f)
 
-  $replayer $f DICOM $pno 1 > /dev/null 2>&1 &
-  timeout -k 0 -s SIGTERM 3s ./dcmqrscp --single-process > /dev/null 2>&1
+  ./dcmqrscp --single-process > /dev/null 2>&1 &
+  server=$!
+  $replayer $f DICOM $pno 1 > /dev/null 2>&1
+  #the server gets 3s to exit by itself after the replay, then it is stopped with SIGTERM
+  timeout 3s tail --pid=$server -f /dev/null || kill -SIGTERM $server
 
   wait
   cov_data=$(gcovr -r $WORKDIR/dcmtk-gcov -s | grep "[lb][a-z]*:")
@@ -52,8 +55,11 @@ count=0
 for f in $(echo $folder/$testdir/id*); do
   time=$(stat -c %Y $f)
 
-  $replayer $f DICOM $pno 1 > /dev/null 2>&1 &
-  timeout -k 0 -s SIGTERM 3s ./dcmqrscp --single-process > /dev/null 2>&1
+  ./dcmqrscp --single-process > /dev/null 2>&1 &
+  server=$!
+  $replayer $f DICOM $pno 1 > /dev/null 2>&1
+  #the server gets 3s to exit by itself after the replay, then it is stopped with SIGTERM
+  timeout 3s tail --pid=$server -f /dev/null || kill -SIGTERM $server
 
   wait
   count=$(expr $count + 1)

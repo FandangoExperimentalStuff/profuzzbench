@@ -33,8 +33,11 @@ fi
 for f in $(echo $folder/$testdir/*.raw); do 
   time=$(stat -c %Y $f)
     
-  $replayer $f TLS $pno 100 > /dev/null 2>&1 &
-  timeout -k 0 3s ./apps/openssl s_server -key key.pem -cert cert.pem -4 -naccept 1 -no_anti_replay > /dev/null 2>&1
+  ./apps/openssl s_server -key key.pem -cert cert.pem -4 -naccept 1 -no_anti_replay > /dev/null 2>&1 &
+  server=$!
+  $replayer $f TLS $pno 100 > /dev/null 2>&1
+  #the server gets 3s to exit by itself after the replay, then it is stopped with SIGTERM
+  timeout 3s tail --pid=$server -f /dev/null || kill -SIGTERM $server
   
   wait
   cov_data=$(gcovr -r . -s | grep "[lb][a-z]*:")
@@ -51,8 +54,11 @@ count=0
 for f in $(echo $folder/$testdir/id*); do 
   time=$(stat -c %Y $f)
   
-  $replayer $f TLS $pno 100 > /dev/null 2>&1 &
-  timeout -k 0 3s ./apps/openssl s_server -key key.pem -cert cert.pem -4 -naccept 1 -no_anti_replay > /dev/null 2>&1
+  ./apps/openssl s_server -key key.pem -cert cert.pem -4 -naccept 1 -no_anti_replay > /dev/null 2>&1 &
+  server=$!
+  $replayer $f TLS $pno 100 > /dev/null 2>&1
+  #the server gets 3s to exit by itself after the replay, then it is stopped with SIGTERM
+  timeout 3s tail --pid=$server -f /dev/null || kill -SIGTERM $server
 
   wait
   count=$(expr $count + 1)

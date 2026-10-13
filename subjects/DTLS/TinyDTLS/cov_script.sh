@@ -33,8 +33,11 @@ fi
 for f in $(echo $folder/$testdir/*.raw); do 
   time=$(stat -c %Y $f)
     
-  $replayer $f DTLS12 $pno 30 > /dev/null 2>&1 &
-  timeout -k 0 -s SIGUSR1 3s ./tinydtls-gcov/tests/dtls-server > /dev/null 2>&1
+  ./tinydtls-gcov/tests/dtls-server > /dev/null 2>&1 &
+  server=$!
+  $replayer $f DTLS12 $pno 30 > /dev/null 2>&1
+  #the server gets 3s to exit by itself after the replay, then it is stopped with SIGUSR1
+  timeout 3s tail --pid=$server -f /dev/null || kill -SIGUSR1 $server
   
   wait
   cov_data=$(gcovr -r $WORKDIR/tinydtls-gcov -s | grep "[lb][a-z]*:")
@@ -51,8 +54,11 @@ count=0
 for f in $(echo $folder/$testdir/id*); do 
   time=$(stat -c %Y $f)
   
-  $replayer $f DTLS12 $pno 30 > /dev/null 2>&1 &
-  timeout -k 0 -s SIGUSR1 3s ./tinydtls-gcov/tests/dtls-server > /dev/null 2>&1
+  ./tinydtls-gcov/tests/dtls-server > /dev/null 2>&1 &
+  server=$!
+  $replayer $f DTLS12 $pno 30 > /dev/null 2>&1
+  #the server gets 3s to exit by itself after the replay, then it is stopped with SIGUSR1
+  timeout 3s tail --pid=$server -f /dev/null || kill -SIGUSR1 $server
 
   wait
   count=$(expr $count + 1)
