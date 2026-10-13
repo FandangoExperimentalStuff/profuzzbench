@@ -6,15 +6,10 @@ OPTIONS=$3    #all configured options -- to make it flexible, we only fix some o
 TIMEOUT=$4    #time for fuzzing
 SKIPCOUNT=$5  #used for calculating cov over time. e.g., SKIPCOUNT=5 means we run gcovr after every 5 test cases
 
-strstr() {
-  [ "${1#*$2*}" = "$1" ] && return 1
-  return 0
-}
+#Commands for the fandango driver
+if [ $FUZZER = "fandango" ]; then
 
-#Commands for afl-based fuzzers (e.g., aflnet, aflnwe)
-if $(strstr $FUZZER "afl"); then
-
-  TARGET_DIR=${TARGET_DIR:-"live555"}
+  TARGET_DIR=${TARGET_DIR:-"live555-fandango"}
   INPUTS=${WORKDIR}/in-rtsp
 
   # Run fuzzer-specific commands (if any)
@@ -25,7 +20,7 @@ if $(strstr $FUZZER "afl"); then
   #Step-1. Do Fuzzing
   #Move to fuzzing folder
   cd $WORKDIR/${TARGET_DIR}/testProgs
-  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/${FUZZER}/afl-fuzz -d -i ${INPUTS} -x ${WORKDIR}/rtsp.dict -o $OUTDIR -N tcp://127.0.0.1/8554 $OPTIONS ./testOnDemandRTSPServer 8554
+  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/8554 --budget $TIMEOUT $OPTIONS -- ./testOnDemandRTSPServer 8554
 
   STATUS=$?
 
@@ -36,11 +31,7 @@ if $(strstr $FUZZER "afl"); then
   #The last argument passed to cov_script should be 0 if the fuzzer is afl/nwe and it should be 1 if the fuzzer is based on aflnet
   #0: the test case is a concatenated message sequence -- there is no message boundary
   #1: the test case is a structured file keeping several request messages
-  if [ $FUZZER == "aflnwe" ]; then
-    cov_script ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/ 8554 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time.csv 0
-  else
-    cov_script ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/ 8554 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time.csv 1
-  fi
+  cov_script ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/ 8554 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time.csv 1
 
   cd $WORKDIR/live555-cov
   #copy .hh files since gcovr could not detect them
@@ -52,7 +43,7 @@ if $(strstr $FUZZER "afl"); then
 
   gcovr -r .. --html --html-details -o index.html
   mkdir ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_html/
-  cp *.html ${WORKDIR}/live555/testProgs/${OUTDIR}/cov_html/
+  cp *.html ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_html/
 
   #Step-3. Save the result to the ${WORKDIR} folder
   #Tar all results to a file

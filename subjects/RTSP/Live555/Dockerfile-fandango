@@ -1,6 +1,21 @@
 # syntax=docker/dockerfile:1-labs
 FROM live555
 
+# Import environment variable to pass as parameter to make (e.g., to make parallel builds with -j)
+ARG MAKE_OPT
+
+# Compile Live555 for the Fandango driver: AFL instrumentation without the response code changes of fuzzing.patch
+RUN cd $WORKDIR && \
+    git clone https://github.com/rgaufman/live555.git live555-fandango && \
+    cd live555-fandango && \
+    git checkout ceeb4f4 && \
+    patch -p1 < $WORKDIR/gcov.patch && \
+    ./genMakefiles linux && \
+    AFL_USE_ASAN=1 make C_COMPILER=afl-clang-fast CPLUSPLUS_COMPILER=afl-clang-fast++ LINK="afl-clang-fast++ -o" clean all $MAKE_OPT
+
+RUN cd ${WORKDIR}/live555-fandango/testProgs && \
+    cp ${AFLNET}/tutorials/live555/sample_media_sources/*.* ./
+
 # Set up Fandango in a Python 3.11 venv with the versions locked in uv.lock of the uv workspace
 COPY --from=ghcr.io/astral-sh/uv:0.13.0 /uv /uvx /bin/
 COPY --from=fandango-workspace --chown=ubuntu:ubuntu pyproject.toml uv.lock /home/ubuntu/fandango-workspace/

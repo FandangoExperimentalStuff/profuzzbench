@@ -6,11 +6,6 @@ OPTIONS=$3    #all configured options -- to make it flexible, we only fix some o
 TIMEOUT=$4    #time for fuzzing
 SKIPCOUNT=$5  #used for calculating cov over time. e.g., SKIPCOUNT=5 means we run gcovr after every 5 test cases
 
-strstr() {
-  [ "${1#*$2*}" = "$1" ] && return 1
-  return 0
-}
-
 #Network deamons needed by forked-daapd
 sudo /etc/init.d/dbus start
 sudo /etc/init.d/avahi-daemon start
@@ -29,22 +24,22 @@ then
   exit 1
 fi
 
-#Commands for afl-based fuzzers (e.g., aflnet, aflnwe)
-if $(strstr $FUZZER "afl"); then
+#Commands for the fandango driver
+if [ $FUZZER = "fandango" ]; then
 
   # Run fuzzer-specific commands (if any)
   if [ -e ${WORKDIR}/run-${FUZZER} ]; then
     source ${WORKDIR}/run-${FUZZER}
   fi
 
-  TARGET_DIR=${TARGET_DIR:-"forked-daapd"}
+  TARGET_DIR=${TARGET_DIR:-"forked-daapd-fandango"}
   INPUTS=${INPUTS:-${WORKDIR}"/in-daap"}
 
   #Step-1. Do Fuzzing
   #Move to fuzzing folder
   cd $WORKDIR
 
-  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/${FUZZER}/afl-fuzz -d -i ${INPUTS} -o $OUTDIR -N tcp://127.0.0.1/3689 $OPTIONS ${WORKDIR}/${TARGET_DIR}/src/forked-daapd -d 0 -c ${WORKDIR}/forked-daapd.conf -f
+  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/3689 --budget $TIMEOUT $OPTIONS -- ${WORKDIR}/${TARGET_DIR}/src/forked-daapd -d 0 -c ${WORKDIR}/forked-daapd.conf -f
 
   STATUS=$?
 
@@ -55,11 +50,7 @@ if $(strstr $FUZZER "afl"); then
   #The last argument passed to cov_script should be 0 if the fuzzer is afl/nwe and it should be 1 if the fuzzer is based on aflnet
   #0: the test case is a concatenated message sequence -- there is no message boundary
   #1: the test case is a structured file keeping several request messages
-  if [ $FUZZER = "aflnwe" ]; then
-    cov_script ${WORKDIR}/${OUTDIR}/ 3689 ${SKIPCOUNT} ${WORKDIR}/${OUTDIR}/cov_over_time.csv 0
-  else
-    cov_script ${WORKDIR}/${OUTDIR}/ 3689 ${SKIPCOUNT} ${WORKDIR}/${OUTDIR}/cov_over_time.csv 1
-  fi
+  cov_script ${WORKDIR}/${OUTDIR}/ 3689 ${SKIPCOUNT} ${WORKDIR}/${OUTDIR}/cov_over_time.csv 1
 
   cd $WORKDIR/forked-daapd-gcov
   gcovr -r . --html --html-details -o index.html

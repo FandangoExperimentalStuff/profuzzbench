@@ -1,6 +1,22 @@
 # syntax=docker/dockerfile:1-labs
 FROM forked-daapd
 
+# Import environment variable to pass as parameter to make (e.g., to make parallel builds with -j)
+ARG MAKE_OPT
+
+# Compile forked-daapd for the Fandango driver: AFL instrumentation without the CRLF that forked-daapd.patch
+# appends to every HTTP body
+COPY --chown=ubuntu:ubuntu forked-daapd-fandango.patch ${WORKDIR}/forked-daapd-fandango.patch
+RUN cd $WORKDIR && \
+    git clone https://github.com/ejurgensen/forked-daapd.git forked-daapd-fandango && \
+    cd forked-daapd-fandango && \
+    git checkout 2ca10d9 && \
+    patch -p1 < $WORKDIR/forked-daapd-fandango.patch && \
+    autoreconf -i && \
+    CC=$AFLNET/afl-clang-fast CFLAGS="-DSQLITE_CORE" ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var  --disable-mpd --disable-itunes --disable-lastfm --disable-spotify --disable-verification  --disable-shared --enable-static && \
+    AFL_USE_ASAN=1 make -C src/ SMARTPL2SQL.c SMARTPL.c DAAP2SQL.c DAAPLexer.c RSPLexer.c RSP2SQL.c && \
+    AFL_USE_ASAN=1 make clean all $MAKE_OPT
+
 # Set up Fandango in a Python 3.11 venv with the versions locked in uv.lock of the uv workspace
 COPY --from=ghcr.io/astral-sh/uv:0.13.0 /uv /uvx /bin/
 COPY --from=fandango-workspace --chown=ubuntu:ubuntu pyproject.toml uv.lock /home/ubuntu/fandango-workspace/

@@ -43,7 +43,7 @@ cd $PFBENCH
 cd subjects/RTSP/Live555
 docker build . -t live555 --build-arg MAKE_OPT $NO_CACHE
 docker build . -t live555-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t live555-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
+docker build . -t live555-fandango -f Dockerfile-fandango --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
 
 cd $PFBENCH
 cd subjects/SIP/Kamailio
@@ -79,5 +79,5 @@ cd $PFBENCH
 cd subjects/DAAP/forked-daapd
 docker build . -t forked-daapd --build-arg MAKE_OPT $NO_CACHE
 docker build . -t forked-daapd-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t forked-daapd-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
+docker build . -t forked-daapd-fandango -f Dockerfile-fandango --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
 
