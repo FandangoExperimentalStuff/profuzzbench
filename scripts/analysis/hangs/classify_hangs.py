@@ -118,7 +118,7 @@ def classify(path):
                 break
             answer = await_answer(sock, server, args.wait_s)
             record["answers"].append(answer)
-            if answer in ("busy", "closed"):
+            if answer == "closed":
                 record["end"] = answer
                 break
     except FileCapReached:
@@ -142,7 +142,9 @@ def classify(path):
     latencies = [a for a in record["answers"] if isinstance(a, float)]
     answered = [isinstance(a, float) for a in record["answers"]]
     last_answered = max((i for i, a in enumerate(answered) if a), default=-1)
-    if record["end"] == "busy" or (record["end"] == "file_cap" and record["server_cpu_s"] >= args.busy_cpu_s):
+    # busy only if the server never answers again after computing without an answer
+    busy_for_good = "busy" in record["answers"][last_answered + 1:]
+    if busy_for_good or (record["end"] == "file_cap" and record["server_cpu_s"] >= args.busy_cpu_s):
         record["class"] = "busy"
     elif latencies and max(latencies) >= args.slow_s:
         record["class"] = "slow"
