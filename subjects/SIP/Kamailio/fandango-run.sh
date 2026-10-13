@@ -24,7 +24,7 @@ if [ $FUZZER = "fandango" ]; then
 
   cd $WORKDIR/${TARGET_DIR}
 
-  /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint udp://127.0.0.1/5060 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/run_pjsip -- ./src/kamailio -f ${WORKDIR}/kamailio-basic.cfg -L $KAMAILIO_MODULES -Y $KAMAILIO_RUNTIME_DIR -n 1 -D -E
+  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint udp://127.0.0.1/5060 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/run_pjsip -- ./src/kamailio -f ${WORKDIR}/kamailio-basic.cfg -L $KAMAILIO_MODULES -Y $KAMAILIO_RUNTIME_DIR -n 1 -D -E
 
   STATUS=$?
 

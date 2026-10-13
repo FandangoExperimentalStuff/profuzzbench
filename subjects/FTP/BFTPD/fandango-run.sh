@@ -20,7 +20,7 @@ if [ $FUZZER = "fandango" ]; then
   #Step-1. Do Fuzzing
   #Move to fuzzing folder
   cd $WORKDIR/${TARGET_DIR}
-  /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/21 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/clean -- ./bftpd -D -c ${WORKDIR}/basic.conf
+  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/21 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/clean -- ./bftpd -D -c ${WORKDIR}/basic.conf
 
   STATUS=$?
 

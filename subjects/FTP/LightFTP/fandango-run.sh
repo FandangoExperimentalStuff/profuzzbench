@@ -21,7 +21,7 @@ if [ $FUZZER = "fandango" ]; then
   #Move to fuzzing folder
   cd $WORKDIR/${TARGET_DIR}/Source/Release
   echo "$WORKDIR/${TARGET_DIR}/Source/Release"
-  /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/2200 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/ftpclean -- ./fftp fftp.conf 2200
+  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/2200 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/ftpclean -- ./fftp fftp.conf 2200
 
   STATUS=$?
 

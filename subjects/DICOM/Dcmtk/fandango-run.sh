@@ -20,7 +20,7 @@ if [ $FUZZER = "fandango" ]; then
   #Step-1. Do Fuzzing
   #Move to fuzzing folder
   cd $WORKDIR/${TARGET_DIR}/build/bin
-  /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/5158 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/clean -- ./dcmqrscp --single-process
+  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/5158 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/clean -- ./dcmqrscp --single-process
 
   STATUS=$?
 

@@ -20,7 +20,7 @@ if [ $FUZZER = "fandango" ]; then
   #Step-1. Do Fuzzing
   #Move to fuzzing folder
   cd $WORKDIR/${TARGET_DIR}/src
-  /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint udp://127.0.0.1/5353 --budget $TIMEOUT $OPTIONS -- ./dnsmasq
+  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint udp://127.0.0.1/5353 --budget $TIMEOUT $OPTIONS -- ./dnsmasq
 
   STATUS=$?
 

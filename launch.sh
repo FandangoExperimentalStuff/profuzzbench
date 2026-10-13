@@ -5,7 +5,7 @@
 cd "$(dirname "$0")"
 
 TARGETS=${TARGETS:-"lightftp bftpd proftpd pure-ftpd exim dnsmasq live555 kamailio openssh openssl tinydtls dcmtk forked-daapd"}
-FUZZERS=${FUZZERS:-"aflnet stateafl"}      # add aflnwe if needed
+FUZZERS=${FUZZERS:-"aflnet stateafl"}      # add aflnwe or fandango if needed
 RUNS=${RUNS:-10}
 # CPUs to use, as a list of ranges (like taskset -c). One run per CPU; SLOTS = number of CPUs.
 # On this Threadripper, CPU n and n+24 are SMT siblings of the same physical core.

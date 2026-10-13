@@ -20,3 +20,6 @@ USER root
 # Replace the run and coverage scripts of the base image with their Fandango versions
 COPY --chown=ubuntu:ubuntu fandango-run.sh ${WORKDIR}/run
 COPY --chown=ubuntu:ubuntu fandango-cov_script.sh ${WORKDIR}/cov_script
+
+# Copy the Fandango specification of the protocol
+COPY --chown=ubuntu:ubuntu fan-specs ${WORKDIR}/fan-specs
