@@ -32,6 +32,4 @@ cd $PFBENCH
 
 Every target has a `fan-specs/` directory and an entry `OPTS[<target>,fandango]` in [jobs.conf](jobs.conf), which names the specification the target expects (`<protocol>.fan`, e.g., `dns.fan` for Dnsmasq). To run Fandango on a target, put the specification into its `fan-specs/` directory and rebuild its Fandango image. The run is limited to the fuzzing time with `timeout`, as for AFLNet and StateAFL. A server that does not answer a message within `TEST_TIMEOUT` counts as hanging (`--response-timeout`).
 
-Live555 and forked-daapd additionally need a dedicated build of the server for Fandango and are not supported yet.
-
 Please see the main [README.md](README.md) for more information about how to analyze experiments with ProFuzzBench.
