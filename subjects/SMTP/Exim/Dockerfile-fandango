@@ -23,3 +23,5 @@ COPY --chown=ubuntu:ubuntu fandango-cov_script.sh ${WORKDIR}/cov_script
 
 # Copy the Fandango specification of the protocol
 COPY --chown=ubuntu:ubuntu fan-specs ${WORKDIR}/fan-specs
+
+COPY --chown=ubuntu:ubuntu in-smtp-replay ${WORKDIR}/in-smtp-replay
