@@ -38,6 +38,16 @@ if [ $FUZZER = "fandango" ]; then
   mkdir ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/cov_html/
   cp *.html ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/cov_html/
 
+  #Coverage of the seeds of the seed-based fuzzers followed by the Fandango sessions, to compare with them
+  cd $WORKDIR/LightFTP-gcov/Source/Release
+  SEEDED=$(mktemp -d)
+  mkdir ${SEEDED}/replayable-queue
+  cp ${WORKDIR}/in-ftp-replay/*.raw ${SEEDED}/replayable-queue/
+  touch -d @$(sed -n 's/^start_time *: *//p' ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/fuzzer_stats) ${SEEDED}/replayable-queue/*.raw
+  cp -p ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/replayable-queue/id* ${SEEDED}/replayable-queue/ 2>/dev/null
+  cov_script ${SEEDED}/ 2200 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/cov_over_time_with_seeds.csv 1
+  rm -rf ${SEEDED}
+
   #Step-3. Save the result to the ${WORKDIR} folder
   #Tar all results to a file
   cd ${WORKDIR}/${TARGET_DIR}/Source/Release

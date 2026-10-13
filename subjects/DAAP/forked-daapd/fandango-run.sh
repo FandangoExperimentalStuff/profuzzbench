@@ -57,6 +57,16 @@ if [ $FUZZER = "fandango" ]; then
   mkdir ${WORKDIR}/${OUTDIR}/cov_html/
   cp *.html ${WORKDIR}/${OUTDIR}/cov_html/
 
+  #Coverage of the seeds of the seed-based fuzzers followed by the Fandango sessions, to compare with them
+  cd $WORKDIR
+  SEEDED=$(mktemp -d)
+  mkdir ${SEEDED}/replayable-queue
+  cp ${WORKDIR}/in-daap-replay/*.raw ${SEEDED}/replayable-queue/
+  touch -d @$(sed -n 's/^start_time *: *//p' ${WORKDIR}/${OUTDIR}/fuzzer_stats) ${SEEDED}/replayable-queue/*.raw
+  cp -p ${WORKDIR}/${OUTDIR}/replayable-queue/id* ${SEEDED}/replayable-queue/ 2>/dev/null
+  cov_script ${SEEDED}/ 3689 ${SKIPCOUNT} ${WORKDIR}/${OUTDIR}/cov_over_time_with_seeds.csv 1
+  rm -rf ${SEEDED}
+
   #Step-3. Save the result to the ${WORKDIR} folder
   #Tar all results to a file
   cd ${WORKDIR}
