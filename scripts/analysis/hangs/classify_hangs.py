@@ -13,6 +13,7 @@ import argparse, json, os, pathlib, select, signal, socket, struct, subprocess, 
 
 LENGTH = struct.Struct("=I")
 TICK_S = 1 / os.sysconf("SC_CLK_TCK")
+RECORD_PREFIX = "RECORD "
 REPLY_END_S = 0.1  # an answer ends after this long without further bytes
 
 
@@ -164,7 +165,7 @@ def classify(path):
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--hangs", required=True, help="directory of hang files in the replay format")
-parser.add_argument("--out", required=True, help="JSON lines, one record per hang file")
+parser.add_argument("--done", default=None, help="JSON lines of hang files already classified, which are skipped")
 parser.add_argument("--command", required=True, help="command line of the fuzzing build of the server")
 parser.add_argument("--cwd", required=True)
 parser.add_argument("--cleanup", default=None, help="shell command run before every hang file")
@@ -179,10 +180,8 @@ parser.add_argument("--busy-cpu-s", type=float, default=5.0, help="CPU time with
 parser.add_argument("--file-cap-s", type=float, default=60.0, help="plus --wait-s per message: longest time per hang file")
 args = parser.parse_args()
 done = set()
-if os.path.exists(args.out):
-    done = {json.loads(line)["file"] for line in open(args.out) if line.strip()}
-with open(args.out, "a") as out:
-    for path in sorted(pathlib.Path(args.hangs).iterdir()):
-        if path.name not in done:
-            out.write(json.dumps(classify(path)) + "\n")
-            out.flush()
+if args.done and os.path.exists(args.done):
+    done = {json.loads(line)["file"] for line in open(args.done) if line.strip()}
+for path in sorted(pathlib.Path(args.hangs).iterdir()):
+    if path.name not in done:
+        print(RECORD_PREFIX + json.dumps(classify(path)), flush=True)

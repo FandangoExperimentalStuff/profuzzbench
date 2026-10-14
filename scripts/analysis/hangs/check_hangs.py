@@ -10,6 +10,7 @@ import argparse, collections, concurrent.futures, csv, json, pathlib, re, subpro
 from typing import NamedTuple
 
 HERE = pathlib.Path(__file__).resolve().parent
+RECORD_PREFIX = "RECORD "  # as classify_hangs.py marks its records on stdout
 W = "$WORKDIR"
 DAAPD_DAEMONS = "sudo /etc/init.d/dbus start >/dev/null; sudo /etc/init.d/avahi-daemon start >/dev/null;"
 
@@ -82,15 +83,26 @@ def check_run(run, out, cpu, wait_s, slow_s):
     target, fuzzer, number, directory = run
     config = TARGETS[target]
     cleanup_option = f"--cleanup {config.cleanup}" if config.cleanup else ""
-    classify = (f"python3 /hangs-tool/classify_hangs.py --hangs /hangs --out /out/{directory.name}.jsonl "
+    result = out / f"{directory.name}.jsonl"
+    classify = (f"python3 /hangs-tool/classify_hangs.py --hangs /hangs --done /out/{result.name} "
                 f"--cwd {config.cwd} --command \"{config.command}\" {cleanup_option} --transport {config.transport} "
                 f"--port {config.port} --wait-s {wait_s} --slow-s {slow_s} {config.options}")
-    completed = subprocess.run(["docker", "run", "--rm", "--cpuset-cpus", str(cpu), "-v", f"{HERE}:/hangs-tool:ro",
-                    "-v", f"{directory.resolve()}:/hangs:ro", "-v", f"{out.resolve()}:/out", target,
-                    "/bin/bash", "-c", config.before + classify], capture_output=True, text=True)
-    if completed.returncode != 0:
-        error = (completed.stderr.strip().splitlines() or ["no output"])[-1]
-        print(f"WARNING {directory.name}: container ended with {completed.returncode}: {error}", flush=True)
+    # The container only reads /out; its records come over stdout and are written here, by the host's user
+    container = subprocess.Popen(["docker", "run", "--rm", "--cpuset-cpus", str(cpu), "-v", f"{HERE}:/hangs-tool:ro",
+                                  "-v", f"{directory.resolve()}:/hangs:ro", "-v", f"{out.resolve()}:/out:ro", target,
+                                  "/bin/bash", "-c", config.before + classify],
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    last_other_line = "no output"
+    with open(result, "a") as records:
+        for line in container.stdout:
+            if line.startswith(RECORD_PREFIX):
+                records.write(line[len(RECORD_PREFIX):])
+                records.flush()
+            elif line.strip():
+                last_other_line = line.strip()
+    if container.wait() != 0:
+        error = last_other_line
+        print(f"WARNING {directory.name}: container ended with {container.returncode}: {error}", flush=True)
     return run
 
 
