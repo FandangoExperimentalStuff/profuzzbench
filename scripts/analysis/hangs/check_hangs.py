@@ -4,7 +4,7 @@ Takes the results directory of a campaign (results-<target>/out-<target>-<fuzzer
 files of every run against the fuzzing build in the base image of the target with classify_hangs.py, and prints
 how many hangs are real per target and fuzzer. Needs the base images (e.g. 'lightftp'). Rerunning resumes.
 
-python3 check_hangs.py <results dir> <out dir> [--jobs 12] [--cpus 0-11,24-35] [--sample 0] [--targets ...]
+python3 check_hangs.py <results dir> <out dir> [--jobs 12] [--cpus 0-11,24-35] [--memory 6g] [--sample 0] [--targets ...]
 """
 import argparse, collections, concurrent.futures, csv, json, pathlib, re, subprocess, tarfile
 from typing import NamedTuple
@@ -79,7 +79,7 @@ def extract_hangs(results, work, sample, targets):
     return runs
 
 
-def check_run(run, out, cpu, wait_s, slow_s):
+def check_run(run, out, cpu, memory, wait_s, slow_s):
     target, fuzzer, number, directory = run
     config = TARGETS[target]
     cleanup_option = f"--cleanup {config.cleanup}" if config.cleanup else ""
@@ -88,8 +88,9 @@ def check_run(run, out, cpu, wait_s, slow_s):
                 f"--cwd {config.cwd} --command \"{config.command}\" {cleanup_option} --transport {config.transport} "
                 f"--port {config.port} --wait-s {wait_s} --slow-s {slow_s} {config.options}")
     # The container only reads /out; its records come over stdout and are written here, by the host's user
-    container = subprocess.Popen(["docker", "run", "--rm", "--cpuset-cpus", str(cpu), "-v", f"{HERE}:/hangs-tool:ro",
-                                  "-v", f"{directory.resolve()}:/hangs:ro", "-v", f"{out.resolve()}:/out:ro", target,
+    container = subprocess.Popen(["docker", "run", "--rm", "--cpuset-cpus", str(cpu), "--memory", memory,
+                                  "-v", f"{HERE}:/hangs-tool:ro", "-v", f"{directory.resolve()}:/hangs:ro",
+                                  "-v", f"{out.resolve()}:/out:ro", target,
                                   "/bin/bash", "-c", config.before + classify],
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     last_other_line = "no output"
@@ -133,6 +134,7 @@ parser.add_argument("out", type=pathlib.Path, help="output directory; rerunning 
 parser.add_argument("--targets", nargs="*", default=list(TARGETS), choices=list(TARGETS))
 parser.add_argument("--jobs", type=int, default=12, help="containers at the same time, one CPU each")
 parser.add_argument("--cpus", default="0-11", help="CPUs for the containers, as taskset -c")
+parser.add_argument("--memory", default="6g", help="memory limit per container; a server over it is killed")
 parser.add_argument("--sample", type=int, default=0, help="at most this many hang files per run; 0 for all")
 parser.add_argument("--wait-s", type=float, default=6.0, help="wait this long for each answer; must exceed --slow-s")
 parser.add_argument("--slow-s", type=float, default=5.0, help="an answer this late is a real hang, like TEST_TIMEOUT")
@@ -151,7 +153,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.jobs, len(cpus))
                 free_cpus.append(pending.pop(future))
                 print(f"done {future.result()[3].name}", flush=True)
         cpu = free_cpus.pop(0)
-        pending[pool.submit(check_run, run, args.out, cpu, args.wait_s, args.slow_s)] = cpu
+        pending[pool.submit(check_run, run, args.out, cpu, args.memory, args.wait_s, args.slow_s)] = cpu
     for future in concurrent.futures.as_completed(pending):
         print(f"done {future.result()[3].name}", flush=True)
 summarize(runs, args.out)
