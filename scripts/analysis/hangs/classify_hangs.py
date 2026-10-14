@@ -3,6 +3,7 @@ Replays the hang files of one run against the fuzzing build of the server and cl
 
 Classes:
  - busy:    the server computes for at least --busy-cpu-s without answering      -> a real hang
+ - memory:  the server is killed for its memory (SIGKILL before the replay ends) -> a real hang
  - slow:    one answer takes at least --slow-s                                   -> a real hang
  - fast:    every answer comes quickly; only the sum of the session exceeded -t  -> no hang
  - silent:  the server is idle and does not answer any more from some message on -> no hang
@@ -14,6 +15,7 @@ import argparse, json, os, pathlib, select, signal, socket, struct, subprocess, 
 LENGTH = struct.Struct("=I")
 TICK_S = 1 / os.sysconf("SC_CLK_TCK")
 RECORD_PREFIX = "RECORD "
+OOM_KILLED = (-signal.SIGKILL, 128 + signal.SIGKILL)  # the server itself, or the shell that started it
 REPLY_END_S = 0.1  # an answer ends after this long without further bytes
 
 
@@ -149,6 +151,9 @@ def classify(path):
         record["class"] = "busy"
     elif latencies and max(latencies) >= args.slow_s:
         record["class"] = "slow"
+    elif exit_status in OOM_KILLED:
+        # Only the out-of-memory killer sends SIGKILL while the replay runs; this script sends it afterwards
+        record["class"] = "memory"
     elif exit_status is not None and (exit_status < 0 or exit_status > 128):
         record["class"] = "crashed"
     elif record["end"] in ("closed", "exited"):

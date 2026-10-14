@@ -4,7 +4,7 @@ Takes the results directory of a campaign (results-<target>/out-<target>-<fuzzer
 files of every run against the fuzzing build in the base image of the target with classify_hangs.py, and prints
 how many hangs are real per target and fuzzer. Needs the base images (e.g. 'lightftp'). Rerunning resumes.
 
-python3 check_hangs.py <results dir> <out dir> [--jobs 12] [--cpus 0-11,24-35] [--memory 6g] [--sample 0] [--targets ...]
+python3 check_hangs.py <results dir> <out dir> [--jobs 12] [--cpus 0-11,24-35] [--memory 4g] [--sample 0] [--targets ...]
 """
 import argparse, collections, concurrent.futures, csv, json, pathlib, re, subprocess, tarfile
 from typing import NamedTuple
@@ -46,8 +46,8 @@ TARGETS = {
     "forked-daapd": Target(3689, "tcp", W, f"{W}/forked-daapd/src/forked-daapd -d 0 -c {W}/forked-daapd.conf -f",
                            options="--settle-s 20", before=DAAPD_DAEMONS),
 }
-REAL = ("busy", "slow")
-CLASSES = ("busy", "slow", "fast", "silent", "closed", "crashed")
+REAL = ("busy", "memory", "slow")
+CLASSES = ("busy", "memory", "slow", "fast", "silent", "closed", "crashed")
 
 
 def cpu_list(text):
@@ -125,7 +125,8 @@ def summarize(runs, out):
     for (target, fuzzer), c in sorted(counts.items()):
         total = sum(c.values())
         print(f"{target:13} {fuzzer:9} {total:6} {sum(c[r] for r in REAL):6}  " + " ".join(f"{c[k]:6}" for k in CLASSES))
-    print("real = busy (the server computes without answering) + slow (one answer takes at least --slow-s)")
+    print("real = busy (the server computes without answering) + memory (the server is killed for its memory) "
+          "+ slow (one answer takes at least --slow-s)")
 
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -134,7 +135,7 @@ parser.add_argument("out", type=pathlib.Path, help="output directory; rerunning 
 parser.add_argument("--targets", nargs="*", default=list(TARGETS), choices=list(TARGETS))
 parser.add_argument("--jobs", type=int, default=12, help="containers at the same time, one CPU each")
 parser.add_argument("--cpus", default="0-11", help="CPUs for the containers, as taskset -c")
-parser.add_argument("--memory", default="6g", help="memory limit per container; a server over it is killed")
+parser.add_argument("--memory", default="4g", help="memory limit per container; a server over it is killed")
 parser.add_argument("--sample", type=int, default=0, help="at most this many hang files per run; 0 for all")
 parser.add_argument("--wait-s", type=float, default=6.0, help="wait this long for each answer; must exceed --slow-s")
 parser.add_argument("--slow-s", type=float, default=5.0, help="an answer this late is a real hang, like TEST_TIMEOUT")
