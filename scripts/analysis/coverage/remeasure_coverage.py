@@ -5,12 +5,14 @@ Takes the results directory of a campaign (results-<target>/out-<target>-<fuzzer
 replayable-queue of every run in the base image of its target, as run.sh does after fuzzing, and writes a new
 cov_over_time.csv per run. Docker base images need to be compiled. Rerunning resumes.
 
-python3 remeasure_coverage.py <results dir> <out dir> [--jobs 12] [--cpus 0-11] [--targets ...] [--fuzzers ...]
+python3 remeasure_coverage.py <results dir> <out dir> [--jobs 12] [--cpus 0-11] [--memory 4g]
+    [--targets ...] [--fuzzers ...]
 """
 import argparse, concurrent.futures, pathlib, re, subprocess, tarfile
 from typing import NamedTuple
 
 W = "$WORKDIR"
+CSV_MARKER = "=== cov_over_time.csv ==="  # on stdout, after the setup's own output, before the measured table
 
 
 class Target(NamedTuple):
@@ -78,22 +80,24 @@ def unpack_queue(run, work):
     return directory
 
 
-def remeasure(run, work, out, cpu, skipcount):
+def remeasure(run, work, out, cpu, memory, skipcount):
     csv = out / f"{run.name}.csv"
     if csv.exists():
         return run, "already measured"
     directory = unpack_queue(run, work).resolve()
     config = TARGETS[run.target]
+    # The table goes to stdout and is written here, by the host's user: the container writes nothing it mounts
     measure = (f"{config.before} cd {config.gcov_dir} && "
-               f"cov_script /queue/ {config.port} {skipcount} /out/{run.name}.csv.part 1 > /dev/null 2>&1")
-    completed = subprocess.run(["docker", "run", "--rm", "--cpuset-cpus", str(cpu), "-v", f"{directory}:/queue",
-                                "-v", f"{out.resolve()}:/out", run.target, "/bin/bash", "-c", measure],
+               f"cov_script /queue/ {config.port} {skipcount} /tmp/cov.csv 1 > /dev/null 2>&1 && "
+               f"echo '{CSV_MARKER}' && cat /tmp/cov.csv")
+    completed = subprocess.run(["docker", "run", "--rm", "--cpuset-cpus", str(cpu), "--memory", memory,
+                                "-v", f"{directory}:/queue", run.target, "/bin/bash", "-c", measure],
                                capture_output=True, text=True)
-    part = out / f"{run.name}.csv.part"
-    if completed.returncode != 0 or not part.exists() or len(part.read_text().splitlines()) < 2:
+    _, marker, table = completed.stdout.partition(CSV_MARKER + "\n")
+    if completed.returncode != 0 or not marker or len(table.splitlines()) < 2:
         error = (completed.stderr.strip().splitlines() or ["no output"])[-1]
         return run, f"FAILED (exit {completed.returncode}): {error}"
-    part.replace(csv)
+    csv.write_text(table)
     return run, f"{len(csv.read_text().splitlines()) - 1} rows"
 
 
@@ -104,6 +108,7 @@ parser.add_argument("--targets", nargs="*", default=list(TARGETS), choices=list(
 parser.add_argument("--fuzzers", nargs="*", default=["aflnet", "stateafl"], choices=["aflnet", "stateafl", "aflnwe"])
 parser.add_argument("--jobs", type=int, default=12, help="containers at the same time, one CPU each")
 parser.add_argument("--cpus", default="0-11", help="CPUs for the containers, as taskset -c")
+parser.add_argument("--memory", default="4g", help="memory limit per container; a server over it is killed")
 parser.add_argument("--skipcount", type=int, default=5, help="run gcovr after every this many test cases, as SKIPCOUNT")
 args = parser.parse_args()
 (args.out / "csv").mkdir(parents=True, exist_ok=True)
@@ -123,5 +128,6 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=len(cpus)) as pool:
         if len(pending) >= len(cpus):
             report(concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)[0])
         cpu = free_cpus.pop(0)
-        pending[pool.submit(remeasure, run, args.out / "queues", args.out / "csv", cpu, args.skipcount)] = cpu
+        pending[pool.submit(remeasure, run, args.out / "queues", args.out / "csv", cpu, args.memory,
+                            args.skipcount)] = cpu
     report(concurrent.futures.wait(pending)[0])
