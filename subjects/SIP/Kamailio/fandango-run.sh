@@ -22,6 +22,11 @@ if [ $FUZZER = "fandango" ]; then
   export KAMAILIO_MODULES="src/modules"
   export KAMAILIO_RUNTIME_DIR="runtime_dir"
 
+  #Configure the spec for this setup from the KEY=VALUE files next to it
+  for SPEC_ENV in ${WORKDIR}/fan-specs/*.env; do
+    if [ -e "$SPEC_ENV" ]; then set -a; source "$SPEC_ENV"; set +a; fi
+  done
+
   cd $WORKDIR/${TARGET_DIR}
 
   timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint udp://127.0.0.1/5060 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/run_pjsip -- ./src/kamailio -f ${WORKDIR}/kamailio-basic.cfg -L $KAMAILIO_MODULES -Y $KAMAILIO_RUNTIME_DIR -n 1 -D -E

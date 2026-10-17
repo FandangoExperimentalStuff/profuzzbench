@@ -16,6 +16,11 @@ if [ $FUZZER = "fandango" ]; then
   TARGET_DIR=${TARGET_DIR:-"tinydtls"}
   INPUTS=${INPUTS:-${WORKDIR}"/in-dtls"}
 
+  #Configure the spec for this setup from the KEY=VALUE files next to it
+  for SPEC_ENV in ${WORKDIR}/fan-specs/*.env; do
+    if [ -e "$SPEC_ENV" ]; then set -a; source "$SPEC_ENV"; set +a; fi
+  done
+
   #Step-1. Do Fuzzing
   #Move to fuzzing folder
   cd $WORKDIR
