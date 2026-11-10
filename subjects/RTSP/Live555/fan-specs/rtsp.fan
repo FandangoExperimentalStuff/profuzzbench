@@ -1,3141 +1,4527 @@
-# Real Time Streaming Protocol (RTSP) 1.0, RFC 2326, as a Fandango I/O grammar.
-#
-# Fandango plays the RTSP client (party Client, client state machine RFC 2326 A.1), the system
-# under test the media server (party Server, RFC 2326 A.2), over one persistent TCP connection
-# (RFC 2326 9, scheme "rtsp"). Message syntax: RFC 2326 4, 6, 7, 12, 15 and the HTTP/1.1 rules
-# it refers to (RFC 9110, RFC 9112); URIs per RFC 3986.
-#
-# Section references: "2326 x" = RFC 2326, "9110 x" = RFC 9110, "9112 x" = RFC 9112,
-# "3986 x" = RFC 3986. "H x" in RFC 2326 refers to RFC 2068, superseded by RFC 9110/9112.
+# Real Time Streaming Protocol (RTSP 1.0, RFC 2326 and its erratum), testing servers over a TCP control connection.
+# The HTTP syntax RTSP imports comes from RFC 9110/9112, the URI syntax from RFC 3986.
+# Fandango is the Client; the Server is the implementation under test.
+# Section numbers in the comments are those of RFC 2326 unless another RFC is named.
 
+# ============================================================================================
+# Test setup: everything the test setup decides is read here, from the environment, with defaults.
+# ============================================================================================
 import os
 import re
-import math
-import base64
 import random
+import base64
+import threading
 
-# ======================================================================================
-# Test setup: everything the test setup decides, each value from an environment variable
-# ======================================================================================
-
-RTSP_HOST = os.environ.get("RTSP_HOST", "127.0.0.1")              # server host in Request-URIs
-RTSP_PORT = os.environ.get("RTSP_PORT", "554")                    # server port in Request-URIs
-RTSP_MEDIA_PATH = os.environ.get("RTSP_MEDIA_PATH", "test.mkv")   # presentation the server plays
-RTSP_MEDIA_TRACK = os.environ.get("RTSP_MEDIA_TRACK", "track1")   # control path of one of its streams
-RTSP_RECORD_PATH = os.environ.get("RTSP_RECORD_PATH", "rec")      # presentation the client records
-RTSP_RECORD_TRACK = os.environ.get("RTSP_RECORD_TRACK", "trackID=0")  # control path of its stream
-RTSP_AUTH_PATH = os.environ.get("RTSP_AUTH_PATH", "secure")       # presentation that may need credentials
-RTSP_USER = os.environ.get("RTSP_USER", "user")                   # valid credentials
+# host[:port] of the server as it appears in request URLs
+RTSP_AUTHORITY = os.environ.get("RTSP_AUTHORITY", "127.0.0.1")
+# Presentation paths the server setup offers; each session picks from them
+RTSP_TARGETS = [t for t in os.environ.get("RTSP_TARGETS", "/test").split(",") if t]
+# Stream control paths (appended to the presentation path) the server setup offers
+RTSP_CONTROLS = [t for t in os.environ.get("RTSP_CONTROLS", "/trackID=0").split(",") if t]
+# Paths the server setup accepts for publishing with ANNOUNCE and RECORD
+RTSP_PUBLISH_TARGETS = [t for t in os.environ.get("RTSP_PUBLISH_TARGETS", "/publish").split(",") if t]
+# Credentials that the accepting exchange sends; the refusing exchange sends other values
+RTSP_USER = os.environ.get("RTSP_USER", "user")
 RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "pass")
-RTSP_WRONG_PASSWORD = os.environ.get("RTSP_WRONG_PASSWORD", "wrong-password")  # refused credentials
-RTSP_MISSING_PATH = os.environ.get("RTSP_MISSING_PATH", "no-such-presentation")  # unknown resource
-RTSP_CLIENT_PORT = int(os.environ.get("RTSP_CLIENT_PORT", "50000"))  # first client RTP port (even)
-RTSP_MULTICAST_ADDRESS = os.environ.get("RTSP_MULTICAST_ADDRESS", "224.2.0.1")  # client-chosen group
-RTSP_UNKNOWN_OPTION = os.environ.get("RTSP_UNKNOWN_OPTION", "x-fandango-unsupported")  # option-tag the client requires (private, 2326 3.8)
-RTSP_UNKNOWN_CONFERENCE = os.environ.get("RTSP_UNKNOWN_CONFERENCE", "fandango-conference")  # conference-id the server does not know
-RTSP_CONFERENCE = os.environ.get("RTSP_CONFERENCE", "conf-1")      # pre-established conference (2326 12.9)
-RTSP_REPLY_WAIT = os.environ.get("RTSP_REPLY_WAIT", "2")           # seconds the client waits for a reply
-RTSP_AUTH_REPLY_WAIT = os.environ.get("RTSP_AUTH_REPLY_WAIT", "3")  # seconds it waits for the reply to wrong credentials
-RTSP_TRANSPORT = os.environ.get("RTSP_TRANSPORT", "tcp")            # the driver's endpoint: "tcp" (scheme rtsp) or "udp" (rtspu, 2326 9.2)
-TOLERATED = os.environ.get("TOLERATED", "")                       # comma-separated tolerances
+# Comma-separated names of the deviations of the server under test that the grammar tolerates
+TOLERATED = os.environ.get("TOLERATED", "")
+# Seconds Fandango waits for the reply to a queued PLAY (10.5): the server may hold it back until the running PLAY has ended
+RTSP_WAIT = os.environ.get("RTSP_WAIT", "6.0")
+# Seconds Fandango waits for the reply to a request (9.2: the server may leave it unanswered, and the sender may resend after a timeout)
+RTSP_REPLY_WAIT = os.environ.get("RTSP_REPLY_WAIT", "1.5")
+# Seconds Fandango waits for the server to close the connection after a request with Connection: close (the server may keep it open)
+RTSP_CLOSE_WAIT = os.environ.get("RTSP_CLOSE_WAIT", "1.0")
+# Interleaved frames the Client party hands to Fandango per session; the media payload is not carried (RFC 3550)
+RTSP_FRAME_LIMIT = int(os.environ.get("RTSP_FRAME_LIMIT", "2"))
 
 
-# 2326 3.2, 9: the scheme names the transport: rtsp a persistent TCP connection, rtspu
-# connectionless UDP; 9.2: over UDP a request without reply may be resent, over TCP never
-CONNECTIONLESS = RTSP_TRANSPORT.lower() == "udp"
-URL_SCHEME = "rtspu" if CONNECTIONLESS else "rtsp"
+def reply_wait(longest):  # the longest wait of a timer, see the setup block
+    """How long Fandango waits for a reply: 2/3 of the longest wait up to all of it. Fandango's packet filter holds back a packet that is identical to one already sent for seconds
+    when it adds no coverage, so the start of the timer varies in the milliseconds instead of repeating one string."""
+    longest = float(longest)
+    return str(round(random.uniform(longest * 2 / 3, longest), 3))
 
 
-def resend_allowed(expiry):
-    """2326 9.2: the reply timer's expiry is an occasion to resend the request over UDP only."""
-    return CONNECTIONLESS
+def tolerated(name):
+    return name in [n.strip() for n in TOLERATED.split(",") if n.strip()]
 
 
-def url_scheme():
-    return random.choice([URL_SCHEME, URL_SCHEME.upper()])
+# ============================================================================================
+# What earlier messages of the session name, for the requests that follow (recording and recalling).
+# ============================================================================================
+MEMORY = {}
 
 
-def tolerated(name, deviation=None):
-    """Whether the test setup tolerates the server deviation `name` (tolerances.json); `deviation`
-    is the tree that shows it."""
-    return name in [item.strip() for item in TOLERATED.split(",") if item.strip()]
+def reset_memory():
+    MEMORY.clear()
+    MEMORY["cseq"] = 0
+    MEMORY["session"] = None
+    MEMORY["base"] = None
+    MEMORY["location"] = None
+    MEMORY["request_url"] = None
+    MEMORY["message_url"] = None
+    MEMORY["controls"] = []
+    MEMORY["aggregate"] = None
+    MEMORY["etag"] = None
+    MEMORY["frames"] = 0
+    MEMORY["target"] = random.choice(RTSP_TARGETS)
+    MEMORY["publish"] = random.choice(RTSP_PUBLISH_TARGETS)
 
 
-# ======================================================================================
-# Helpers of constraints, generators and computed repetitions
-# ======================================================================================
-
-def _name(tree):
-    return tree.symbol.name() if tree.symbol.is_non_terminal else ""
+reset_memory()
 
 
-MESSAGE_PREFIXES = ("<req_", "<rep_", "<srv_req_", "<interleaved_frame")
+def record_session(value):
+    MEMORY["session"] = str(value)
+    return str(value)
 
 
-def _is_message(tree):
-    """Whether `tree` is (part of) a party message: messages are named <req_*>, <rep_*>,
-    <srv_req_*> and <interleaved_frame*>; states, replies-in-state rules and wrappers are not."""
-    return _name(tree).startswith(MESSAGE_PREFIXES)
-
-
-def _from_client(message):
-    """Whether a party message is one the client sends: its requests, replies and data."""
-    return _name(message).startswith(("<req_", "<rep_to_", "<interleaved_frame_sent"))
-
-
-def has_header(message, name):
-    return _first(message, name) is not None
-
-
-def _first(tree, name):
-    for found in tree.find_subtrees(name):
-        return found
-    return None
-
-
-def _message_of(tree):
-    """The party message holding `tree`: its outermost message-named ancestor."""
-    message = None
-    node = tree
-    while node is not None:
-        if _is_message(node):
-            message = node
-        elif message is not None:
-            break
-        node = node.parent
-    return message
-
-
-def _messages_before(tree):
-    """The party messages of the session before the one holding `tree`, in order."""
-    stop = _message_of(tree)
-    found = []
-
-    def walk(node):
-        if node is stop:
-            return True
-        if _is_message(node):
-            found.append(node)
-            return False
-        for child in node.children:
-            if walk(child):
-                return True
-        return False
-
-    walk(tree.get_root())
-    return found
-
-
-def content_length(headers):
-    """Length of the body a header block announces: its Content-Length, else 0 (2326 4.4, 12.14)."""
-    value = _first(headers, "<content_length_value>")
-    return int(str(value)) if value is not None else 0
-
-
-def entity_to_octets(entity):
-    """Converter: the octets of a typed body (2326 4.3, see octets_to_entity); identity coding."""
-    return bytes(entity)[1:]
-
-
-def _content_codings(body):
-    message = body.parent
-    if message is None:
-        return []
-    codings = []
-    for header in message.find_subtrees("<h_content_encoding>"):
-        codings += [str(token).strip().lower() for token in header.find_subtrees("<token>")]
-    return codings
-
-
-def _media_type(body):
-    message = body.parent
-    for value in (message.find_subtrees("<media_type_rcv>") if message is not None else []):
-        return str(value).split(";")[0].strip().lower()
-    return None
-
-
-def _lzw_decompress(data):
-    """The "compress" coding (9110 8.4.1.1): adaptive LZW of the UNIX compress program."""
-    if data[:2] != b"\x1f\x9d":
-        raise ValueError("no compress header")
-    max_bits, block_mode = data[2] & 0x1F, data[2] & 0x80
-    table = [bytes([i]) for i in range(256)] + ([b""] if block_mode else [])
-    bits, out, previous = 9, [], None
-    position, payload = 0, data[3:]
-    total_bits = len(payload) * 8
-    group_start = 0
-    while position + bits <= total_bits:
-        byte, offset = position // 8, position % 8
-        chunk = int.from_bytes(payload[byte:byte + 3].ljust(3, b"\0"), "little")
-        code = (chunk >> offset) & ((1 << bits) - 1)
-        position += bits
-        if block_mode and code == 256:
-            # clear: a new table; the rest of the current group of codes is padding
-            group = bits * 8
-            position = group_start + ((position - group_start + group - 1) // group) * group
-            table, bits, previous, group_start = table[:257], 9, None, position
-            continue
-        if code < len(table):
-            entry = table[code]
-        elif code == len(table) and previous is not None:
-            entry = previous + previous[:1]
-        else:
-            raise ValueError("bad compress code")
-        out.append(entry)
-        if previous is not None and len(table) < (1 << max_bits):
-            table.append(previous + entry[:1])
-        previous = entry
-        if len(table) >= (1 << bits) and bits < max_bits:
-            group = bits * 8
-            position = group_start + ((position - group_start + group - 1) // group) * group
-            bits, group_start = bits + 1, position
-    return b"".join(out)
-
-
-def _lzw_compress(data):
-    """The "compress" coding (9110 8.4.1.1): adaptive LZW as the UNIX compress program writes it
-    (16-bit maximum, no block mode); codes grow from 9 bits, each growth after a whole group
-    of eight codes."""
-    out, table = bytearray(), {bytes([i]): i for i in range(256)}
-    bits, acc, used, group_start = 9, 0, 0, 0
-    def emit(code):
-        nonlocal acc, used
-        acc |= code << used
-        used += bits
-    current = b""
-    for byte in data:
-        candidate = current + bytes([byte])
-        if candidate in table:
-            current = candidate
-            continue
-        emit(table[current])
-        if len(table) >= (1 << bits) and bits < 16:
-            group = bits * 8
-            used = group_start + ((used - group_start + group - 1) // group) * group
-            bits, group_start = bits + 1, used
-        if len(table) < (1 << 16):
-            table[candidate] = len(table)
-        current = bytes([byte])
-    if current:
-        emit(table[current])
-    return b"\x1f\x9d\x10" + acc.to_bytes((used + 7) // 8, "little")
-
-
-def encode_body(plain):
-    """Converter: a body of the client in a content coding (9110 8.4.1: gzip, deflate, compress),
-    chosen at random; its Content-Encoding names the coding its first octets show (body_coding)."""
-    import gzip
-    import zlib
-    data = bytes(plain)
-    coding = random.choice(["gzip", "deflate", "compress"])
-    if coding == "gzip":
-        return gzip.compress(data, mtime=0)
-    if coding == "deflate":
-        return zlib.compress(data)
-    return _lzw_compress(data)
-
-
-def _coding_of(data):
-    return "gzip" if data[:2] == b"\x1f\x8b" else "compress" if data[:2] == b"\x1f\x9d" else "deflate"
-
-
-def decode_body(coded):
-    """Converter: the body a coded body of the client holds (inverse of encode_body)."""
-    import gzip
-    import zlib
-    data = bytes(coded)
-    coding = _coding_of(data)
+def record_cseq(value):
     try:
-        return gzip.decompress(data) if coding == "gzip" else zlib.decompress(data) if coding == "deflate" else _lzw_decompress(data)
-    except Exception:
-        return data
-
-
-def _coded_part(tree):
-    node = tree
-    while node is not None and _first(node, "<coded_octets>") is None:
-        node = node.parent
-    return _first(node, "<coded_octets>") if node is not None else None
-
-
-def body_coding(coding):
-    """The content coding a coded body of the client is in (9110 8.4: Content-Encoding names it)."""
-    coded = _coded_part(coding)
-    return _coding_of(bytes(coded)) if coded is not None else str(coding)
-
-
-def coded_length(length):
-    """2326 12.14 (C5, C6): the Content-Length of a coded body is the length of the coded octets."""
-    coded = _coded_part(length)
-    return len(bytes(coded)) if coded is not None else int(str(length))
-
-
-def octets_to_entity(body):
-    """Converter: the octets of a body, decoded by its content codings (9110 8.4.1: gzip,
-    deflate, compress), typed by its Content-Type (2326 12.16): S an SDP description, P
-    text/parameters, O any other type, E no body (Content-Length: 0)."""
-    import gzip
-    import zlib
-    data = bytes(body)
-    for coding in reversed(_content_codings(body)):
-        try:
-            if coding in ("gzip", "x-gzip"):
-                data = gzip.decompress(data)
-            elif coding == "deflate":
-                data = zlib.decompress(data)
-            elif coding in ("compress", "x-compress"):
-                data = _lzw_decompress(data)
-        except Exception:
-            pass
-    if not data:
-        return b"E"
-    kind = _media_type(body)
-    return (b"S" if kind == "application/sdp" else b"P" if kind == "text/parameters" else b"O") + data
-
-
-def media_controls_complete(sdp):
-    """2326 C.2, C.3 (C35, C36): with more than one media section, each has its own a=control."""
-    sections = list(sdp.find_subtrees("<sdp_media>"))
-    if len(sections) < 2:
-        return True
-    return all(_first(section, "<sdp_a_control_rcv>") is not None for section in sections)
-
-
-def frame_length(length):
-    """Length of an interleaved frame's data: its two-byte length field (2326 10.12)."""
-    return int.from_bytes(bytes(length), "big")
-
-
-def status_code(reply):
-    """Status-Code of a reply's Status-Line (2326 7.1)."""
-    while len(reply.children) == 1:
-        reply = reply.children[0]
-    return int(str(reply.children[2]))
-
-
-def _first_message(tree):
-    """The first party message in `tree`, `tree` itself included."""
-    if _is_message(tree):
-        return tree
-    for child in tree.children:
-        found = _first_message(child)
-        if found is not None:
-            return found
-    return None
-
-
-def _opening_message(tree):
-    """The message that opens the exchange `tree` begins with: its first party message; for a
-    DESCRIBE with wrong credentials (<auth_request>) the request, which server messages between
-    the timer's restart and the request may precede."""
-    node = tree
-    while not _is_message(node) and node.children:
-        if _name(node) == "<auth_request>":
-            request = _first(node, "<req_describe_wrong_credentials>")
-            return request if request is not None else _first_message(node)
-        node = node.children[0]
-    return _first_message(tree)
-
-
-def _exchange_request(reply):
-    """The request a reply answers: the other party's message that opened the reply's exchange;
-    for pipelined replies the request in the same place of the pipeline (2326 9.1)."""
-    message = _message_of(reply)
-    if _name(message) in ("<rep_pipelined_first>", "<rep_pipelined_second>",
-                          "<rep_pipelined_first_closing>", "<rep_pipelined_second_closing>"):
-        node = message.parent
-        while node is not None and _name(node) != "<pipelined_exchange>":
-            node = node.parent
-        wanted = _name(message).replace("<rep_", "<req_").replace("_closing>", ">")
-        return _first(node, wanted) if node is not None else None
-    # a reply after another reply of its exchange answers the pipelined second request
-    node, after_reply = message.parent, False
-    while node is not None:
-        opening = _opening_message(node.children[0]) if node.children else None
-        if opening is not None and opening is not message:
-            if _from_client(opening) != _from_client(message):
-                if after_reply:
-                    for child in node.children[1:]:
-                        if _name(child).endswith("_pipelined>"):
-                            return child
-                return opening
-            after_reply = after_reply or _name(opening).startswith("<rep_")
-        node = node.parent
-    return None
-
-
-def request_cseq(reply):
-    """CSeq value of the request a reply answers (2326 12.17)."""
-    request = _exchange_request(reply)
-    if request is None:
-        return None
-    value = _first(request, "<cseq_value>")
-    if value is None:
-        value = _first(request, "<cseq_value_rcv>")
-    return None if value is None else str(value)
-
-
-def expected_cseq(header):
-    """CSeq of a request: one more than the client's previous request's (2326 9.2); any value
-    for the first request of the connection."""
-    previous = None
-    for message in _messages_before(header):
-        if _from_client(message):
-            value = _first(message, "<cseq_value>")
-            if value is not None:
-                previous = int(str(value))
-    if _name(_message_of(header)).endswith("_resent>") and previous is not None:
-        return previous    # 2326 9.2: a resent request carries the original sequence number
-    expected = previous + 1 if previous is not None else int(str(_first(header, "<cseq_value>")))
-    # the next request follows this one, also before its reply arrives (pipelining, 2326 9.1)
-    _recorded["cseq"] = max(_recorded["cseq"], expected)
-    return expected
-
-
-def record_answered_cseq(reply):
-    """Records the CSeq of the request a final reply answered, from which the next request's
-    CSeq follows (2326 9.2)."""
-    value = request_cseq(reply)
-    if value is not None and value.isdigit():
-        _recorded["cseq"] = max(_recorded["cseq"], int(value))
-    return True
-
-
-def recalled_next_cseq():
-    return str(_recorded["cseq"] + 1)
-
-
-# A received value echoed later: recorded when it arrives, recalled when the client sends it.
-# Each session starts from a fresh record (session_begins).
-def _fresh_record():
-    return {"session": "0", "server_cseq": "0", "channel": 0, "cseq": 0, "announced": False,
-            "presentation": None, "channels": set(), "streams": [], "set_up": [],
-            "etag": None, "conference": None, "ranges": {}}
-
-
-_recorded = _fresh_record()
-
-
-def session_begins(timer):
-    """A session (one connection, 2326 9) starts with its first timer start, before any party
-    message: nothing an earlier session recorded holds in it."""
-    if _first_message(timer.get_root()) is None:
-        _recorded.clear()
-        _recorded.update(_fresh_record())
-    return True
-
-
-def _request_uri(request):
-    return bytes(request).split(b" ", 2)[1].decode("latin-1")
-
-
-def _uri_path(uri):
-    """The path of an rtsp URL without its leading "/" (3986 3.3)."""
-    rest = uri.split("://", 1)[-1]
-    return rest.split("/", 1)[1] if "/" in rest else ""
-
-
-def record_reply_effects(headers):
-    """Records what a successful reply decided for the target resources: an accepted ANNOUNCE
-    makes the record presentation the one to set up; a successful SETUP fixes the session's
-    presentation and adds its stream to the session (2326 10.3, 10.4)."""
-    request = _exchange_request(headers)
-    message = _message_of(headers)
-    if request is None or message is None or not _name(message).startswith("<rep_"):
-        return True
-    try:
-        code = status_code(message)
-    except Exception:
-        return True
-    if not 200 <= code < 300:
-        return True
-    method = bytes(request).split(b" ", 1)[0]
-    uri = _request_uri(request)
-    if method == b"ANNOUNCE":
-        _recorded["announced"] = True
-        _recorded["streams"] = [RTSP_RECORD_PATH + "/" + RTSP_RECORD_TRACK]
-    if method == b"SETUP":
-        record = "/" + RTSP_RECORD_PATH in uri
-        _recorded["presentation"] = RTSP_RECORD_PATH if record else RTSP_MEDIA_PATH
-    return True
-
-
-def record_description(sdp):
-    """Records the streams a description names (2326 C.1.1: a=control, relative to Content-Base,
-    else to the request URL; C.3) and its a=etag (C.1.8): SETUPs address these streams, one
-    after another into one session (aggregate control, 2326 1.3), and condition on the tag."""
-    message = _message_of(sdp)
-    request = _exchange_request(sdp) if message is not None else None
-    if message is None or request is None or not _name(message).startswith("<rep_"):
-        return True
-    header = _first(message, "<h_content_base>")
-    base = str(_first(header, "<uri_rcv>")) if header is not None else _request_uri(request)
-    streams = []
-    for media in sdp.find_subtrees("<sdp_media>"):
-        control = _first(media, "<sdp_a_control_rcv>")
-        if control is None:
-            continue
-        value = str(_first(control, "<sdp_value>")).strip()
-        if value == "*" or not value:
-            continue
-        url = value if "://" in value else base[:base.rfind("/") + 1] + value
-        streams.append(_uri_path(url))
-    if streams:
-        _recorded["streams"] = streams
-    etag = _first(sdp, "<sdp_a_etag_rcv>")
-    if etag is not None:
-        _recorded["etag"] = str(_first(etag, "<sdp_value>")).strip()
-    # C.1.5 a=range: the range of the presentation, at session level (before the media), else
-    # of its first stream with one; PLAY, PAUSE and RECORD choose their Range inside it
-    for line in sdp.find_subtrees("<sdp_a_range_rcv>"):
-        bounds = _npt_bounds(str(line))
-        if bounds is not None:
-            _recorded["ranges"][_uri_path(_request_uri(request)).rstrip("/")] = bounds
-            break
-    return True
-
-
-def _npt_seconds_of(text):
-    """Seconds of an npt-time other than "now" (2326 3.6: npt-sec or npt-hhmmss)."""
-    seconds = 0.0
-    for part in text.split(":"):
-        seconds = seconds * 60 + float(part or 0)
-    return seconds
-
-
-def _npt_bounds(line):
-    """(start, end) of an a=range line with an npt-range; end None if open (2326 3.6, C.1.5)."""
-    match = re.search(r"npt=([0-9:.]*)-([0-9:.]*)", line, re.IGNORECASE)
-    if match is None:
-        return None
-    start, end = match.groups()
-    return (_npt_seconds_of(start) if start else 0.0, _npt_seconds_of(end) if end else None)
-
-
-def _range_bands():
-    """Bounds for a Range inside the presentation of the session (2326 3.6, 12.29; C.1.5): its
-    a=range from the description, split into a start band, a pause band and an end band, so that
-    a start lies before every pause point and every end, and a pause point inside every range
-    played from such a start (10.6: "within the range of the presentation"; 11.3.20 457). The
-    bands hold whole seconds; a fraction (< 1 s) stays in the band. Without a recorded end (open
-    range, no description) the bands follow the start one second apart."""
-    presentation = (_recorded["presentation"] or RTSP_MEDIA_PATH).rstrip("/")
-    start, end = _recorded["ranges"].get(presentation, (0.0, None))
-    low = math.ceil(start)
-    high = math.floor(end) if end is not None else None
-    if high is None or high - low < 4:
-        return low, low + 1, low + 2, None
-    return low, low + (high - low) // 2, low + 3 * (high - low) // 4, high
-
-
-def range_start():
-    low, pause, end, high = _range_bands()
-    return str(random.randint(low, pause - 1))
-
-
-def range_pause_point():
-    low, pause, end, high = _range_bands()
-    return str(random.randint(pause, end - 1))
-
-
-def range_end():
-    low, pause, end, high = _range_bands()
-    return str(random.randint(end, high - 1 if high is not None else end + 30))
-
-
-def described_stream():
-    """A stream the last description named and the session has not set up yet, else any of
-    its streams (2326 10.4: one SETUP per stream)."""
-    streams = _recorded["streams"] or [RTSP_MEDIA_PATH + "/" + RTSP_MEDIA_TRACK]
-    fresh = [stream for stream in streams if stream not in _recorded["set_up"]]
-    return random.choice(fresh or streams)
-
-
-def setup_target():
-    """Path of the stream to set up: a described stream not yet set up, the record stream once
-    an ANNOUNCE was accepted, else the media stream; now and then the aggregate URL (2326 10.4)."""
-    if random.random() < 0.1:
-        return _recorded["presentation"] or RTSP_MEDIA_PATH
-    if _recorded["streams"] and random.random() < 0.8:
-        return described_stream()
-    if _recorded["announced"] and random.random() < 0.8:
-        return RTSP_RECORD_PATH + "/" + RTSP_RECORD_TRACK
-    return RTSP_MEDIA_PATH + "/" + RTSP_MEDIA_TRACK
-
-
-def setup_mode():
-    return "RECORD" if _recorded["announced"] else "PLAY"
-
-
-def session_target():
-    """Path of PLAY, PAUSE, RECORD, TEARDOWN: the aggregate URL of the session's presentation,
-    now and then one of its streams (2326 1.3, 10.5)."""
-    presentation = _recorded["presentation"] or RTSP_MEDIA_PATH
-    if random.random() < 0.15:
-        if _recorded["set_up"]:
-            return random.choice(_recorded["set_up"])
-        track = RTSP_RECORD_TRACK if presentation == RTSP_RECORD_PATH else RTSP_MEDIA_TRACK
-        return presentation + "/" + track
-    return presentation
-
-
-def recalled_etag():
-    """The entity tag of the description (2326 C.1.8 a=etag), else one the server does not know."""
-    return _recorded["etag"] or random.choice(["158bb3e7c7fd62ce67f12b533f06b83a", "v1"])
-
-
-# SETUP requests that start a new session (sent without Session)
-NEW_SESSION_SETUPS = ("<req_setup>", "<req_setup_described>", "<req_setup_unknown_conference>",
-                      "<req_setup_announced>", "<req_setup_close>")
-
-
-def record_session(reply):
-    """Records the session identifier, the stream and the interleaved channels a successful
-    SETUP reply assigned (2326 12.37, 10.4, 10.12)."""
-    value = _first(reply, "<session_id_rcv>")
-    if value is not None:
-        _recorded["session"] = str(value)
-    channels = sorted(interleaved_channels_of(reply))
-    if channels:
-        _recorded["channel"] = channels[0]
-    request = _exchange_request(reply)
-    if request is not None and _name(request) in NEW_SESSION_SETUPS:
-        _recorded["channels"] = set(channels)
-        _recorded["set_up"] = []
-    else:
-        _recorded["channels"] |= set(channels)
-    if request is not None:
-        path = _uri_path(_request_uri(request))
-        if path not in _recorded["set_up"]:
-            _recorded["set_up"].append(path)
-        conference = _first(request, "<conference_id>") or _first(request, "<conference_id_unknown>")
-        if conference is not None:
-            _recorded["conference"] = str(conference)
-    return True
-
-
-def record_play_session(reply):
-    """2326 A.2: an object that needs no SETUP plays on a PLAY without session; the session
-    identifier its reply may give is the one later requests carry (2326 12.37)."""
-    request = _exchange_request(reply)
-    value = _first(reply, "<session_id_rcv>")
-    if request is not None and _name(request) in ("<req_play_without_setup>", "<req_play_without_setup_any_range>") and value is not None:
-        _recorded["session"] = str(value)
-    return True
-
-
-def recalled_session():
-    return _recorded["session"]
-
-
-def assigned_session(tree):
-    """Session identifier of the last successful SETUP reply before `tree`, or of a PLAY without
-    session that started one (2326 12.37, A.2)."""
-    session = None
-    for message in _messages_before(tree):
-        if _name(message) == "<rep_setup_2xx>" or (_name(message) == "<rep_play_2xx>" and _first(
-                _exchange_request(message) or message, "<h_session>") is None):
-            value = _first(message, "<session_id_rcv>")
-            if value is not None:
-                session = str(value)
-    return session
-
-
-def nosetup_session_count(cseq):
-    """2326 12.37, A.2 (C9): 1 where a reply of the session gave an identifier (the PLAY reply of an
-    object without SETUP), which the request then carries, else 0."""
-    return 0 if assigned_session(cseq) is None else 1
-
-
-def session_for(header):
-    """The session identifier a request of the session carries: the one its SETUP reply
-    assigned (2326 12.37); the recalled value where no reply of this connection assigned one."""
-    assigned = assigned_session(header)
-    return assigned if assigned is not None else str(_first(header, "<session_id_sent>"))
-
-
-def record_server_cseq(request):
-    """Records the CSeq of a request of the server, which the client's reply echoes (2326 12.17),
-    its Session (12.37) and the option-tags its Require names (12.32)."""
-    _recorded["server_cseq"] = str(_first(request, "<cseq_value_rcv>"))
-    session = _first(request, "<session_id_rcv>")
-    _recorded["server_session"] = str(session) if session is not None else _recorded["session"]
-    _recorded["server_tags"] = _server_tags(request)
-    return True
-
-
-def _server_tags(request):
-    tags = []
-    for field in request.find_subtrees("<h_known_text>"):
-        name, _, value = str(field).partition(":")
-        if name.strip().lower() == "require":
-            tags += [tag.strip() for tag in value.split(",") if tag.strip()]
-    return tags
-
-
-def _answered_server_request(tree):
-    request = _exchange_request(tree)
-    return request if request is not None and _name(request).startswith("<srv_req_") else None
-
-
-def request_session(tree):
-    """2326 12.37: the Session of the server's request a reply of the client answers."""
-    request = _answered_server_request(tree)
-    session = _first(request, "<session_id_rcv>") if request is not None else None
-    return None if session is None else str(session)
-
-
-def echoed_session_count(tree):
-    """1 where the server's request carried a Session, which the client's reply returns."""
-    return 0 if request_session(tree) is None else 1
-
-
-def recalled_server_session():
-    return _recorded.get("server_session", "0")
-
-
-def required_by_server(tree, more=False):
-    """The number of option-tags the server's request requires (2326 12.32): 1 (an Unsupported
-    field) or 0 for the field, that number less one for the tags after the first."""
-    request = _answered_server_request(tree)
-    tags = _server_tags(request) if request is not None else []
-    if more:
-        return max(len(tags) - 1, 0)
-    return 1 if tags else 0
-
-
-def required_tag_at(tag):
-    """The option-tag of the server's Require at the place of `tag` in the client's Unsupported."""
-    request = _answered_server_request(tag)
-    tags = _server_tags(request) if request is not None else []
-    header = tag.parent
-    while header is not None and _name(header) != "<h_unsupported_sent>":
-        header = header.parent
-    listed = list(header.find_subtrees("<option_tag_echo>")) if header is not None else [tag]
-    index = next((i for i, other in enumerate(listed) if other is tag), 0)
-    return tags[index] if index < len(tags) else str(tag)
-
-
-def recalled_required_tag():
-    tags = _recorded.get("server_tags") or ["play.basic"]
-    return random.choice(tags)
-
-
-def recalled_server_cseq():
-    return _recorded["server_cseq"]
-
-
-def interleaved_channels_of(message):
-    channels = set()
-    parameters = list(message.find_subtrees("<tp_interleaved>")) + list(message.find_subtrees("<tp_interleaved_rcv>"))
-    for parameter in parameters:
-        numbers = [int(str(channel)) for channel in parameter.find_subtrees("<channel>")]
-        if len(numbers) == 2:
-            channels.update(numbers)
-        elif numbers:
-            # 2326 10.12: RTCP on the channel above RTP unless given
-            channels.update((numbers[0], numbers[0] + 1))
-    return channels
-
-
-def session_channels(tree):
-    """Channels the SETUP replies of the session set with the interleaved parameter (2326 10.12)."""
-    channels = set()
-    for message in _messages_before(tree):
-        if _name(message) == "<rep_setup_2xx>":
-            channels |= interleaved_channels_of(message)
-    return channels
-
-
-def recalled_channel():
-    """One of the session's interleaved channels (2326 10.12: RTP or RTCP), else the first."""
-    channels = sorted(_recorded["channels"]) or [_recorded["channel"]]
-    return bytes([random.choice(channels) % 256])
-
-
-def _request_timestamp(reply):
-    request = _exchange_request(reply)
-    sent = [str(value) for value in request.find_subtrees("<timestamp_value>")] if request else []
-    return sent[0] if sent else None
-
-
-def timestamp_echoed(reply):
-    """2326 12.38 (C13): a reply to a request with a Timestamp echoes its exact value (a reply
-    without Timestamp holds <timestamp_not_echoed>, see timestamp_missing)."""
-    sent = _request_timestamp(reply)
-    received = [str(value) for value in reply.find_subtrees("<timestamp_value_rcv>")]
-    return sent is None or not received or received[0] == sent
-
-
-def timestamp_missing(headers):
-    """1 where a reply's header block has no Timestamp field although its request carried one
-    (2326 12.38), else 0: the count of <timestamp_not_echoed> after the header block."""
-    if _request_timestamp(headers) is None:
-        return 0
-    return 0 if _first(headers, "<h_timestamp_rcv>") is not None else 1
-
-
-def _required_tags(reply):
-    request = _exchange_request(reply)
-    return {str(tag) for tag in request.find_subtrees("<option_tag_unknown>")} if request else set()
-
-
-def _shown_unsupported(tree):
-    """The option-tags earlier replies of the session listed in Unsupported, which "lists the
-    features not supported by the server" (2326 12.40)."""
-    shown = set()
-    for message in _messages_before(tree):
-        if not _from_client(message):
-            for header in message.find_subtrees("<h_unsupported>"):
-                shown |= {str(tag) for tag in header.find_subtrees("<option_tag_rcv>")}
-    return shown
-
-
-def _answers_options(headers):
-    """The status code of a reply that answers its request's options: a 2xx (the server carried
-    the request out) or 551 (Option not supported, 2326 11.3.14), else None. Other refusals (401,
-    454, 405, ...) reject the request before its options matter; 1xx replies answer nothing."""
-    try:
-        code = status_code(_message_of(headers))
-    except Exception:
-        return None
-    return code if 200 <= code < 300 or code == 551 else None
-
-
-def _unsupported_required(headers, tags, code):
-    """The option-tags of the request's Require the messages of the session show the server does
-    not support: those an earlier reply listed in Unsupported (2326 12.40), and the only option of
-    a request that a 551 answers ("An option given in the Require or the Proxy-Require fields was
-    not supported", 11.3.14) when the request has one Require option-tag and no Proxy-Require."""
-    shown = tags & _shown_unsupported(headers)
-    if code == 551 and len(tags) == 1:
-        request = _exchange_request(headers)
-        if request is not None and _first(request, "<h_proxy_require>") is None:
-            shown |= tags
-    return shown
-
-
-def unsupported_listed(headers):
-    """2326 12.32 (C21): "The server MUST respond to this header by using the Unsupported header to
-    negatively acknowledge those options which are NOT supported": the Unsupported field of a
-    2xx or 551 reply to a request with Require lists every option-tag of that Require the session
-    shows the server does not support (_unsupported_required). Whether the server supports an
-    option-tag is a property of the server that only its messages show, so an option-tag no
-    earlier reply of the session refused binds nothing (3.8: anyone may define private tags). A
-    reply without Unsupported is judged by require_acknowledged."""
-    tags = _required_tags(headers)
-    if not tags:
-        return True
-    code = _answers_options(headers)
-    if code is None:
-        return True
-    listed = {str(tag) for header in headers.find_subtrees("<h_unsupported>")
-              for tag in header.find_subtrees("<option_tag_rcv>")}
-    if not listed:
-        return True
-    return _unsupported_required(headers, tags, code) <= listed
-
-
-def require_acknowledged(headers):
-    """2326 12.32 (C21): a 2xx or 551 reply to a request with Require has an Unsupported field
-    when the session shows that the server does not support one of its option-tags (an earlier
-    reply listed it in Unsupported, 12.40), and a 551 to a request whose only options are those
-    of its Require always has one: 551 states that one of them is not supported (11.3.14), which
-    12.32 makes the server acknowledge in Unsupported."""
-    tags = _required_tags(headers)
-    if not tags:
-        return True
-    code = _answers_options(headers)
-    if code is None or _first(headers, "<h_unsupported>") is not None:
-        return True
-    if code == 551:
-        request = _exchange_request(headers)
-        if request is not None and _first(request, "<h_proxy_require>") is None:
-            return False
-    return not _unsupported_required(headers, tags, code)
-
-
-def scale_answered(headers):
-    """2326 12.34 (C17): the header block of a 2xx reply to a PLAY or RECORD with Scale has a Scale
-    field (the response MUST contain the scale value the server chose). Scale is an optional
-    field (Table 3 "opt."): a server that does not implement it chooses no scale and ignores the
-    field like any unknown one (2326 12), so the requirement binds a server that has shown on this
-    connection that it implements Scale, by a Scale field in an earlier reply."""
-    if not any(not _from_client(message) and _first(message, "<h_scale_rcv>") is not None
-               for message in _messages_before(headers)):
-        return True
-    request = _exchange_request(headers)
-    if request is None or _first(request, "<h_scale>") is None:
-        return True
-    if bytes(request).split(b" ", 1)[0] not in (b"PLAY", b"RECORD"):
-        return True
-    try:
-        code = status_code(_message_of(headers))
-    except Exception:
-        return True
-    if not 200 <= code < 300:
-        return True
-    return _first(headers, "<h_scale_rcv>") is not None
-
-
-# 9110 5.3: fields that are no comma-separated lists, by nonterminal and, for those read as
-# text (<h_known_text>), by field name
-SINGLE_FIELDS = ("<h_content_length>", "<h_content_type>", "<h_session_rcv>", "<h_content_base>",
-                 "<h_content_location>", "<h_location>", "<h_scale_rcv>", "<h_speed_rcv>",
-                 "<h_timestamp_rcv>", "<h_transport_rcv>", "<h_expires>", "<h_last_modified>")
-SINGLE_TEXT_FIELDS = ("date", "server", "retry-after", "bandwidth", "blocksize", "user-agent",
-                      "from", "referer", "if-modified-since", "authorization", "conference",
-                      "proxy-authorization", "key-mgmt", "host")
-
-
-def at_most_once(headers):
-    """9110 5.3 (C14, C34): no repeated field lines of a field that is no comma-separated list
-    (Transport of a reply: the one transport-spec the server chose, 2326 12.39)."""
-    for name in SINGLE_FIELDS:
-        if sum(1 for _ in headers.find_subtrees(name)) > 1:
-            return False
-    names = [str(field).split(":", 1)[0].strip().lower() for field in headers.find_subtrees("<h_known_text>")]
-    return all(names.count(name) <= 1 for name in SINGLE_TEXT_FIELDS)
-
-
-def _spec_ids(spec, interleaved, client_port, port):
-    """What identifies a transport-spec among those of a request: its first interleaved channel,
-    client RTP port or multicast port (2326 12.39)."""
-    ids = set()
-    for name, kind in ((interleaved, "i"), (client_port, "c"), (port, "c")):
-        for node in spec.find_subtrees(name):
-            first = _first(node, "<channel>") if kind == "i" else None
-            text = str(first) if first is not None else str(node).split("=", 1)[-1]
-            digits = "".join(ch for ch in text.split("-")[0] if ch.isdigit())
-            if digits:
-                ids.add((kind, int(digits)))
-    return ids
-
-
-# the transport-specs a SETUP offers (2326 12.39), in every Transport form of the requests
-OFFERED_SPECS = ("<ts_udp_unicast>", "<ts_tcp_interleaved>", "<ts_multicast_server>",
-                 "<ts_multicast_client>", "<h_transport_record>")
-
-
-def _asks_append(spec):
-    """Whether an offered transport-spec asks to record (mode RECORD) and append (2326 12.39)."""
-    if _first(spec, "<tp_append>") is None:
-        return False
-    return _first(spec, "<mode_record>") is not None or \
-        any(str(mode).upper() == "RECORD" for mode in spec.find_subtrees("<mode_method>"))
-
-
-def _ids_of(specs):
-    """The ids of the given offered transport-specs (see _spec_ids)."""
-    return set().union(*[_spec_ids(spec, "<tp_interleaved>", "<client_port_pair>", "<client_port_pair>")
-                         for spec in specs]) if specs else set()
-
-
-def _request_method(message):
-    """The method of a request message (2326 6.1: Method SP Request-URI SP RTSP-Version)."""
-    return bytes(message).split(b" ", 1)[0].decode("latin-1")
-
-
-def _server_replies_before(tree):
-    """The server's replies earlier in the session."""
-    return [message for message in _messages_before(tree)
-            if not _from_client(message) and _name(message).startswith("<rep_")]
-
-
-def _listed_methods(reply, field):
-    """The methods of the Public or Allow fields (`field`: <h_public>, <h_allow>) of a reply, one
-    set per field (2326 12.28, 12.4: 1#method)."""
-    return [{str(method) for method in header.find_subtrees("<method_rcv>")}
-            for header in reply.find_subtrees(field)]
-
-
-def _answered_501(reply, method):
-    """Whether a reply is a 501 Not Implemented (2326 10, 11.3.19) to a request of `method`."""
-    request = _exchange_request(reply)
-    if request is None or _request_method(request) != method:
-        return False
-    try:
-        return status_code(reply) == 501
-    except Exception:
-        return False
-
-
-def _has_range(request):
-    """Whether a request carries a Range field (2326 12.29; field names are case-insensitive)."""
-    return re.search(rb"\r\nrange[ \t]*:", bytes(request), re.IGNORECASE) is not None
-
-
-def _is_aggregate_of(uri, target):
-    """Whether the Request-URI `uri` is the URL `target` itself or the aggregate URL of the
-    presentation `target` is a stream of (2326 1.3, C.1.1: stream URLs below the presentation)."""
-    path, wanted = _uri_path(uri).rstrip("/"), _uri_path(target).rstrip("/")
-    return bool(path) and (wanted == path or wanted.startswith(path + "/"))
-
-
-def _records_not(tree):
-    """Whether earlier replies of the session show that the server does not record (2326 10.11),
-    hence does not append, for the resource the request of `tree` addresses: a Public field
-    without RECORD (12.28; 1.5: "The server SHOULD list the methods it supports using the Public
-    response header"), a 501 to a RECORD that carried no Range (10: the method is not
-    implemented; 12.29 lets a 501 refuse a Range format instead), or an Allow field without
-    RECORD in a reply to a request whose Request-URI is this request's own URL or its aggregate
-    URL (12.4: "the methods supported by the resource identified by the request-URI"). A 405 to
-    a RECORD is no evidence: 11.3.1 prescribes it for a RECORD in a session set up for PLAY."""
-    request = _exchange_request(tree)
-    target = _request_uri(request) if request is not None else None
-    for reply in _server_replies_before(tree):
-        if any("RECORD" not in methods for methods in _listed_methods(reply, "<h_public>")):
-            return True
-        earlier = _exchange_request(reply)
-        if earlier is None:
-            continue
-        if _answered_501(reply, "RECORD") and not _has_range(earlier):
-            return True
-        if target is not None and _is_aggregate_of(_request_uri(earlier), target) \
-                and any("RECORD" not in methods for methods in _listed_methods(reply, "<h_allow>")):
-            return True
-    return False
-
-
-def append_refused(reply):
-    """2326 12.39 (C15): "If appending is requested and the server does not support this, it
-    MUST refuse the request rather than overwrite the resource identified by the URI." Whether the
-    server supports appending is a property of the server that only its messages show: the
-    requirement binds once earlier replies of the session show that it does not record
-    (_records_not), and a server that does not record does not append. Then it answers no SETUP
-    that asks to append (an offered transport-spec with mode RECORD and append) with a 2xx that
-    accepts such a spec for recording; without such evidence every reply passes. The reply's
-    Transport indicates the values actually chosen (12.39); a chosen transport without mode has
-    the default mode PLAY ("If not provided, the default is PLAY"), and append "is ignored if the
-    mode parameter does not contain RECORD": a chosen transport whose mode, explicit or default,
-    lacks RECORD records nothing and overwrites nothing. A chosen transport with RECORD accepts an
-    asking spec when every offered spec asks to append, or when its interleaved channel, client
-    port or multicast port is that of an asking spec and of no offered spec without append. A 2xx
-    without Transport (12.39: the server MAY omit it) accepts the request as offered: a violation
-    when every offered spec asks to append, no evidence of an asking spec otherwise."""
-    request = _exchange_request(reply)
-    if request is None:
-        return True
-    offered = [spec for name in OFFERED_SPECS for spec in request.find_subtrees(name)]
-    asking = [spec for spec in offered if _asks_append(spec)]
-    if not asking or not _records_not(reply):
-        return True
-    chosen = _first(reply, "<transport_spec_rcv>")
-    if chosen is None:
-        return len(asking) < len(offered)
-    modes = [str(method).upper() for mode in chosen.find_subtrees("<tp_mode_rcv>")
-             for method in mode.find_subtrees("<method_rcv>")]
-    if "RECORD" not in modes:
-        return True
-    if len(asking) == len(offered):
-        return False
-    chosen_ids = _spec_ids(chosen, "<tp_interleaved_rcv>", "<tp_client_port_rcv>", "<tp_port_rcv>")
-    matched = _ids_of(asking) & chosen_ids
-    return not matched or bool(matched & _ids_of([spec for spec in offered if not _asks_append(spec)]))
-
-
-def _is_2xx(message):
-    """Whether a server message is a final 2xx reply, keeping the connection or closing it."""
-    return _first(message, "<rep_2xx>") is not None or _first(message, "<rep_2xx_closing>") is not None
-
-
-def new_session_distinct(reply):
-    """2326 12.37 (C11): a SETUP that starts a new session for a URL gets an identifier other
-    than the sessions of the same presentation still live on this connection (set up and not
-    ended by a 2xx TEARDOWN). Checked on every 2xx, however the state's rule names the reply
-    (<rep_setup_2xx>, <rep_any> after <req_setup_close>, <rep_2xx_closing>); a session counts as
-    set up by any earlier 2xx to a new-session SETUP and as ended by any 2xx to a TEARDOWN."""
-    request = _exchange_request(reply)
-    if request is None or _name(request) not in NEW_SESSION_SETUPS:
-        return True
-    value = _first(reply, "<session_id_rcv>")
-    if value is None:
-        return True
-    presentation = _uri_path(_request_uri(request)).split("/", 1)[0]
-    live = {}
-    for message in _messages_before(reply):
-        if _from_client(message) or not _is_2xx(message):
-            continue
-        answered = _exchange_request(message)
-        if answered is None:
-            continue
-        if _name(answered) in NEW_SESSION_SETUPS:
-            old = _first(message, "<session_id_rcv>")
-            if old is not None:
-                live[str(old)] = _uri_path(_request_uri(answered)).split("/", 1)[0]
-        elif _request_method(answered) == "TEARDOWN":
-            torn = _first(answered, "<session_id_sent>")
-            if torn is not None:
-                live.pop(str(torn), None)
-    return live.get(str(value)) != presentation
-
-
-def conference_unchanged(header):
-    """2326 12.9 (C27): the conference-id stays the same within the RTSP session."""
-    if _name(_message_of(header)) in NEW_SESSION_SETUPS:
-        return True
-    value = str(_first(header, "<conference_id>"))
-    earlier = []
-    for message in _messages_before(header):
-        if _name(message) in NEW_SESSION_SETUPS:
-            earlier = []
-        earlier += [str(old) for old in message.find_subtrees("<conference_id>")]
-        earlier += [str(old) for old in message.find_subtrees("<conference_id_unknown>")]
-    return all(old == value for old in earlier)
-
-
-def recalled_conference():
-    """The conference-id of the session, else the one the test setup gives (2326 12.9)."""
-    return _recorded["conference"] or RTSP_CONFERENCE
-
-
-def cseq_echoed(headers):
-    """2326 12.17 (C1): the reply carries the CSeq of the request it answers."""
-    return str(_first(headers, "<cseq_value_rcv>")) == request_cseq(headers)
-
-
-def no_content_length(reply):
-    """9110 8.6 (C8): no Content-Length in a 1xx reply."""
-    return not has_header(reply, "<h_content_length>")
-
-
-def no_content_length_in_204(reply):
-    """9110 8.6, 2326 4.4 (C7, C8): no Content-Length, hence no body, in a 204 reply."""
-    return status_code(reply) != 204 or not has_header(reply, "<h_content_length>")
-
-
-# 2326 6.1 and Table 2: the methods of RTSP/1.0; a server must implement OPTIONS, SETUP, PLAY
-# and TEARDOWN ("required"), the others are "recommended" or "optional"
-RTSP_METHODS = ("DESCRIBE", "ANNOUNCE", "GET_PARAMETER", "OPTIONS", "PAUSE", "PLAY", "RECORD",
-                "REDIRECT", "SETUP", "SET_PARAMETER", "TEARDOWN")
-REQUIRED_METHODS = ("OPTIONS", "SETUP", "PLAY", "TEARDOWN")
-
-
-def _set_up_for_play(tree):
-    """Whether a SETUP of the session earlier got a 2xx whose transport has no mode RECORD: an
-    explicit mode without it, or none (2326 12.39: "If not provided, the default is PLAY"); a 2xx
-    without Transport takes the mode of the request's offer."""
-    for message in _messages_before(tree):
-        if _name(message) != "<rep_setup_2xx>":
-            continue
-        chosen = _first(message, "<transport_spec_rcv>")
-        text = bytes(chosen if chosen is not None else (_exchange_request(message) or message))
-        if re.search(rb'mode[ \t]*=[ \t]*"?[A-Za-z_, \t]*RECORD', text, re.IGNORECASE) is None:
-            return True
-    return False
-
-
-def unimplemented_refused(reply):
-    """2326 10, notes on Table 2 (C25, F52): "If a server does not support a particular method,
-    it MUST return "501 Not Implemented"". Whether the server supports a method is a property of
-    the server that only its messages show: the requirement binds once an earlier reply of the
-    session left the method out of its Public field (12.28; 1.5: "The server SHOULD list the
-    methods it supports using the Public response header"), for an extension method (6.1) also
-    once an earlier reply refused it with 501 (to a method 2326 defines a 501 may refuse a Range
-    format instead, 12.29). It concerns the methods a server need not implement: the extension
-    methods and those Table 2 calls recommended or optional (DESCRIBE, ANNOUNCE, PAUSE,
-    GET_PARAMETER, SET_PARAMETER, RECORD); every server implements the required ones (OPTIONS,
-    SETUP, PLAY, TEARDOWN), whether its Public lists them or not. Then the reply is 501 or a
-    refusal a server gives before it looks at the method: 401 and 407 (credentials), a 5xx of its
-    own failure, load or a gateway (not 505: the request is RTSP/1.0), or 551 to a request with
-    Require or Proxy-Require (12.32, 12.27); a 3xx has its own alternative. 405 to a RECORD
-    passes in a session set up for PLAY (11.3.1: "also to be used if a RECORD request is issued
-    even though the mode parameter in the Transport header only specified PLAY"). Without such
-    evidence every reply passes: the server may implement the method."""
-    request = _exchange_request(reply)
-    if request is None or not _from_client(request):
-        return True
-    method = _request_method(request)
-    if method in REQUIRED_METHODS:
-        return True
-    code = status_code(reply)
-    if code == 551:
-        if _required_tags(reply) or _first(request, "<h_proxy_require>") is not None:
-            return True
-    elif code in (401, 407, 501) or (500 <= code < 600 and code != 505):
-        return True
-    earlier_replies = _server_replies_before(reply)
-    shown = any(method not in methods for earlier in earlier_replies
-                for methods in _listed_methods(earlier, "<h_public>"))
-    if not shown and method not in RTSP_METHODS:
-        shown = any(_answered_501(earlier, method) for earlier in earlier_replies)
-    if not shown:
-        return True
-    return method == "RECORD" and code == 405 and _set_up_for_play(reply)
-
-
-def challenge_in_401(reply):
-    """9110 15.5.2 (C32): a 401 reply carries WWW-Authenticate."""
-    return status_code(reply) != 401 or has_header(reply, "<h_www_authenticate>")
-
-
-def challenge_in_407(reply):
-    """9110 15.5.8 (C33): a 407 reply carries Proxy-Authenticate."""
-    return status_code(reply) != 407 or has_header(reply, "<h_proxy_authenticate>")
-
-
-def allow_in_405(reply):
-    """2326 11.3.1 (C23): a 405 reply carries Allow."""
-    return status_code(reply) != 405 or has_header(reply, "<h_allow>")
-
-
-def location_in_redirect(request):
-    """2326 10.10 (C26): REDIRECT carries Location."""
-    return has_header(request, "<h_location>")
-
-
-EXTENSION_TCHARS = "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-
-
-def extension_method():
-    """An extension-method (2326 6.1: token): now and then a familiar X_ name, else a token of
-    random tchars; never a method 2326 defines (in any case, so that no server mistakes it for
-    one), never starting with "$" (10.12)."""
-    while True:
-        if random.random() < 0.4:
-            name = random.choice(["X_FANDANGO", "X_PROBE", "x-fandango", "Fandango.Test", "x_probe~2"])
-        else:
-            name = random.choice(EXTENSION_TCHARS.replace("$", "")) + "".join(
-                random.choice(EXTENSION_TCHARS) for _ in range(random.randint(0, 11)))
-        if name.upper() not in RTSP_METHODS:
-            return name
-
-
-def name_case(canonical):
-    """A field name as sent: canonical mostly, lower or upper case now and then (9110 5.1)."""
-    return random.choices([canonical, canonical.lower(), canonical.upper()], [8, 1, 1])[0]
-
-
-def ows_value():
-    """Whitespace after a field's colon: mostly one space, now and then none, two or a tab."""
-    return random.choices(["", " ", "  ", "\t"], [4, 13, 2, 1])[0]
-
-
-def auth_space():
-    """The 1*SP between auth-scheme and token68 of sent credentials (9110 11.4): mostly one."""
-    return random.choices([" ", "  ", "   "], [8, 1, 1])[0]
+        MEMORY["cseq"] = int(str(value))
+    except ValueError:
+        pass
+    return str(value)
+
+
+def record_base(value):
+    MEMORY["base"] = str(value)
+    return str(value)
+
+
+def record_location(value):
+    MEMORY["location"] = str(value)
+    return str(value)
+
+
+def message_base(piece):
+    """Content-Base and Content-Location of one message, read from its header block as it arrives: they belong to that message and to no other (C.1.1)."""
+    head = bytes(piece).split(b"\r\n\r\n", 1)[0].decode("latin-1")
+    found = {}
+    for line in re.sub(r"\r\n[ \t]+", " ", head).split("\r\n")[1:]:
+        key, _, value = line.partition(":")
+        if key.strip().lower() in ("content-base", "content-location"):
+            found[key.strip().lower()] = value.strip()
+    return found.get("content-base"), found.get("content-location")
+
+
+def message_url(piece):
+    """The request URL of one message (C.1.1, third place): the URL of the request line of a request, of the request a reply answers otherwise."""
+    line = bytes(piece)[:300].split(b"\r\n", 1)[0].decode("latin-1")
+    if line.startswith("RTSP/"):
+        return MEMORY.get("request_url")
+    parts = line.split(" ")
+    return parts[1] if len(parts) == 3 and parts[1] != "*" else None
+
+
+def reset_description(value):
+    """A new description: its controls, aggregate control and entity tag start afresh, and its presentation URL is the base of the message that carries it."""
+    MEMORY["controls"] = []
+    MEMORY["description_base"] = resolve_control("*")
+    MEMORY["aggregate"] = None
+    MEMORY["etag"] = None
+    return str(value)
+
+
+def record_aggregate(value):
+    MEMORY["aggregate"] = resolve_control(str(value))
+    return str(value)
+
+
+def record_etag(value):
+    MEMORY["etag"] = str(value)
+    return str(value)
+
+
+def recall_etag():
+    return MEMORY.get("etag") or "".join(random.choice("abcdef0123456789") for _ in range(8))
+
+
+def record_control(value):
+    MEMORY["controls"].append(resolve_control(str(value)))
+    return str(value)
+
+
+def next_cseq():
+    return str(MEMORY["cseq"] + 1)
+
+
+def session_count():
+    return 1 if MEMORY["session"] else 0
+
+
+def recall_session():
+    return MEMORY["session"] or "".join(random.choice("0123456789ABCDEF") for _ in range(8))
+
+
+def url_path(url):
+    m = re.match(r"(?i)^[a-z][a-z0-9+.-]*://[^/]*(/.*)?$", url)
+    return (m.group(1) or "/") if m else None
+
+
+def absolute_url(url):
+    return url if "://" in url else "rtsp://" + RTSP_AUTHORITY + url
+
+
+def resolve_control(control):
+    """The abs_path a control URL of a presentation description names, resolved as RFC 1808 does against the base (Appendix C.1.1:
+    Content-Base, else Content-Location, else the request URL); "*" inherits the entire base URL. A Content-Base or Content-Location that is a
+    relative reference (RFC 9110 8.7 allows a partial URI) is first resolved against the request URL of the message."""
+    from urllib.parse import urljoin
+    request_url = absolute_url(MEMORY.get("message_url") or MEMORY["target"])
+    base_url = urljoin(request_url, MEMORY["base"] or MEMORY["location"] or request_url)
+    if control == "*":
+        return url_path(base_url)
+    return url_path(urljoin(base_url, control))
+
+
+def recall_setup_path():
+    controls = MEMORY["controls"]
+    if controls:
+        return random.choice(controls)
+    return MEMORY["target"] + random.choice(RTSP_CONTROLS)
+
+
+def recall_presentation_path():
+    """The aggregate control URL of the description, else the base it names, else the target (C.1.1)."""
+    if MEMORY.get("aggregate"):
+        return MEMORY["aggregate"]
+    return MEMORY.get("description_base") or MEMORY["target"]
+
+
+def recall_cseq():
+    return str(MEMORY.get("cseq", 0))
+
+
+def publish_default_path():
+    return MEMORY["publish"] + "/streamid=0"
+
+
+def ext_method():
+    return random.choice(["XTEST", "X-PING", "FOOBAR", "DUMMY_OP"])
 
 
 def basic_credentials(user, password):
-    """token68 of the Basic scheme: base64 of user-id ":" password (2326 D.2.2, 9110 11.4)."""
-    return base64.b64encode(f"{user}:{password}".encode()).decode()
-
-
-def random_ntp_like():
-    return f"{random.randint(0, 99999)}.{random.randint(0, 999):03d}"
-
-
-# ======================================================================================
-# The session: the client state machine (2326 A.1)
-# ======================================================================================
-#
-# Each state has one alternative per request the client may send in it (2326 A.1: "Messages
-# not listed for each state MUST NOT be issued by the client in that state, with the exception
-# of messages not affecting state"). The request is followed by what the server may send
-# before its final reply (<interim>), then the final reply, whose class selects the next state:
-# 2xx the state of the table, 3xx Init, 4xx/5xx no change (2326 A.1).
-
-# 2326 A.1: the client starts in Init; a session opens with the client's first request. A SETUP
-# that no description or announcement preceded (<req_setup>) comes only after a first exchange:
-# as the shortest way into Ready, Fandango's planner otherwise opens most sessions with it, and a
-# server that needs the DESCRIBE first (2326 C.1.1: the description names the streams), such as
-# ZLMediaKit, closes those connections; every SETUP form stays in Init
-<start> ::= <TimerControl:reply_start> <opening_requesting>
-<opening_requesting> ::= <init_opening> | <expired_before_request> <opening_restart> \
-    | <server_initiated> <opening_requesting> \
-    | <exchange_server_redirect> <opening_requesting> \
-    | <exchange_server_redirect_ranged> <opening_requesting>
-<opening_restart> ::= <TimerControl:reply_start> <opening_requesting> | ''
-
-# Each request starts the reply timer 1 just before it is sent (see <reply_start>), the final
-# reply is followed by its cancel (<reply_done>, <reply_settled>). The timer runs for the reply:
-# an expiry that arrives before the request went out (a slow generation, e.g. while the server
-# streams; <expired_before_request>) returns to the state, which starts the timer again for its
-# next request (<*_requesting>; before the first request <opening_requesting>); it does not end
-# the session there. Interleaved data
-# (2326 10.12: it arrives in any state, e.g. RTCP) and the server's requests (2326 9: at any
-# point of the persistent connection) are accepted between all messages: between exchanges
-# (<server_initiated>), within them (<interim>, <reply_done>) and between the timer's start and
-# the request (<*_requesting>: a REDIRECT without Range leads to Init, whose request then goes
-# out, one with a Range keeps the state, 2326 10.10). A reply that stays away ends the session
-# when the timer expires.
-
-# 2326 A.1 Init: SETUP -> Ready on 2xx; the other requests leave Init; session requests without a
-# session are refused.
-<state_init> ::= <TimerControl:reply_start> <init_requesting> \
-    | <server_initiated> <state_init> \
-    | <exchange_server_redirect> <state_init> \
-    | <exchange_server_redirect_ranged> <state_init> \
-    | ''
-<init_requesting> ::= <server_initiated> <init_requesting> \
-    | <exchange_server_redirect_ranged> <init_requesting> \
-    | <exchange_server_redirect> <init_requesting> \
-    | <expired_before_request> <state_init> \
-    | <init_transition>
-<init_transition> ::= <Client:req_setup> <resend_setup>* <interim>* <setup_reply_in_init> \
-    | <init_opening>
-<init_opening> ::= <Client:req_describe_media> <resend_describe_media>* <interim>* <describe_reply_in_init> \
-    | <Client:req_announce_record> <resend_announce_record>* <interim>* <announce_reply_in_init> \
-    | <Client:req_play_without_setup> <resend_play_without_setup>* <interim>* <play_without_setup_reply> \
-    | <Client:req_play_without_setup_any_range> <resend_play_without_setup_any_range>* <interim>* <play_without_setup_reply> \
-    | <close_request> <interim>* <close_reply> \
-    | <stateless_request> <interim>* <stateless_reply_in_init> \
-    | <no_session_request> <interim>* <no_session_reply> \
-    | <Client:req_extension> <resend_extension>* <interim>* <extension_reply_in_init> \
-    | <Client:req_extension_close> <resend_extension_close>* <interim>* <extension_close_reply> \
-    | <pipelined_exchange>
-<setup_reply_in_init> ::= <Server:rep_setup_2xx> <reply_end_ready> \
-    | <Server:rep_not_2xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-# 2326 C.1.1, 10.4: the description names the streams (a=control); the SETUP that follows a
-# successful DESCRIBE of the presentation addresses one of them (a dependent exchange with its
-# own request, <req_setup_described>), also joining a conference (<req_setup_unknown_conference>)
-# or closing the connection after the reply (<req_setup_close>); Init's other requests stay
-# open in <state_init>
-<describe_reply_in_init> ::= <Server:rep_describe_2xx> <reply_end_after_describe> \
-    | <Server:rep_not_2xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<setup_after_describe> ::= <TimerControl:reply_start> <setup_after_describe_requesting> \
-    | <server_initiated> <setup_after_describe> \
-    | <exchange_server_redirect> <state_init> \
-    | <exchange_server_redirect_ranged> <setup_after_describe> \
-    | ''
-<setup_after_describe_requesting> ::= <server_initiated> <setup_after_describe_requesting> \
-    | <exchange_server_redirect_ranged> <setup_after_describe_requesting> \
-    | <exchange_server_redirect> <init_requesting> \
-    | <expired_before_request> <setup_after_describe> \
-    | <Client:req_setup_described> <resend_setup_described>* <interim>* <setup_reply_in_init> \
-    | <Client:req_setup_unknown_conference> <resend_setup_unknown_conference>* <interim>* <setup_reply_in_init> \
-    | <Client:req_setup_close> <resend_setup_close>* <interim>* <close_reply>
-# 2326 10.3, 10.11: after the description of the presentation to record is accepted, the client
-# sets up its stream for recording (a dependent exchange with its own request,
-# <req_setup_announced>); Init's other requests stay open in <state_init>
-<announce_reply_in_init> ::= <Server:rep_announce_2xx> <reply_end_after_announce> \
-    | <Server:rep_not_2xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<setup_after_announce> ::= <TimerControl:reply_start> <setup_after_announce_requesting> \
-    | <server_initiated> <setup_after_announce> \
-    | <exchange_server_redirect> <state_init> \
-    | <exchange_server_redirect_ranged> <setup_after_announce> \
-    | ''
-<setup_after_announce_requesting> ::= <server_initiated> <setup_after_announce_requesting> \
-    | <exchange_server_redirect_ranged> <setup_after_announce_requesting> \
-    | <exchange_server_redirect> <init_requesting> \
-    | <expired_before_request> <setup_after_announce> \
-    | <Client:req_setup_announced> <resend_setup_announced>* <interim>* <setup_reply_in_init>
-# 2326 A.2: an object that needs no SETUP (e.g. multicast) starts in Ready, so PLAY without a
-# session plays it (F27) and its two-state machine (Ready, Playing) follows; any other object
-# refuses it like the requests below
-<play_without_setup_reply> ::= <Server:rep_play_2xx> <reply_end_playing_nosetup> \
-    | <Server:rep_not_2xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-# 2326 12.10, 9112 9.6: after a request with "Connection: close" the connection ends (F87)
-<close_reply> ::= <Server:rep_any> <reply_end_close> | <exchange_server_redirect> <interim>* <close_reply> \
-    | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<stateless_reply_in_init> ::= <Server:rep_any> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-
-# 2326 A.1 Ready: PLAY 2xx -> Playing, RECORD 2xx -> Recording, TEARDOWN 2xx -> Init,
-# SETUP 2xx -> Ready
-<state_ready> ::= <TimerControl:reply_start> <ready_requesting> \
-    | <Client:interleaved_frame_sent> <state_ready> \
-    | <server_initiated> <state_ready> \
-    | <exchange_server_redirect> <state_init> \
-    | <exchange_server_redirect_ranged> <state_ready> \
-    | ''
-<ready_requesting> ::= <server_initiated> <ready_requesting> \
-    | <exchange_server_redirect_ranged> <ready_requesting> \
-    | <exchange_server_redirect> <init_requesting> \
-    | <expired_before_request> <state_ready> \
-    | <ready_transition>
-<ready_transition> ::= <pipelined_in_ready> \
-    | <Client:req_play> <resend_play>* <interim_session>* <play_reply_in_ready> \
-    | <Client:req_play_any_range> <resend_play_any_range>* <interim_session>* <play_reply_in_ready> \
-    | <Client:req_record> <resend_record>* <interim_session>* <record_reply_in_ready> \
-    | <Client:req_record_any_range> <resend_record_any_range>* <interim_session>* <record_reply_in_ready> \
-    | <Client:req_teardown> <resend_teardown>* <interim_session>* <teardown_reply_in_ready> \
-    | <Client:req_setup_in_session> <resend_setup_in_session>* <interim_session>* <setup_reply_in_ready> \
-    | <session_stateless_request> <interim_session>* <stateless_reply_in_ready> \
-    | <session_close_request> <interim_session>* <close_reply> \
-    | <Client:req_extension_in_session> <resend_extension_in_session>* <interim_session>* <extension_reply_in_ready> \
-    | <Client:req_extension_in_session_close> <resend_extension_in_session_close>* <interim_session>* <extension_close_reply>
-<play_reply_in_ready> ::= <Server:rep_play_2xx> <reply_end_playing> \
-    | <Server:rep_err> <reply_end_ready> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<record_reply_in_ready> ::= <Server:rep_record_2xx> <reply_end_recording> \
-    | <Server:rep_err> <reply_end_ready> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<teardown_reply_in_ready> ::= <Server:rep_teardown_2xx> <reply_end_init> \
-    | <Server:rep_err> <reply_end_ready> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-# 2326 12.23: 304 to a conditional SETUP leaves the state unchanged
-<setup_reply_in_ready> ::= <Server:rep_setup_2xx> <reply_end_ready> \
-    | <Server:rep_err> <reply_end_ready> \
-    | <Server:rep_304> <reply_end_ready> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<stateless_reply_in_ready> ::= <Server:rep_not_3xx> <reply_end_ready> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-
-# 2326 A.1 Playing: PAUSE 2xx -> Ready, TEARDOWN 2xx -> Init, PLAY 2xx -> Playing,
-# (the session does not end in Playing: while the server streams, the client ends it with a
-# request, e.g. TEARDOWN, so that Fandango does not wait for a silence that never comes)
-# SETUP 2xx -> Playing (changed transport, F71); A.1/A.2: at the end of the requested range the
-# state becomes Ready, after which the client may RECORD (<req_record_after_play>)
-<state_playing> ::= <TimerControl:reply_start> <playing_requesting> \
-    | <Client:interleaved_frame_sent> <state_playing> \
-    | <server_initiated> <state_playing> \
-    | <exchange_server_redirect> <state_init> \
-    | <exchange_server_redirect_ranged> <state_playing>
-<playing_requesting> ::= <server_initiated> <playing_requesting> \
-    | <exchange_server_redirect_ranged> <playing_requesting> \
-    | <exchange_server_redirect> <init_requesting> \
-    | <expired_before_request> <state_playing> \
-    | <playing_transition>
-<playing_transition> ::= <pipelined_in_playing> \
-    | <Client:req_pause> <resend_pause>* <interim_session>* <pause_reply_in_playing> \
-    | <Client:req_pause_any_point> <resend_pause_any_point>* <interim_session>* <pause_reply_in_playing> \
-    | <Client:req_teardown> <resend_teardown>* <interim_session>* <teardown_reply_in_playing> \
-    | <Client:req_play_in_playing> <resend_play_in_playing>* <interim_session>* <play_reply_in_playing> \
-    | <Client:req_play_any_range> <resend_play_any_range>* <interim_session>* <play_reply_in_playing> \
-    | <Client:req_setup_in_session> <resend_setup_in_session>* <interim_session>* <setup_reply_in_playing> \
-    | <Client:req_record_after_play> <resend_record_after_play>* <interim_session>* <record_reply_in_ready> \
-    | <session_stateless_request> <interim_session>* <stateless_reply_in_playing> \
-    | <session_close_request> <interim_session>* <close_reply> \
-    | <Client:req_extension_in_session> <resend_extension_in_session>* <interim_session>* <extension_reply_in_playing> \
-    | <Client:req_extension_in_session_close> <resend_extension_in_session_close>* <interim_session>* <extension_close_reply>
-<req_play_in_playing> ::= <req_play>
-# (either part of the Range split: no other RECORD is sent in Playing)
-<req_record_after_play> ::= <req_record> | <req_record_any_range>
-<pause_reply_in_playing> ::= <Server:rep_pause_2xx> <reply_end_ready> \
-    | <Server:rep_err> <reply_end_playing> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<teardown_reply_in_playing> ::= <Server:rep_teardown_2xx> <reply_end_init> \
-    | <Server:rep_err> <reply_end_playing> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<play_reply_in_playing> ::= <Server:rep_play_2xx> <reply_end_playing> \
-    | <Server:rep_err> <reply_end_playing> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<setup_reply_in_playing> ::= <Server:rep_setup_2xx> <reply_end_playing> \
-    | <Server:rep_err> <reply_end_playing> \
-    | <Server:rep_304> <reply_end_playing> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<stateless_reply_in_playing> ::= <Server:rep_not_3xx> <reply_end_playing> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-
-# 2326 A.1 Recording: PAUSE 2xx -> Ready, TEARDOWN 2xx -> Init, RECORD 2xx -> Recording,
-# SETUP 2xx -> Recording (changed transport); the client sends the media as interleaved data
-# (2326 10.12)
-<state_recording> ::= <TimerControl:reply_start> <recording_requesting> \
-    | <Client:interleaved_frame_sent> <state_recording> \
-    | <server_initiated> <state_recording> \
-    | <exchange_server_redirect> <state_init> \
-    | <exchange_server_redirect_ranged> <state_recording> \
-    | ''
-<recording_requesting> ::= <server_initiated> <recording_requesting> \
-    | <exchange_server_redirect_ranged> <recording_requesting> \
-    | <exchange_server_redirect> <init_requesting> \
-    | <expired_before_request> <state_recording> \
-    | <recording_transition>
-<recording_transition> ::= <pipelined_in_recording> \
-    | <Client:req_pause> <resend_pause>* <interim_session>* <pause_reply_in_recording> \
-    | <Client:req_pause_any_point> <resend_pause_any_point>* <interim_session>* <pause_reply_in_recording> \
-    | <Client:req_teardown> <resend_teardown>* <interim_session>* <teardown_reply_in_recording> \
-    | <Client:req_record_in_recording> <resend_record_in_recording>* <interim_session>* <record_reply_in_recording> \
-    | <Client:req_record_any_range> <resend_record_any_range>* <interim_session>* <record_reply_in_recording> \
-    | <Client:req_setup_in_session> <resend_setup_in_session>* <interim_session>* <setup_reply_in_recording> \
-    | <session_stateless_request> <interim_session>* <stateless_reply_in_recording> \
-    | <session_close_request> <interim_session>* <close_reply> \
-    | <Client:req_extension_in_session> <resend_extension_in_session>* <interim_session>* <extension_reply_in_recording> \
-    | <Client:req_extension_in_session_close> <resend_extension_in_session_close>* <interim_session>* <extension_close_reply>
-<req_record_in_recording> ::= <req_record>
-<pause_reply_in_recording> ::= <Server:rep_pause_2xx> <reply_end_ready> \
-    | <Server:rep_err> <reply_end_recording> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<teardown_reply_in_recording> ::= <Server:rep_teardown_2xx> <reply_end_init> \
-    | <Server:rep_err> <reply_end_recording> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<record_reply_in_recording> ::= <Server:rep_record_2xx> <reply_end_recording> \
-    | <Server:rep_err> <reply_end_recording> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<setup_reply_in_recording> ::= <Server:rep_setup_2xx> <reply_end_recording> \
-    | <Server:rep_err> <reply_end_recording> \
-    | <Server:rep_304> <reply_end_recording> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<stateless_reply_in_recording> ::= <Server:rep_not_3xx> <reply_end_recording> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-
-# 2326 A.2: the state machine of an object that needs no SETUP: Ready and Playing only; PLAY
-# 2xx -> Playing, PAUSE 2xx -> Ready, errors no change, 3xx Init. Its PLAY and PAUSE carry the
-# Session the PLAY reply gave, if any (<h_session_nosetup>)
-<state_ready_nosetup> ::= <TimerControl:reply_start> <ready_nosetup_requesting> \
-    | <server_initiated> <state_ready_nosetup> \
-    | <exchange_server_redirect> <state_init> \
-    | <exchange_server_redirect_ranged> <state_ready_nosetup> \
-    | ''
-<ready_nosetup_requesting> ::= <server_initiated> <ready_nosetup_requesting> \
-    | <exchange_server_redirect_ranged> <ready_nosetup_requesting> \
-    | <exchange_server_redirect> <init_requesting> \
-    | <expired_before_request> <state_ready_nosetup> \
-    | <pipelined_in_ready_nosetup> \
-    | <Client:req_play_nosetup> <resend_play_nosetup>* <interim>* <play_nosetup_reply_in_ready> \
-    | <Client:req_play_nosetup_any_range> <resend_play_nosetup_any_range>* <interim>* <play_nosetup_reply_in_ready> \
-    | <stateless_request> <interim>* <stateless_reply_in_ready_nosetup> \
-    | <nosetup_close_request> <interim>* <close_reply> \
-    | <Client:req_extension_nosetup> <resend_extension_nosetup>* <interim>* <extension_reply_in_ready_nosetup> \
-    | <Client:req_extension_nosetup_close> <resend_extension_nosetup_close>* <interim>* <extension_close_reply>
-<play_nosetup_reply_in_ready> ::= <Server:rep_play_2xx> <reply_end_playing_nosetup> \
-    | <Server:rep_err> <reply_end_ready_nosetup> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<stateless_reply_in_ready_nosetup> ::= <Server:rep_not_3xx> <reply_end_ready_nosetup> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<state_playing_nosetup> ::= <TimerControl:reply_start> <playing_nosetup_requesting> \
-    | <server_initiated> <state_playing_nosetup> \
-    | <exchange_server_redirect> <state_init> \
-    | <exchange_server_redirect_ranged> <state_playing_nosetup>
-<playing_nosetup_requesting> ::= <server_initiated> <playing_nosetup_requesting> \
-    | <exchange_server_redirect_ranged> <playing_nosetup_requesting> \
-    | <exchange_server_redirect> <init_requesting> \
-    | <expired_before_request> <state_playing_nosetup> \
-    | <pipelined_in_playing_nosetup> \
-    | <Client:req_pause_nosetup> <resend_pause_nosetup>* <interim>* <pause_nosetup_reply_in_playing> \
-    | <Client:req_pause_nosetup_any_point> <resend_pause_nosetup_any_point>* <interim>* <pause_nosetup_reply_in_playing> \
-    | <Client:req_play_nosetup> <resend_play_nosetup>* <interim>* <play_nosetup_reply_in_playing> \
-    | <Client:req_play_nosetup_any_range> <resend_play_nosetup_any_range>* <interim>* <play_nosetup_reply_in_playing> \
-    | <stateless_request> <interim>* <stateless_reply_in_playing_nosetup> \
-    | <nosetup_close_request> <interim>* <close_reply> \
-    | <Client:req_pause_nosetup_close> <resend_pause_nosetup_close>* <interim>* <close_reply> \
-    | <Client:req_extension_nosetup> <resend_extension_nosetup>* <interim>* <extension_reply_in_playing_nosetup> \
-    | <Client:req_extension_nosetup_close> <resend_extension_nosetup_close>* <interim>* <extension_close_reply>
-<pause_nosetup_reply_in_playing> ::= <Server:rep_pause_2xx> <reply_end_ready_nosetup> \
-    | <Server:rep_err> <reply_end_playing_nosetup> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<play_nosetup_reply_in_playing> ::= <Server:rep_play_2xx> <reply_end_playing_nosetup> \
-    | <Server:rep_err> <reply_end_playing_nosetup> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<stateless_reply_in_playing_nosetup> ::= <Server:rep_not_3xx> <reply_end_playing_nosetup> \
-    | <Server:rep_3xx> <reply_end_init> \
-    | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-
-# 2326 9.2: over UDP (RTSP_TRANSPORT) a request whose reply stays away is resent when the reply
-# timer expires (<resend_due>), "the same message" with "the original sequence number" (CSeq,
-# expected_cseq), as often as the client chooses; over TCP an expiry is no occasion to resend
-# (where on <resend_due>): "requests MUST NOT be retransmitted"
-<resend_due> ::= <timer_expired>
-<resend_setup> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_setup_resent>
-<req_setup_resent> ::= <req_setup>
-<resend_describe_media> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_describe_media_resent>
-<req_describe_media_resent> ::= <req_describe_media>
-<resend_announce_record> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_announce_record_resent>
-<req_announce_record_resent> ::= <req_announce_record>
-<resend_play_without_setup> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_play_without_setup_resent>
-<req_play_without_setup_resent> ::= <req_play_without_setup>
-<resend_play_without_setup_any_range> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_play_without_setup_any_range_resent>
-<req_play_without_setup_any_range_resent> ::= <req_play_without_setup_any_range>
-<resend_extension> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_extension_resent>
-<req_extension_resent> ::= <req_extension>
-<resend_extension_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_extension_close_resent>
-<req_extension_close_resent> ::= <req_extension_close>
-<resend_extension_in_session> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_extension_in_session_resent>
-<req_extension_in_session_resent> ::= <req_extension_in_session>
-<resend_extension_in_session_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_extension_in_session_close_resent>
-<req_extension_in_session_close_resent> ::= <req_extension_in_session_close>
-<resend_extension_nosetup> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_extension_nosetup_resent>
-<req_extension_nosetup_resent> ::= <req_extension_nosetup>
-<resend_extension_nosetup_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_extension_nosetup_close_resent>
-<req_extension_nosetup_close_resent> ::= <req_extension_nosetup_close>
-<resend_setup_described> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_setup_described_resent>
-<req_setup_described_resent> ::= <req_setup_described>
-<resend_setup_unknown_conference> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_setup_unknown_conference_resent>
-<req_setup_unknown_conference_resent> ::= <req_setup_unknown_conference>
-<resend_setup_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_setup_close_resent>
-<req_setup_close_resent> ::= <req_setup_close>
-<resend_setup_announced> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_setup_announced_resent>
-<req_setup_announced_resent> ::= <req_setup_announced>
-<resend_play> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_play_resent>
-<req_play_resent> ::= <req_play>
-<resend_record> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_record_resent>
-<req_record_resent> ::= <req_record>
-<resend_teardown> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_teardown_resent>
-<req_teardown_resent> ::= <req_teardown>
-<resend_setup_in_session> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_setup_in_session_resent>
-<req_setup_in_session_resent> ::= <req_setup_in_session>
-<resend_pause> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_pause_resent>
-<req_pause_resent> ::= <req_pause>
-<resend_play_any_range> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_play_any_range_resent>
-<req_play_any_range_resent> ::= <req_play_any_range>
-<resend_pause_any_point> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_pause_any_point_resent>
-<req_pause_any_point_resent> ::= <req_pause_any_point>
-<resend_record_any_range> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_record_any_range_resent>
-<req_record_any_range_resent> ::= <req_record_any_range>
-<resend_play_in_playing> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_play_in_playing_resent>
-<req_play_in_playing_resent> ::= <req_play_in_playing>
-<resend_record_after_play> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_record_after_play_resent>
-<req_record_after_play_resent> ::= <req_record_after_play>
-<resend_record_in_recording> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_record_in_recording_resent>
-<req_record_in_recording_resent> ::= <req_record_in_recording>
-<resend_play_nosetup> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_play_nosetup_resent>
-<req_play_nosetup_resent> ::= <req_play_nosetup>
-<resend_pause_nosetup> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_pause_nosetup_resent>
-<req_pause_nosetup_resent> ::= <req_pause_nosetup>
-<resend_play_nosetup_any_range> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_play_nosetup_any_range_resent>
-<req_play_nosetup_any_range_resent> ::= <req_play_nosetup_any_range>
-<resend_pause_nosetup_any_point> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_pause_nosetup_any_point_resent>
-<req_pause_nosetup_any_point_resent> ::= <req_pause_nosetup_any_point>
-<resend_pause_nosetup_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_pause_nosetup_close_resent>
-<req_pause_nosetup_close_resent> ::= <req_pause_nosetup_close>
-<resend_options> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_options_resent>
-<req_options_resent> ::= <req_options>
-<resend_describe> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_describe_resent>
-<req_describe_resent> ::= <req_describe>
-<resend_describe_wrong_credentials> ::= <TimerEvent:resend_due> <TimerControl:reply_start_auth> <Client:req_describe_wrong_credentials_resent>
-<req_describe_wrong_credentials_resent> ::= <req_describe_wrong_credentials>
-<resend_announce> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_announce_resent>
-<req_announce_resent> ::= <req_announce>
-<resend_get_parameter> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_get_parameter_resent>
-<req_get_parameter_resent> ::= <req_get_parameter>
-<resend_set_parameter> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_set_parameter_resent>
-<req_set_parameter_resent> ::= <req_set_parameter>
-<resend_bad_version> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_bad_version_resent>
-<req_bad_version_resent> ::= <req_bad_version>
-<resend_setup_unsupported_transport> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_setup_unsupported_transport_resent>
-<req_setup_unsupported_transport_resent> ::= <req_setup_unsupported_transport>
-<resend_get_parameter_in_session> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_get_parameter_in_session_resent>
-<req_get_parameter_in_session_resent> ::= <req_get_parameter_in_session>
-<resend_set_parameter_in_session> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_set_parameter_in_session_resent>
-<req_set_parameter_in_session_resent> ::= <req_set_parameter_in_session>
-<resend_announce_in_session> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_announce_in_session_resent>
-<req_announce_in_session_resent> ::= <req_announce_in_session>
-<resend_options_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_options_close_resent>
-<req_options_close_resent> ::= <req_options_close>
-<resend_describe_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_describe_close_resent>
-<req_describe_close_resent> ::= <req_describe_close>
-<resend_get_parameter_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_get_parameter_close_resent>
-<req_get_parameter_close_resent> ::= <req_get_parameter_close>
-<resend_set_parameter_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_set_parameter_close_resent>
-<req_set_parameter_close_resent> ::= <req_set_parameter_close>
-<resend_announce_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_announce_close_resent>
-<req_announce_close_resent> ::= <req_announce_close>
-<resend_teardown_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_teardown_close_resent>
-<req_teardown_close_resent> ::= <req_teardown_close>
-<resend_play_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_play_close_resent>
-<req_play_close_resent> ::= <req_play_close>
-<resend_pause_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_pause_close_resent>
-<req_pause_close_resent> ::= <req_pause_close>
-<resend_record_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_record_close_resent>
-<req_record_close_resent> ::= <req_record_close>
-<resend_setup_in_session_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_setup_in_session_close_resent>
-<req_setup_in_session_close_resent> ::= <req_setup_in_session_close>
-<resend_play_nosetup_close> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_play_nosetup_close_resent>
-<req_play_nosetup_close_resent> ::= <req_play_nosetup_close>
-<resend_play_no_session> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_play_no_session_resent>
-<req_play_no_session_resent> ::= <req_play_no_session>
-<resend_teardown_no_session> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_teardown_no_session_resent>
-<req_teardown_no_session_resent> ::= <req_teardown_no_session>
-<resend_record_no_session> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_record_no_session_resent>
-<req_record_no_session_resent> ::= <req_record_no_session>
-<resend_pause_no_session> ::= <TimerEvent:resend_due> <TimerControl:reply_start> <Client:req_pause_no_session_resent>
-<req_pause_no_session_resent> ::= <req_pause_no_session>
-
-# 9112 9.6: "A client, server, or proxy MAY close the transport connection at any time": the
-# reply to a request may stay away. The client waits RTSP_REPLY_WAIT seconds for it (timer 1):
-# its expiry before the reply ends the session; after the reply the client cancels it.
-<reply_start> ::= <timer_start>
-<reply_cancel> ::= <timer_cancel>
-<reply_expired> ::= <timer_expired>
-# an expiry that arrives after the timer's start, before the request went out (see <state_init>):
-# one rule for all states, the state follows and starts the timer again
-<expired_before_request> ::= <TimerEvent:reply_expired>
-# the spec's only timer: id 1, running RTSP_REPLY_WAIT seconds (the standard library's
-# <timer_id> and <timer_timeout> aliases, overridden)
-<timer_id> ::= '1'
-<timer_timeout> ::= r'[0-9]+(?:\.[0-9]+)?' := RTSP_REPLY_WAIT
-# the same timer, started again for the reply to wrong credentials (<auth_request>), runs
-# RTSP_AUTH_REPLY_WAIT seconds (where below); its cancel and expiry are those of timer 1
-<reply_start_auth> ::= 'start: ' <timer_id> ' (' <timer_timeout> ')\n'
-
-# 2326 7.1.1 / 9110 15.2: 1xx replies precede the final reply; 2326 10.12: interleaved data of
-# either party may be sent at any time on the connection; 2326 9, 10: the server may send its
-# requests at any time on a persistent connection, also while a request of the client waits
-# for its reply
-# (also a REDIRECT with a Range: it takes effect later, the state stays, 2326 10.10). The client
-# sends interleaved data only on channels a SETUP of the session set up (2326 10.12): in Ready,
-# Playing and Recording (<interim_session>), not in Init or the states of A.2
-<interim> ::= <Server:interleaved_frame> | <Server:rep_1xx> | <server_request_exchange> \
-    | <exchange_server_redirect_ranged>
-<interim_session> ::= <interim> | <Client:interleaved_frame_sent>
-# after the final reply (2326 10.10, A.1): interleaved data, requests of the server and REDIRECTs
-# that arrive before the client cancels the timer, then the cancel, or the expiry if it comes
-# first. Each reply continues with <reply_end_X>, X the state its class selects: a REDIRECT with
-# a Range leaves X, an immediate REDIRECT leads to Init (<reply_done>, which accepts all of them,
-# then <state_init>); after a reply that ends the connection (<reply_end_close>: the reply to a
-# request with "Connection: close", or a reply that carries it, <rep_closing>) nothing follows.
-# The first message that tells the two apart decides the alternative. The race between the
-# cancel and the expiry is one rule for every state (<reply_settled>), as is the expiry before a
-# request (<expired_before_request>): Fandango's planner weighs each place where it takes a step
-# by how often it took it, and in a rule of its own per state the rarely taken expiry stayed the
-# cheaper way on in each of them, so the planner waited for it after a reply.
-<reply_done> ::= <server_initiated> <reply_done> | <exchange_server_redirect_ranged> <reply_done> \
-    | <exchange_server_redirect> <reply_done> | <reply_settled>
-# the race between the client's cancel and the timer's expiry after the final reply, one rule
-# for all states: either message settles the timer
-<reply_settled> ::= <TimerControl:reply_cancel> | <TimerEvent:reply_expired>
-<reply_end_init> ::= <reply_done> <state_init>
-<reply_end_close> ::= <reply_done>
-<reply_end_ready> ::= <server_initiated> <reply_end_ready> | <exchange_server_redirect_ranged> <reply_end_ready> \
-    | <reply_settled> <state_ready> \
-    | <exchange_server_redirect> <reply_done> <state_init>
-<reply_end_playing> ::= <server_initiated> <reply_end_playing> | <exchange_server_redirect_ranged> <reply_end_playing> \
-    | <reply_settled> <state_playing> \
-    | <exchange_server_redirect> <reply_done> <state_init>
-<reply_end_recording> ::= <server_initiated> <reply_end_recording> | <exchange_server_redirect_ranged> <reply_end_recording> \
-    | <reply_settled> <state_recording> \
-    | <exchange_server_redirect> <reply_done> <state_init>
-<reply_end_ready_nosetup> ::= <server_initiated> <reply_end_ready_nosetup> | <exchange_server_redirect_ranged> <reply_end_ready_nosetup> \
-    | <reply_settled> <state_ready_nosetup> \
-    | <exchange_server_redirect> <reply_done> <state_init>
-<reply_end_playing_nosetup> ::= <server_initiated> <reply_end_playing_nosetup> | <exchange_server_redirect_ranged> <reply_end_playing_nosetup> \
-    | <reply_settled> <state_playing_nosetup> \
-    | <exchange_server_redirect> <reply_done> <state_init>
-<reply_end_after_describe> ::= <server_initiated> <reply_end_after_describe> | <exchange_server_redirect_ranged> <reply_end_after_describe> \
-    | <reply_settled> <setup_after_describe> \
-    | <exchange_server_redirect> <reply_done> <state_init>
-<reply_end_after_announce> ::= <server_initiated> <reply_end_after_announce> | <exchange_server_redirect_ranged> <reply_end_after_announce> \
-    | <reply_settled> <setup_after_announce> \
-    | <exchange_server_redirect> <reply_done> <state_init>
-
-# 2326 9.1: the client MAY pipeline its requests; the server answers them in the order received
-# (C4). Two requests that leave Init unchanged, then their replies in request order; the first
-# reply may arrive before the second request is sent (<pipelined_rest>)
-<pipelined_exchange> ::= <Client:req_pipelined_first> <interim>* <pipelined_rest>
-<pipelined_rest> ::= <Client:req_pipelined_second> <interim>* <pipelined_replies> \
-    | <Server:rep_pipelined_first> <interim>* <pipelined_after_first> \
-    | <exchange_server_redirect> <interim>* <pipelined_rest> \
-    | <TimerEvent:reply_expired> \
-    | <Server:rep_pipelined_first_closing> <reply_end_close>
-# after the first reply the client may also leave the second request unsent: the reply settles
-# the timer as any final reply does (<reply_settled>), Init stays
-<pipelined_after_first> ::= <Client:req_pipelined_second> <interim>* <pipelined_second_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_after_first> \
-    | <reply_settled> <state_init>
-<pipelined_replies> ::= <Server:rep_pipelined_first> <interim>* <pipelined_second_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_replies> | <TimerEvent:reply_expired> \
-    | <Server:rep_pipelined_first_closing> <reply_end_close>
-<pipelined_second_reply> ::= <Server:rep_pipelined_second> <reply_end_init> \
-    | <exchange_server_redirect> <interim>* <pipelined_second_reply> | <TimerEvent:reply_expired> \
-    | <Server:rep_pipelined_second_closing> <reply_end_close>
-<req_pipelined_first> ::= <req_options> | <req_get_parameter> | <req_describe>
-<req_pipelined_second> ::= <req_options> | <req_get_parameter> | <req_describe>
-<rep_pipelined_first> ::= <rep_any>
-<rep_pipelined_second> ::= <rep_any>
-
-# 2326 9.1: "A client that supports persistent connections or connectionless mode MAY
-# "pipeline" its requests"; the server answers in the order received (C4). In each state, two
-# requests one after the other, then their replies in that order: the first reply's class
-# selects the state in which the second request's reply rule continues (a dependent second
-# request, <req_*_pipelined>). The first reply may also arrive before the second request goes
-# out; that is the exchange of the state's own rule.
-<pipelined_in_ready> ::= <Client:req_setup_in_session> <Client:req_play_pipelined> <interim_session>* <setup_play_replies_in_ready> \
-    | <play_leading> <Client:req_pause_pipelined> <interim_session>* <play_pause_replies_in_ready> \
-    | <play_leading> <Client:req_teardown_pipelined> <interim_session>* <play_teardown_replies_in_ready> \
-    | <play_leading> <Client:req_get_parameter_pipelined> <interim_session>* <play_get_parameter_replies_in_ready> \
-    | <record_leading> <Client:req_teardown_pipelined> <interim_session>* <record_teardown_replies_in_ready>
-<setup_play_replies_in_ready> ::= <Server:rep_setup_2xx> <interim_session>* <play_reply_in_ready> \
-    | <Server:rep_err> <interim_session>* <play_reply_in_ready> \
-    | <Server:rep_304> <interim_session>* <play_reply_in_ready> \
-    | <Server:rep_3xx> <interim>* <no_session_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_redirected> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<play_pause_replies_in_ready> ::= <Server:rep_play_2xx> <interim_session>* <pause_reply_in_playing> \
-    | <Server:rep_err> <interim_session>* <stateless_reply_in_ready> \
-    | <Server:rep_3xx> <interim>* <no_session_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_redirected> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<play_teardown_replies_in_ready> ::= <Server:rep_play_2xx> <interim_session>* <teardown_reply_in_playing> \
-    | <Server:rep_err> <interim_session>* <teardown_reply_in_ready> \
-    | <Server:rep_3xx> <interim>* <no_session_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_redirected> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<play_get_parameter_replies_in_ready> ::= <Server:rep_play_2xx> <interim_session>* <stateless_reply_in_playing> \
-    | <Server:rep_err> <interim_session>* <stateless_reply_in_ready> \
-    | <Server:rep_3xx> <interim>* <stateless_reply_in_init> \
-    | <exchange_server_redirect> <interim>* <pipelined_redirected> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<record_teardown_replies_in_ready> ::= <Server:rep_record_2xx> <interim_session>* <teardown_reply_in_recording> \
-    | <Server:rep_err> <interim_session>* <teardown_reply_in_ready> \
-    | <Server:rep_3xx> <interim>* <no_session_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_redirected> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<pipelined_in_playing> ::= <pause_leading> <Client:req_play_pipelined> <interim_session>* <pause_play_replies_in_playing> \
-    | <pause_leading> <Client:req_teardown_pipelined> <interim_session>* <pause_teardown_replies_in_playing>
-<pause_play_replies_in_playing> ::= <Server:rep_pause_2xx> <interim_session>* <play_reply_in_ready> \
-    | <Server:rep_err> <interim_session>* <play_reply_in_playing> \
-    | <Server:rep_3xx> <interim>* <no_session_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_redirected> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<pause_teardown_replies_in_playing> ::= <Server:rep_pause_2xx> <interim_session>* <teardown_reply_in_ready> \
-    | <Server:rep_err> <interim_session>* <teardown_reply_in_playing> \
-    | <Server:rep_3xx> <interim>* <no_session_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_redirected> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<pipelined_in_recording> ::= <pause_leading> <Client:req_record_pipelined> <interim_session>* <pause_record_replies_in_recording> \
-    | <pause_leading> <Client:req_teardown_pipelined> <interim_session>* <pause_teardown_replies_in_recording>
-<pause_record_replies_in_recording> ::= <Server:rep_pause_2xx> <interim_session>* <record_reply_in_ready> \
-    | <Server:rep_err> <interim_session>* <record_reply_in_recording> \
-    | <Server:rep_3xx> <interim>* <no_session_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_redirected> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<pause_teardown_replies_in_recording> ::= <Server:rep_pause_2xx> <interim_session>* <teardown_reply_in_ready> \
-    | <Server:rep_err> <interim_session>* <teardown_reply_in_recording> \
-    | <Server:rep_3xx> <interim>* <no_session_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_redirected> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<pipelined_in_ready_nosetup> ::= <play_nosetup_leading> <Client:req_pause_nosetup_pipelined> <interim>* <play_pause_replies_in_ready_nosetup>
-<play_pause_replies_in_ready_nosetup> ::= <Server:rep_play_2xx> <interim>* <pause_nosetup_reply_in_playing> \
-    | <Server:rep_err> <interim>* <stateless_reply_in_ready_nosetup> \
-    | <Server:rep_3xx> <interim>* <no_session_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_redirected> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<pipelined_in_playing_nosetup> ::= <pause_nosetup_leading> <Client:req_play_nosetup_pipelined> <interim>* <pause_play_replies_in_playing_nosetup>
-<pause_play_replies_in_playing_nosetup> ::= <Server:rep_pause_2xx> <interim>* <play_nosetup_reply_in_ready> \
-    | <Server:rep_err> <interim>* <play_nosetup_reply_in_playing> \
-    | <Server:rep_3xx> <interim>* <no_session_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_redirected> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-# a REDIRECT before the replies: both replies still arrive (further REDIRECTs may come first),
-# then the session is in Init
-<pipelined_redirected> ::= <Server:rep_any> <interim>* <redirected_reply> \
-    | <exchange_server_redirect> <interim>* <pipelined_redirected> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-# PLAY, PAUSE and RECORD in a pipeline, first or second, carry their Range in either part of the
-# split (2326 12.29: the request the session continues with or any other form, ";time=" included).
-# The first request is the same message as the state's own exchange opens with, so that a reply
-# that arrives before the second request continues that exchange.
-<play_leading> ::= <Client:req_play> | <Client:req_play_any_range>
-<pause_leading> ::= <Client:req_pause> | <Client:req_pause_any_point>
-<record_leading> ::= <Client:req_record> | <Client:req_record_any_range>
-<play_nosetup_leading> ::= <Client:req_play_nosetup> | <Client:req_play_nosetup_any_range>
-<pause_nosetup_leading> ::= <Client:req_pause_nosetup> | <Client:req_pause_nosetup_any_point>
-<req_play_pipelined> ::= <req_play> | <req_play_any_range>
-<req_pause_pipelined> ::= <req_pause> | <req_pause_any_point>
-<req_teardown_pipelined> ::= <req_teardown>
-<req_record_pipelined> ::= <req_record> | <req_record_any_range>
-<req_get_parameter_pipelined> ::= <req_get_parameter_in_session>
-<req_pause_nosetup_pipelined> ::= <req_pause_nosetup> | <req_pause_nosetup_any_point>
-<req_play_nosetup_pipelined> ::= <req_play_nosetup> | <req_play_nosetup_any_range>
-
-# requests that do not affect the state (2326 A.1); any reply class. A SETUP with an
-# unsupported transport sets nothing up: it is refused (2326 11.3.12)
-<stateless_request> ::= <Client:req_options> <resend_options>* | <Client:req_describe> <resend_describe>* \
-    | <auth_request> | <Client:req_announce> <resend_announce>* \
-    | <Client:req_get_parameter> <resend_get_parameter>* | <Client:req_set_parameter> <resend_set_parameter>* | <Client:req_bad_version> <resend_bad_version>* \
-    | <Client:req_setup_unsupported_transport> <resend_setup_unsupported_transport>*
-# within a session also the requests that carry its Session: the liveness test GET_PARAMETER
-# (2326 10.8, 12.37, F75), SET_PARAMETER and ANNOUNCE of the session's presentation or stream
-# (2326 10.3, 10.9; Table 3: Session in all methods but SETUP and OPTIONS), DESCRIBE of the
-# presentation
-<session_stateless_request> ::= <stateless_request> | <Client:req_describe_media> <resend_describe_media>* \
-    | <Client:req_get_parameter_in_session> <resend_get_parameter_in_session>* | <Client:req_set_parameter_in_session> <resend_set_parameter_in_session>* \
-    | <Client:req_announce_in_session> <resend_announce_in_session>*
-
-# requests with "Connection: close" (2326 12.10, 9112 9.6): the reply ends the connection (F87)
-<close_request> ::= <Client:req_options_close> <resend_options_close>* | <Client:req_describe_close> <resend_describe_close>* \
-    | <Client:req_get_parameter_close> <resend_get_parameter_close>* | <Client:req_set_parameter_close> <resend_set_parameter_close>* | <Client:req_announce_close> <resend_announce_close>*
-<session_close_request> ::= <close_request> | <Client:req_teardown_close> <resend_teardown_close>* | <Client:req_play_close> <resend_play_close>* \
-    | <Client:req_pause_close> <resend_pause_close>* | <Client:req_record_close> <resend_record_close>* | <Client:req_setup_in_session_close> <resend_setup_in_session_close>*
-# in the states of A.2: PLAY without SETUP (PAUSE in Playing, above)
-<nosetup_close_request> ::= <close_request> | <Client:req_play_nosetup_close> <resend_play_nosetup_close>*
-
-# session requests sent in Init: no session, or one only an earlier session could have
-# created (2326 11.3.5 454 Session Not Found, 11.3.6 455; 12.37); no reply class is prescribed
-<no_session_request> ::= <Client:req_play_no_session> <resend_play_no_session>* | <Client:req_teardown_no_session> <resend_teardown_no_session>* \
-    | <Client:req_record_no_session> <resend_record_no_session>* | <Client:req_pause_no_session> <resend_pause_no_session>*
-<no_session_reply> ::= <Server:rep_any> <reply_end_init> | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-
-# DESCRIBE with wrong credentials (9110 11.6.2, 15.5.2): a server may answer it late, e.g. after
-# a pause against password guessing; over TCP the spec sets the client no deadline (2326 9.2:
-# no retransmission; 9112 9.6). Just before it the client restarts the reply timer with the
-# longer RTSP_AUTH_REPLY_WAIT (<reply_start_auth>), between that start and the request it accepts
-# what the server may send at any time: interleaved data and requests of the server, REDIRECTs
-# with a Range (the state stays, 2326 10.10); an expiry before the request starts the timer
-# again, and until it does the server may still send all these (<auth_expired>: e.g. interleaved
-# data while playing). A REDIRECT without a Range moves the client to Init before its request
-# went out (2326 A.1): it sends none, and the expiry that follows ends the session
-# (<stateless_reply_in_X>); after an expiry no timer runs that could end it, so there it is
-# not offered.
-<auth_request> ::= <TimerControl:reply_start_auth> <auth_requesting>
-<auth_requesting> ::= <Client:req_describe_wrong_credentials> <resend_describe_wrong_credentials>* \
-    | <server_initiated> <auth_requesting> \
-    | <exchange_server_redirect_ranged> <auth_requesting> \
-    | <expired_before_request> <auth_expired> \
-    | <exchange_server_redirect>
-<auth_expired> ::= <server_initiated> <auth_expired> \
-    | <exchange_server_redirect_ranged> <auth_expired> \
-    | <auth_request>
-
-# an extension method (2326 6.1): any reply, the state unchanged (A.1 defines no transition for
-# it); a 3xx redirects (-> Init). A server without the method MUST return 501 Not Implemented
-# (2326 10, C25): checked where the session shows that it lacks the method (unimplemented_refused,
-# for every method a server need not implement)
-<extension_reply_in_init> ::= <Server:rep_extension> <reply_end_init> \
-    | <Server:rep_3xx> <reply_end_init> | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<extension_reply_in_ready> ::= <Server:rep_extension> <reply_end_ready> \
-    | <Server:rep_3xx> <reply_end_init> | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<extension_reply_in_playing> ::= <Server:rep_extension> <reply_end_playing> \
-    | <Server:rep_3xx> <reply_end_init> | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<extension_reply_in_recording> ::= <Server:rep_extension> <reply_end_recording> \
-    | <Server:rep_3xx> <reply_end_init> | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<extension_reply_in_ready_nosetup> ::= <Server:rep_extension> <reply_end_ready_nosetup> \
-    | <Server:rep_3xx> <reply_end_init> | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<extension_reply_in_playing_nosetup> ::= <Server:rep_extension> <reply_end_playing_nosetup> \
-    | <Server:rep_3xx> <reply_end_init> | <redirect_pending> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-# with "Connection: close": the refusal, then the connection ends (F87)
-<extension_close_reply> ::= <Server:rep_extension> <reply_end_close> | <Server:rep_3xx> <reply_end_close> \
-    | <exchange_server_redirect> <interim>* <close_reply> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-
-# requests of the server (2326 10: ANNOUNCE, GET_PARAMETER, SET_PARAMETER, OPTIONS S->C),
-# each answered by the client, and interleaved data
-<server_initiated> ::= <Server:interleaved_frame> | <server_request_exchange>
-<server_request_exchange> ::= <Server:srv_req_announce> <Server:interleaved_frame>* <Client:rep_to_announce> \
-    | <Server:srv_req_get_parameter> <Server:interleaved_frame>* <Client:rep_to_get_parameter> \
-    | <Server:srv_req_set_parameter> <Server:interleaved_frame>* <Client:rep_to_set_parameter> \
-    | <Server:srv_req_options> <Server:interleaved_frame>* <Client:rep_to_options> \
-    | <Server:srv_req_extension> <Server:interleaved_frame>* <Client:rep_to_extension>
-# 2326 A.1: "Receiving a REDIRECT from the server is equivalent to receiving a 3xx" -> Init;
-# 10.10: a REDIRECT with a Range takes effect at that time: until then the session keeps its
-# state (and its requests may get 3xx or 454 once it took effect)
-# an immediate REDIRECT while a request of the client waits for its reply: the reply (any
-# class) still arrives, then the session is in Init (2326 10.10, A.1)
-<redirect_pending> ::= <exchange_server_redirect> <interim>* <redirected_reply>
-<redirected_reply> ::= <Server:rep_any> <reply_end_init> \
-    | <exchange_server_redirect> <interim>* <redirected_reply> | <TimerEvent:reply_expired> \
-    | <Server:rep_closing> <reply_end_close>
-<exchange_server_redirect> ::= <Server:srv_req_redirect> <Server:interleaved_frame>* <Client:rep_to_redirect>
-<exchange_server_redirect_ranged> ::= <Server:srv_req_redirect_ranged> <Server:interleaved_frame>* <Client:rep_to_redirect>
-
-# ======================================================================================
-# Basic rules (2326 15, 9110 5.6, 9112 5)
-# ======================================================================================
-
-<crlf> ::= '\r\n'
-<sp> ::= ' '
-# LWS = [CRLF] 1*( SP | HT ) (2326 15); received around field values, folding included
-<lws> ::= r'(?:(?:\r\n)?[ \t]+)+'
-<ows> ::= <lws>?
-# whitespace the client sends where LWS is allowed: none, spaces or a tab
-<ows_sent> ::= <wsp_sent>? := ows_value()
-<wsp_sent> ::= ' ' | '  ' | '\t'
-<digits> ::= r'[0-9]+'
-<token> ::= r"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
-<quoted_string> ::= r'"(?:[^"\\\r\n]|\\.)*"'
-# 9110 5.6.1.2: a recipient MUST accept empty list elements: [ element ] *( OWS "," OWS [ element ] );
-# received lists are <list_lead>* element (<list_sep> element)* <list_trail>* (at least one element)
-<list_lead> ::= ',' <ows>
-<list_sep> ::= <ows> ',' <list_comma>* <ows>
-<list_comma> ::= <ows> ','
-<list_trail> ::= <ows> ','
-<octet> ::= rb'[\x00-\xff]'
-# runs of 16 and 256 octets: data of counted length in few nodes (bodies, interleaved data)
-<block_16> ::= rb'[\x00-\xff]{16}'
-<block_256> ::= rb'[\x00-\xff]{256}'
-# TEXT without CR and LF (2326 15)
-<text> ::= r'[^\x00-\x08\x0a-\x1f\x7f]+'
-# a field value the grammar does not structure: TEXT and folding (9112 5.2)
-<field_text> ::= <text>? <field_fold>*
-<field_fold> ::= r'\r\n[ \t]' <text>?
-
-# ======================================================================================
-# Requests of the client (2326 6)
-# ======================================================================================
-
-# 2326 6.1: Request-Line = Method SP Request-URI SP RTSP-Version CRLF; the client speaks 1.0
-<rtsp_version> ::= 'RTSP/1.0'
-
-# --- Request-URIs (2326 3.2, 6.1; 3986 3): rtsp_URL = ( "rtsp:" | "rtspu:" ) "//" host
-# [ ":" port ] [ abs_path ]; scheme and host are case-insensitive (3986 3.1, 3.2.2) ---
-# the scheme of the session's transport (RTSP_TRANSPORT): rtsp over TCP, rtspu over UDP (2326 3.2)
-<rtsp_scheme> ::= <scheme_tcp> | <scheme_udp> := url_scheme()
-<scheme_tcp> ::= 'rtsp' | 'RTSP'
-<scheme_udp> ::= 'rtspu' | 'RTSPU'
-<server_authority> ::= <host> ':' <port>
-<host> ::= r'[0-9A-Za-z.:\[\]-]+' := RTSP_HOST
-<port> ::= <digits> := RTSP_PORT
-# the presentation the server plays, and one of its streams (2326 1.3, C.1.1)
-<media_url> ::= <rtsp_scheme> '://' <server_authority> '/' <media_path>
-<media_path> ::= <path_text> := RTSP_MEDIA_PATH
-# the presentation the client announces and records (2326 10.3, 10.11)
-<record_url> ::= <rtsp_scheme> '://' <server_authority> '/' <record_path>
-<record_path> ::= <path_text> := RTSP_RECORD_PATH
-<record_track> ::= <path_text> := RTSP_RECORD_TRACK
-# a presentation that may need credentials, and one the server does not have
-<auth_url> ::= <rtsp_scheme> '://' <server_authority> '/' <auth_path>
-<auth_path> ::= <path_text> := RTSP_AUTH_PATH
-<missing_url> ::= <rtsp_scheme> '://' <server_authority> '/' <missing_path>
-<missing_path> ::= <path_text> := RTSP_MISSING_PATH
-<path_text> ::= r"[A-Za-z0-9._~!$&'()*+,;=:@%/-]+"
-# 2326 6.1: "*" applies to the server itself, for methods that need no resource
-<asterisk_uri> ::= '*'
-
-# --- header fields the client sends (2326 12) ---
-# Field names are case-insensitive (9110 5.1): canonical, lower and upper case are sent.
-# 2326 12.17: CSeq, in every request; incremented by one per distinct request (2326 9.2)
-# (a request resent over UDP carries the CSeq of the original, 2326 9.2, see <resend_*>)
-<h_cseq> ::= <name_cseq> ':' <ows_sent> <cseq_value> <crlf>
-<name_cseq> ::= 'CSeq' | 'cseq' | 'CSEQ' := name_case("CSeq")
-<cseq_value> ::= <digits> := recalled_next_cseq()
-
-# 2326 12.37: Session = "Session" ":" session-id; no timeout parameter in requests
-<h_session> ::= <name_session> ':' <ows_sent> <session_id_sent> <crlf>
-<name_session> ::= 'Session' | 'session' | 'SESSION' := name_case("Session")
-<session_id_sent> ::= r'[A-Za-z0-9$_.+-]+' := recalled_session()
-# a session identifier no session of this connection was assigned (2326 12.37: 454)
-<h_session_stale> ::= <name_session> ':' <ows_sent> <session_id_stale> <crlf>
-<session_id_stale> ::= r'[A-Za-z0-9$_.+-]+' := "stale" + str(random.randint(100000, 999999))
-
-# 2326 12.41: User-Agent = "User-Agent" ":" 1*( product | comment )
-<h_user_agent> ::= <name_user_agent> ':' <ows_sent> <product> (<sp> <product>){0,2} <crlf>
-<name_user_agent> ::= 'User-Agent' | 'user-agent' | 'USER-AGENT' := name_case("User-Agent")
-<product> ::= <token> ('/' <token>)? := random.choice(["fandango/1.3", "rtsp-test", "client/0.1"])
-
-# 2326 12.38: Timestamp = "Timestamp" ":" *(DIGIT) [ "." *(DIGIT) ] [ delay ]
-<h_timestamp> ::= <name_timestamp> ':' <ows_sent> <timestamp_value> <crlf>
-<name_timestamp> ::= 'Timestamp' | 'timestamp' | 'TIMESTAMP' := name_case("Timestamp")
-<timestamp_value> ::= r'[0-9]+(?:\.[0-9]*)?' := random_ntp_like()
-
-# 2326 12.6: Bandwidth = "Bandwidth" ":" 1*DIGIT (bits per second)
-<h_bandwidth> ::= <name_bandwidth> ':' <ows_sent> <bandwidth_value> <crlf>
-<name_bandwidth> ::= 'Bandwidth' | 'bandwidth' | 'BANDWIDTH' := name_case("Bandwidth")
-<bandwidth_value> ::= <digits> := str(random.choice([64000, 384000, 1000000, 4000000]))
-
-# 2326 12.7: Blocksize = "Blocksize" ":" 1*DIGIT (octets, media packet size)
-<h_blocksize> ::= <name_blocksize> ':' <ows_sent> <blocksize_value> <crlf>
-<name_blocksize> ::= 'Blocksize' | 'blocksize' | 'BLOCKSIZE' := name_case("Blocksize")
-<blocksize_value> ::= <digits> := str(random.choice([512, 1024, 1400, 4096]))
-
-# 2326 12.3 / 9110 12.5.4: Accept-Language = 1#( language-range [ weight ] )
-<h_accept_language> ::= <name_accept_language> ':' <ows_sent> <language_range> (',' <ows_sent> <language_range>){0,2} <crlf>
-<name_accept_language> ::= 'Accept-Language' | 'accept-language' | 'ACCEPT-LANGUAGE' := name_case("Accept-Language")
-<language_range> ::= <language_tag> <weight>?
-<language_tag> ::= r'[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*|\*' := random.choice(["en", "de", "en-US", "*"])
-<weight> ::= ';q=' <qvalue>
-<qvalue> ::= r'0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?' := random.choice(["0.5", "1", "0.8"])
-
-# 2326 12.43 / 9110 7.6.3: Via = 1#( received-protocol RWS received-by [ RWS comment ] )
-<h_via> ::= <name_via> ':' <ows_sent> <via_entry> (',' <ows_sent> <via_entry>){0,2} <crlf>
-<name_via> ::= 'Via' | 'via' | 'VIA' := name_case("Via")
-<via_entry> ::= <via_protocol> ' ' <via_host>
-<via_protocol> ::= 'RTSP/1.0' | '1.0'
-# 9110 7.6.3: received-protocol = [ protocol-name "/" ] protocol-version; received-by = host [ ":" port ]
-<via_host> ::= r"[A-Za-z0-9.-]+(?::[0-9]+)?" := random.choice(["proxy.example", "gw1", "relay.example:554"])
-
-# 2326 12.18 / 9110 6.6.1: Date = HTTP-date (IMF-fixdate)
-<h_date> ::= <name_date> ':' <ows_sent> <http_date> <crlf>
-<name_date> ::= 'Date' | 'date' | 'DATE' := name_case("Date")
-<http_date> ::= <day_name> ', ' <date_day> ' ' <month> ' ' <year> ' ' <time_of_day> ' GMT'
-<day_name> ::= 'Mon' | 'Tue' | 'Wed' | 'Thu' | 'Fri' | 'Sat' | 'Sun'
-<month> ::= 'Jan' | 'Feb' | 'Mar' | 'Apr' | 'May' | 'Jun' | 'Jul' | 'Aug' | 'Sep' | 'Oct' | 'Nov' | 'Dec'
-<date_day> ::= r'0[1-9]|1[0-9]|2[0-8]'
-<year> ::= r'[0-9]{4}' := str(random.randint(1998, 2030))
-<time_of_day> ::= r'[01][0-9]|2[0-3]' ':' r'[0-5][0-9]' ':' r'[0-5][0-9]'
-
-# 2326 12.20 / 9110 10.1.2: From = mailbox
-<h_from> ::= <name_from> ':' <ows_sent> <mailbox> <crlf>
-<name_from> ::= 'From' | 'from' | 'FROM' := name_case("From")
-<mailbox> ::= r'[a-z]+@[a-z]+\.example' := random.choice(["tester@lab.example", "ops@media.example"])
-
-# 2326 12.30 / 9110 10.1.3: Referer = absolute-URI / partial-URI
-<h_referer> ::= <name_referer> ':' <ows_sent> <media_url> <crlf>
-<name_referer> ::= 'Referer' | 'referer' | 'REFERER' := name_case("Referer")
-
-# 2326 12.8: Cache-Control = 1#cache-directive; request directives no-cache, max-stale,
-# min-fresh, max-age, only-if-cached, cache-extension
-<h_cache_control> ::= <name_cache_control> ':' <ows_sent> <cache_request_directive> (',' <ows_sent> <cache_request_directive>){0,2} <crlf>
-<name_cache_control> ::= 'Cache-Control' | 'cache-control' | 'CACHE-CONTROL' := name_case("Cache-Control")
-<cache_request_directive> ::= <cd_no_cache> | <cd_max_stale> | <cd_min_fresh> | <cd_max_age> | <cd_only_if_cached> | <cd_extension>
-# cache-extension = token [ "=" ( token | quoted-string ) ]
-<cd_extension> ::= <cache_extension_name> ('=' (<cache_extension_token> | <cache_extension_quoted>))?
-<cache_extension_name> ::= r'x-[a-z-]+' := random.choice(["x-community", "x-fandango-cache"])
-<cache_extension_token> ::= r'[A-Za-z0-9.-]+' := random.choice(["UCI", "1"])
-<cache_extension_quoted> ::= r'"[A-Za-z0-9 .-]*"' := random.choice(['"lab group"', '"x"'])
-<cd_no_cache> ::= 'no-cache'
-<cd_max_stale> ::= 'max-stale' ('=' <delta_seconds>)?
-<cd_min_fresh> ::= 'min-fresh=' <delta_seconds>
-<cd_max_age> ::= 'max-age=' <delta_seconds>
-<cd_only_if_cached> ::= 'only-if-cached'
-<delta_seconds> ::= <digits> := str(random.randint(0, 3600))
-
-# 2326 12.27: Proxy-Require = 1#option-tag (only proxies act on it; the origin server ignores it)
-<h_proxy_require> ::= <name_proxy_require> ':' <ows_sent> <option_tag> (',' <ows_sent> <option_tag>){0,2} <crlf>
-<name_proxy_require> ::= 'Proxy-Require' | 'proxy-require' | 'PROXY-REQUIRE' := name_case("Proxy-Require")
-<option_tag> ::= r'[A-Za-z0-9.-]+' := random.choice(["play.basic", "com.example.feature"])
-
-# 2326 12.32: Require = 1#option-tag; private option-tags (2326 3.8) whose support the server's
-# replies show (C21: Unsupported, 551)
-<h_require_unknown> ::= <name_require> ':' <ows_sent> <option_tag_unknown> (',' <ows_sent> <option_tag_unknown>){0,1} <crlf>
-<name_require> ::= 'Require' | 'require' | 'REQUIRE' := name_case("Require")
-<option_tag_unknown> ::= r'[A-Za-z0-9.-]+' := RTSP_UNKNOWN_OPTION + random.choice(["", ".a", ".b"])
-
-# 2326 12.10 / 9112 9.6: Connection = 1#connection-option
-<h_connection> ::= <name_connection> ':' <ows_sent> <connection_option> <crlf>
-<name_connection> ::= 'Connection' | 'connection' | 'CONNECTION' := name_case("Connection")
-<connection_option> ::= 'keep-alive' | 'Keep-Alive'
-
-# 2326 8.1: extension-header = message-header, ignored by recipients that do not know it
-<h_extension> ::= <extension_name> ':' <ows_sent> <extension_value> <crlf>
-<extension_name> ::= r'[Xx]-[A-Za-z0-9-]+' := random.choice(["X-Fandango-Test", "x-trace-id", "X-Extension"])
-<extension_value> ::= r'[!-~]+' := random.choice(["1", "abc", "on"])
-
-# 2326 12.1 / 9110 12.5.1: Accept = #( media-range [ weight ] )
-<h_accept> ::= <name_accept> ':' <ows_sent> <media_range> (',' <ows_sent> <media_range>){0,2} <crlf>
-<name_accept> ::= 'Accept' | 'accept' | 'ACCEPT' := name_case("Accept")
-# media-range = ( "*/*" / ( type "/" "*" ) / ( type "/" subtype ) ) parameters, then a weight
-<media_range> ::= (<mr_sdp> | <mr_any_application> | <mr_any> | <mr_rtsl> | <mr_mheg> | <mr_other>) <mr_parameter>? <weight>?
-<mr_sdp> ::= 'application/sdp'
-<mr_any_application> ::= 'application/*'
-<mr_any> ::= '*/*'
-<mr_rtsl> ::= 'application/rtsl'
-<mr_mheg> ::= 'application/mheg'
-<mr_other> ::= <mr_type> '/' <mr_subtype>
-<mr_type> ::= <token> := random.choice(["text", "application", "video"])
-<mr_subtype> ::= <token> := random.choice(["parameters", "x-rtsp-mh", "plain"])
-# parameters = *( OWS ";" OWS parameter ), e.g. application/sdp;level=2 (2326 12.1)
-<mr_parameter> ::= ';' <mr_parameter_name> '=' <mr_parameter_value>
-<mr_parameter_name> ::= <token> := random.choice(["level", "charset"])
-<mr_parameter_value> ::= <token> := random.choice(["2", "utf-8"])
-
-# 2326 12.2 / 9110 12.5.3: Accept-Encoding = #( codings [ weight ] ) (F22)
-<h_accept_encoding> ::= <name_accept_encoding> ':' <ows_sent> <coding_choice> (',' <ows_sent> <coding_choice>){0,2} <crlf>
-<name_accept_encoding> ::= 'Accept-Encoding' | 'accept-encoding' | 'ACCEPT-ENCODING' := name_case("Accept-Encoding")
-<coding_choice> ::= <coding> <weight>?
-<coding> ::= <coding_identity> | <coding_gzip> | <coding_deflate> | <coding_compress> | <coding_any>
-<coding_identity> ::= 'identity'
-<coding_gzip> ::= 'gzip'
-<coding_deflate> ::= 'deflate'
-<coding_compress> ::= 'compress'
-<coding_any> ::= '*'
-
-# 2326 12.23: If-Modified-Since = HTTP-date (conditional DESCRIBE and SETUP, 304)
-<h_if_modified_since> ::= <name_if_modified_since> ':' <ows_sent> <http_date> <crlf>
-<name_if_modified_since> ::= 'If-Modified-Since' | 'if-modified-since' | 'IF-MODIFIED-SINCE' := name_case("If-Modified-Since")
-
-# 2326 12.22 / 9110 13.1.1: If-Match = "*" / 1#entity-tag (SETUP on a description version, C.1.8)
-<h_if_match> ::= <name_if_match> ':' <ows_sent> <if_match_value> <crlf>
-<name_if_match> ::= 'If-Match' | 'if-match' | 'IF-MATCH' := name_case("If-Match")
-<if_match_value> ::= '*' | <entity_tag> (',' <ows_sent> <entity_tag>){0,1}
-<entity_tag> ::= 'W/'? '"' <etag_chars> '"'
-# the description's a=etag (2326 C.1.8), recorded from the DESCRIBE reply
-<etag_chars> ::= r'[!#-~]+' := recalled_etag()
-
-# 2326 12.9: Conference = "Conference" ":" conference-id (SETUP only); an unknown id -> 452
-<h_conference> ::= <name_conference> ':' <ows_sent> <conference_id> <crlf>
-<name_conference> ::= 'Conference' | 'conference' | 'CONFERENCE' := name_case("Conference")
-<conference_id> ::= r'[A-Za-z0-9$_.+!*()-]+' := recalled_conference()
-<h_conference_unknown> ::= <name_conference> ':' <ows_sent> <conference_id_unknown> <crlf>
-<conference_id_unknown> ::= r'[A-Za-z0-9$_.+!*()-]+' := RTSP_UNKNOWN_CONFERENCE
-
-# 2326 12.5 / 9110 11.6.2: Authorization = credentials; Basic: token68 of user-id:password
-# TODO: 2326 1.4, 16 Digest credentials (<h_authorization>): RFC 2069 / RFC 7616 define them and the manifest leaves them out; Digest challenges parse as <challenge>
-<h_authorization> ::= <name_authorization> ':' <ows_sent> <basic_scheme> <auth_sp_sent> <basic_token> <crlf>
-<name_authorization> ::= 'Authorization' | 'authorization' | 'AUTHORIZATION' := name_case("Authorization")
-# 9110 11.1: the auth-scheme is case-insensitive; every case form is sent, the canonical one mostly
-<basic_scheme> ::= 'Basic' | 'basic' | 'BASIC' := name_case("Basic")
-<basic_token> ::= r'[A-Za-z0-9+/]+=*' := basic_credentials(RTSP_USER, RTSP_PASSWORD)
-# 9110 11.4: credentials = auth-scheme [ 1*SP ( token68 / #auth-param ) ]: one space mostly, now
-# and then two or three
-<auth_sp_sent> ::= ' ' | '  ' | '   ' := auth_space()
-# 2326 12.26 / 9110 11.7.2: Proxy-Authorization = credentials (for a proxy on the path)
-<h_proxy_authorization> ::= <name_proxy_authorization> ':' <ows_sent> <basic_scheme> <auth_sp_sent> <basic_token> <crlf>
-<name_proxy_authorization> ::= 'Proxy-Authorization' | 'proxy-authorization' | 'PROXY-AUTHORIZATION' := name_case("Proxy-Authorization")
-<h_authorization_wrong> ::= <name_authorization> ':' <ows_sent> <basic_scheme> <auth_sp_sent> <basic_token_wrong> <crlf>
-<basic_token_wrong> ::= r'[A-Za-z0-9+/]+=*' := basic_credentials(RTSP_USER, RTSP_WRONG_PASSWORD)
-
-# 2326 12.29: Range = 1#ranges-specifier [ ";" "time" "=" utc-time ]; sent as
-# <h_range_in_presentation> | <h_range_other> (below), which split it by value
-<name_range> ::= 'Range' | 'range' | 'RANGE' := name_case("Range")
-<ranges_specifier> ::= <npt_range> | <smpte_range> | <utc_range>
-# 2326 12.29: the time parameter: when the operation is to take effect (F82)
-<range_time> ::= ';time=' <utc_time>
-# 2326 3.6: npt-range = ( npt-time "-" [ npt-time ] ) | ( "-" npt-time )
-<npt_range> ::= 'npt=' <npt_time> '-' <npt_time>? | 'npt=-' <npt_time>
-<npt_time> ::= <npt_now> | <npt_sec> | <npt_hhmmss>
-<npt_now> ::= 'now'
-<npt_sec> ::= <npt_seconds> ('.' <fraction_digits>?)?
-<npt_seconds> ::= <digits> := str(random.randint(0, 50))
-<fraction_digits> ::= r'[0-9]{1,3}'
-<npt_hhmmss> ::= <npt_hh> ':' <npt_mm> ':' <npt_ss> ('.' <fraction_digits>?)?
-<npt_hh> ::= <digits> := str(random.randint(0, 1))
-<npt_mm> ::= r'[0-5]?[0-9]'
-<npt_ss> ::= r'[0-5]?[0-9]'
-# 2326 3.5: smpte-range = smpte-type "=" smpte-time "-" [ smpte-time ]
-<smpte_range> ::= <smpte_type> '=' <smpte_time> '-' <smpte_time>?
-<smpte_type> ::= <smpte_30> | <smpte_30_drop> | <smpte_25>
-<smpte_30> ::= 'smpte'
-<smpte_30_drop> ::= 'smpte-30-drop'
-<smpte_25> ::= 'smpte-25'
-# smpte-time = 1*2DIGIT ":" 1*2DIGIT ":" 1*2DIGIT [ ":" 1*2DIGIT ] [ "." 1*2DIGIT ]: frames and
-# subframes each optional
-<smpte_time> ::= r'[0-9]{1,2}' ':' r'[0-5]?[0-9]' ':' r'[0-5]?[0-9]' (':' r'[0-2]?[0-9]')? ('.' r'[0-9]{1,2}')?
-# 2326 3.7: utc-range = "clock" "=" utc-time "-" [ utc-time ]; utc-time = utc-date "T" utc-time "Z"
-<utc_range> ::= 'clock=' <utc_time> '-' <utc_time>?
-<utc_time> ::= <utc_date> 'T' <utc_hms> ('.' <fraction_digits>)? 'Z'
-<utc_date> ::= r'[0-9]{8}' := f"{random.randint(1998, 2030)}{random.randint(1, 12):02d}{random.randint(1, 28):02d}"
-<utc_hms> ::= r'[0-9]{6}' := f"{random.randint(0, 23):02d}{random.randint(0, 59):02d}{random.randint(0, 59):02d}"
-
-# 2326 10.6: the Range of PAUSE holds exactly one value, the pause point (C19): 'npt=' npt-time
-# '-' | smpte-type '=' smpte-time '-' | 'clock=' utc-time '-', sent as
-# <h_range_point_in_presentation> | <h_range_point_other> (below)
-
-# The Range field of PLAY, PAUSE and RECORD in two parts, by the values the exchange needs:
-# (1) a Range inside the presentation (2326 12.29, 3.6): one npt-range in seconds whose bounds
-# lie in the a=range the session's description declared (C.1.5; record_description), the start
-# before the end (range_start, range_end: generators that choose the value up front); a pause
-# point inside every range played from such a start (10.6, range_pause_point). The server plays
-# it: the request that the session continues with (<req_play>, <req_pause>, <req_record>).
-<h_range_in_presentation> ::= <name_range> ':' <ows_sent> 'npt=' <npt_start_in> '-' <npt_end_in>? <crlf>
-<npt_start_in> ::= <npt_start_seconds> ('.' <fraction_digits>?)?
-<npt_start_seconds> ::= <digits> := range_start()
-<npt_end_in> ::= <npt_end_seconds> ('.' <fraction_digits>?)?
-<npt_end_seconds> ::= <digits> := range_end()
-<h_range_point_in_presentation> ::= <name_range> ':' <ows_sent> 'npt=' <npt_point_in> '-' <crlf>
-<npt_point_in> ::= <npt_point_seconds> ('.' <fraction_digits>?)?
-<npt_point_seconds> ::= <digits> := range_pause_point()
-# (2) every other form 12.29 allows: npt with "now" or hh:mm:ss, an npt-range "-" end, SMPTE
-# (3.5) and clock (3.7) ranges, two ranges, the ";time=" parameter (scheduled PLAY, RECORD and
-# PAUSE, F82; a range or point in seconds is here only with it), with free values that may
-# lie outside the presentation (11.3.20: 457 Invalid Range): sent by requests of their own
-# (<req_play_any_range>, <req_pause_any_point>, <req_record_any_range>; in the A.2 states
-# <req_play_without_setup_any_range>, <req_play_nosetup_any_range>, <req_pause_nosetup_any_point>),
-# whose reply may be of any class; the pipelined, "Connection: close" and no-session PLAY, PAUSE
-# and RECORD carry either part (<play_leading> ..., <req_*_pipelined>, <play_headers_any> ...).
-# Together (1) and (2) are the whole syntax of the field, each message in one of them only.
-<h_range_other> ::= <name_range> ':' <ows_sent> <range_other_forms> <crlf>
-<range_other_forms> ::= <ranges_specifier_other> <range_time>? \
-    | <ranges_specifier> ',' <ows_sent> <ranges_specifier> <range_time>? \
-    | <npt_range_seconds> <range_time>
-<ranges_specifier_other> ::= <npt_range_other> | <smpte_range> | <utc_range>
-<npt_range_other> ::= 'npt=' <npt_now> '-' <npt_time>? | 'npt=' <npt_hhmmss> '-' <npt_time>? \
-    | 'npt=' <npt_sec> '-' <npt_now> | 'npt=' <npt_sec> '-' <npt_hhmmss> | 'npt=-' <npt_time>
-<npt_range_seconds> ::= 'npt=' <npt_sec> '-' <npt_sec>?
-# The PAUSE point likewise: the other point forms with an optional ";time=" (12.29: when the pause
-# is to take effect, F82; 10.6 limits the field to one point, not the parameter), and a point in
-# seconds only with ";time=", so that the two parts stay disjoint.
-<h_range_point_other> ::= <name_range> ':' <ows_sent> <pause_point_other> <crlf>
-<pause_point_other> ::= <pause_point_form> <range_time>? | 'npt=' <npt_sec> '-' <range_time>
-<pause_point_form> ::= 'npt=' <npt_now> '-' | 'npt=' <npt_hhmmss> '-' | <smpte_type> '=' <smpte_time> '-' | 'clock=' <utc_time> '-'
-
-# 2326 12.34: Scale = "Scale" ":" [ "-" ] 1*DIGIT [ "." *DIGIT ]
-<h_scale> ::= <name_scale> ':' <ows_sent> <scale_value> <crlf>
-<name_scale> ::= 'Scale' | 'scale' | 'SCALE' := name_case("Scale")
-<scale_value> ::= '-'? <scale_int> ('.' <fraction_digits>?)?
-<scale_int> ::= <digits> := str(random.choice([1, 1, 2, 4, 0]))
-
-# 2326 12.35: Speed = "Speed" ":" 1*DIGIT [ "." *DIGIT ]
-<h_speed> ::= <name_speed> ':' <ows_sent> <speed_int> ('.' <fraction_digits>?)? <crlf>
-<name_speed> ::= 'Speed' | 'speed' | 'SPEED' := name_case("Speed")
-<speed_int> ::= <digits> := str(random.choice([1, 2, 1]))
-
-# 2326 12.16: Content-Type = media-type; 12.14 Content-Length = 1*DIGIT
-<h_content_type_sdp> ::= <name_content_type> ':' <ows_sent> 'application/sdp' <crlf>
-<h_content_type_parameters> ::= <name_content_type> ':' <ows_sent> 'text/parameters' <crlf>
-<name_content_type> ::= 'Content-Type' | 'content-type' | 'CONTENT-TYPE' := name_case("Content-Type")
-<name_content_length> ::= 'Content-Length' | 'content-length' | 'CONTENT-LENGTH' := name_case("Content-Length")
-
-# 2326 12.39: Transport = "Transport" ":" 1#transport-spec, listed in order of preference
-<h_transport> ::= <name_transport> ':' <ows_sent> <transport_spec> (',' <ows_sent> <transport_spec>){0,2} <crlf>
-<name_transport> ::= 'Transport' | 'transport' | 'TRANSPORT' := name_case("Transport")
-# transport-spec = transport-protocol/profile[/lower-transport] *parameter
-<transport_spec> ::= <ts_udp_unicast> | <ts_tcp_interleaved> | <ts_multicast_server> | <ts_multicast_client>
-# RTP/AVP over UDP (default lower transport), unicast, client_port pair (F62)
-<ts_udp_unicast> ::= 'RTP/AVP' <lower_udp>? ';unicast' <tp_destination>? ';client_port=' <client_port_pair> <tp_ssrc>? <tp_mode>? <tp_append>?
-<lower_udp> ::= '/UDP'
-# RTP/AVP/TCP interleaved over the RTSP connection (F63)
-<ts_tcp_interleaved> ::= 'RTP/AVP/TCP' ';unicast'? <tp_interleaved> <tp_mode>? <tp_append>?
-<tp_interleaved> ::= ';interleaved=' <channel> <channel_pair_end>?
-# the RTCP channel: the client may name any (2326 10.12, 12.39)
-<channel_pair_end> ::= '-' <channel_rtcp>
-<channel_rtcp> ::= <digits> := str(random.choice([1, 3, 5, 7]))
-<channel> ::= <digits> := str(random.choice([0, 2, 4]))
-# multicast, address and port chosen by the server (F65), ttl, layers
-<ts_multicast_server> ::= 'RTP/AVP' ';multicast' <tp_ttl>? <tp_layers>? <tp_mode>? <tp_append>?
-# multicast to a group the client chose (F66, F68)
-<ts_multicast_client> ::= 'RTP/AVP' ';multicast' ';destination=' <multicast_address> ';port=' <client_port_pair> <tp_ttl>? <tp_mode>? <tp_append>?
-<tp_destination> ::= ';destination' ('=' <unicast_destination>)?
-<unicast_destination> ::= r'[0-9.]+' := "127.0.0.1"
-<multicast_address> ::= r'[0-9.]+' := RTSP_MULTICAST_ADDRESS
-<tp_ttl> ::= ';ttl=' <ttl_value>
-<ttl_value> ::= r'[0-9]{1,3}' := str(random.choice([1, 16, 127]))
-<tp_layers> ::= ';layers=' <layers_value>
-<layers_value> ::= <digits> := str(random.choice([1, 2]))
-<tp_ssrc> ::= ';ssrc=' <ssrc_value>
-<ssrc_value> ::= r'[0-9A-F]{8}' := "%08X" % random.getrandbits(32)
-# mode = <"> 1#mode <">; mode = <"> *Method <"> | Method (2326 12.39)
-<tp_mode> ::= ';mode=' (<mode_method> | '"' <mode_method> '"' | '"' <mode_play> ',' <mode_record> '"')
-<mode_method> ::= <mode_play> | <mode_record> := setup_mode()
-<mode_play> ::= 'PLAY'
-<mode_record> ::= 'RECORD'
-# append: recorded data appends to the resource (F70, with mode RECORD; a parameter of every
-# transport-spec, 2326 12.39)
-<tp_append> ::= ';append'
-# an even RTP port and the RTCP port above it (2326 12.39, RTP convention)
-<client_port_pair> ::= <client_rtp_port> '-' <client_rtcp_port>
-<client_rtp_port> ::= <digits> := str(RTSP_CLIENT_PORT + 2 * random.randint(0, 50))
-<client_rtcp_port> ::= <digits> := str(RTSP_CLIENT_PORT + 1)
-
-# a transport only an extension defines; the server refuses it with 461 (2326 11.3.12)
-<h_transport_unsupported> ::= <name_transport> ':' <ows_sent> <transport_unsupported> <crlf>
-<transport_unsupported> ::= 'RTP/SAVP;unicast;client_port=' <client_port_pair> \
-    | 'x-fandango/AVP;unicast'
-
-# --- optional header fields of every request, list-valued ones in any order before CSeq,
-# the others once each after it (9110 5.3); 2326 Table 3: Require, Proxy-Require (F58, F59),
-# Authorization, Proxy-Authorization (F54, F55) in all methods ---
-<list_headers> ::= <list_header>{0,2}
-<list_header> ::= <list_header_base> | <h_connection>
-<list_header_base> ::= <h_via> | <h_accept_language> | <h_cache_control> | <h_require_unknown> | <h_proxy_require>
-# the list fields of a request that closes the connection (no "Connection: keep-alive")
-<list_headers_close> ::= <list_header_base>{0,2}
-<common_headers> ::= <h_authorization>? <h_proxy_authorization>? <general_headers>
-<general_headers> ::= <h_user_agent>? <h_timestamp>? <h_bandwidth>? <h_date>? <h_from>? <h_referer>? <h_extension>?
-
-# --- OPTIONS (2326 10.1): server or presentation, any state ---
-<req_options> ::= 'OPTIONS' <sp> <options_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <common_headers> <crlf>
-<options_uri> ::= <asterisk_uri> | <media_url> | <record_url> | <auth_url>
-
-# --- DESCRIBE (2326 10.2): description of a presentation; Accept, Accept-Encoding,
-# Accept-Language negotiate it (F94); credentials where needed (9110 11.6.2). The DESCRIBE of
-# the presentation the server plays has its own request: in Init its SETUPs follow it ---
-<req_describe> ::= 'DESCRIBE' <sp> <describe_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <describe_headers> <common_headers> <crlf>
-<req_describe_media> ::= 'DESCRIBE' <sp> <media_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <describe_headers> <common_headers> <crlf>
-<describe_uri> ::= <auth_url> | <missing_url> | <record_url>
-<describe_headers> ::= <h_accept>? <h_accept_encoding>? <h_if_modified_since>? <h_blocksize>?
-# DESCRIBE with credentials the server does not accept
-<req_describe_wrong_credentials> ::= 'DESCRIBE' <sp> <auth_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <describe_headers> <h_authorization_wrong> <h_proxy_authorization>? <general_headers> <crlf>
-
-# --- ANNOUNCE C->S (2326 10.3): posts a description (SDP, 2326 C) to the record presentation
-# or its stream (Table 2: P,S); within a session with its Session ---
-<req_announce> ::= 'ANNOUNCE' <sp> <announce_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_blocksize>? <common_headers> <announce_body>
-<req_announce_in_session> ::= 'ANNOUNCE' <sp> <session_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session> <h_blocksize>? <common_headers> <announce_body>
-<announce_uri> ::= <record_url> | <record_url> '/' <record_track>
-# ANNOUNCE of the presentation to record, followed in Init by the SETUP of its stream
-<req_announce_record> ::= 'ANNOUNCE' <sp> <record_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_blocksize>? <common_headers> <announce_body>
-# 9110 8.4 (F22): the body as it is, or in a content coding that Content-Encoding names (2326
-# 12.12; Table 3: ANNOUNCE, SET_PARAMETER), with Content-Length the length of the coded octets
-<announce_body> ::= <h_content_type_sdp> <h_announce_length> <crlf> <sdp_sent> \
-    | <h_content_type_sdp> <h_content_encoding_sent> <h_coded_length> <crlf> <sdp_coded>
-# converter pair: the coded octets of a description, and the description they hold
-<sdp_coded> ::= <coded_octets> := encode_body(<sdp_source>)
-<sdp_source> ::= <sdp_sent> := decode_body(<sdp_coded>)
-<h_content_encoding_sent> ::= <name_content_encoding> ':' <ows_sent> <content_coding_sent> <crlf>
-<name_content_encoding> ::= 'Content-Encoding' | 'content-encoding' | 'CONTENT-ENCODING' := name_case("Content-Encoding")
-<content_coding_sent> ::= <coding_gzip> | <coding_deflate> | <coding_compress>
-<h_coded_length> ::= <name_content_length> ':' <ows_sent> <coded_length> <crlf>
-<coded_length> ::= <digits> := "0"
-<coded_octets> ::= rb'[\x00-\xff]+'
-<h_announce_length> ::= <name_content_length> ':' <ows_sent> <announce_length> <crlf>
-<announce_length> ::= <digits> := "0"
-
-# --- SETUP (2326 10.4): transport of one stream; in Init without a session ---
-<req_setup> ::= 'SETUP' <sp> <setup_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <setup_transport> <setup_headers> <common_headers> <crlf>
-<setup_uri> ::= <rtsp_scheme> '://' <server_authority> '/' <setup_target>
-<setup_target> ::= <path_text> := setup_target()
-# the SETUP of a stream the preceding DESCRIBE named (2326 C.1.1 a=control; C.3), offering
-# one unicast transport (12.39: the client chooses the transports it offers; the other SETUPs
-# offer every form and lists)
-<req_setup_described> ::= 'SETUP' <sp> <described_stream_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_transport_unicast> <setup_headers> <common_headers> <crlf>
-<h_transport_unicast> ::= <name_transport> ':' <ows_sent> <transport_spec_unicast> <crlf>
-# the SETUP of the announced stream for recording: one unicast transport with mode RECORD
-# (2326 10.11, 12.39)
-<req_setup_announced> ::= 'SETUP' <sp> <record_stream_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_transport_record> <setup_headers> <common_headers> <crlf>
-<record_stream_uri> ::= <record_url> '/' <record_track>
-<h_transport_record> ::= <name_transport> ':' <ows_sent> <transport_unicast_base> <tp_mode_record> <tp_append>? <crlf>
-<transport_unicast_base> ::= 'RTP/AVP/TCP' ';unicast'? <tp_interleaved> | 'RTP/AVP' <lower_udp>? ';unicast;client_port=' <client_port_pair>
-<tp_mode_record> ::= ';mode=' (<mode_record> | '"' <mode_record> '"')
-<transport_spec_unicast> ::= <ts_udp_unicast> | <ts_tcp_interleaved>
-<described_stream_uri> ::= <rtsp_scheme> '://' <server_authority> '/' <described_stream>
-<described_stream> ::= <path_text> := described_stream()
-<setup_transport> ::= <h_transport>
-# conditions (12.22 If-Match on the description's a=etag, 12.23), Blocksize, caching (12.8,
-# F92) and the session's conference (12.9, F91)
-<setup_headers> ::= <setup_conditions> <h_conference>?
-<setup_conditions> ::= <h_if_match>? <h_if_modified_since>? <h_blocksize>? <h_cache_control_setup>?
-# 2326 12.8: cache directives of SETUP (media stream caching, F92)
-<h_cache_control_setup> ::= <name_cache_control> ':' <ows_sent> <cache_setup_directive> <crlf>
-<cache_setup_directive> ::= <cd_no_cache> | <cd_max_age> | <cd_only_if_cached> | <cd_no_transform> | <cd_public> | <cd_private> | <cd_extension>
-<cd_no_transform> ::= 'no-transform'
-<cd_public> ::= 'public'
-<cd_private> ::= 'private'
-# SETUP with a transport the server does not support (2326 11.3.12: 461 Unsupported Transport)
-<req_setup_unsupported_transport> ::= 'SETUP' <sp> <setup_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_transport_unsupported> <setup_conditions> <common_headers> <crlf>
-# SETUP joining a conference the server does not know (2326 12.9, 11.3.3: 452 Conference Not
-# Found); its own request, the unknown id given before the other fields
-<req_setup_unknown_conference> ::= 'SETUP' <sp> <setup_uri> <sp> <rtsp_version> <crlf> <h_conference_unknown> <list_headers> <h_cseq> <setup_transport> <setup_conditions> <common_headers> <crlf>
-# SETUP within a session: with the session (2326 10.4, 12.37); adds a stream or changes transport
-<req_setup_in_session> ::= 'SETUP' <sp> <setup_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session> <setup_transport> <setup_headers> <common_headers> <crlf>
-
-# --- PLAY (2326 10.5): aggregate or stream URL; Range, Scale, Speed ---
-<req_play> ::= 'PLAY' <sp> <session_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session> <play_headers> <common_headers> <crlf>
-<play_headers> ::= <h_range_in_presentation>? <h_scale>? <h_speed>? <h_blocksize>?
-<session_uri> ::= <rtsp_scheme> '://' <server_authority> '/' <session_target>
-<session_target> ::= <path_text> := session_target()
-# --- PAUSE (2326 10.6): optional pause point ---
-<req_pause> ::= 'PAUSE' <sp> <session_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session> <pause_headers> <common_headers> <crlf>
-<pause_headers> ::= <h_range_point_in_presentation>? <h_blocksize>?
-# --- RECORD (2326 10.11): Range, Scale ---
-<req_record> ::= 'RECORD' <sp> <session_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session> <record_headers> <common_headers> <crlf>
-<record_headers> ::= <h_range_in_presentation>? <h_scale>? <h_blocksize>?
-# --- PLAY, PAUSE, RECORD with a Range in any other form (2326 12.29; see <h_range_other>) ---
-<req_play_any_range> ::= 'PLAY' <sp> <session_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session> <h_range_other> <h_scale>? <h_speed>? <h_blocksize>? <common_headers> <crlf>
-<req_pause_any_point> ::= 'PAUSE' <sp> <session_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session> <h_range_point_other> <h_blocksize>? <common_headers> <crlf>
-<req_record_any_range> ::= 'RECORD' <sp> <session_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session> <h_range_other> <h_scale>? <h_blocksize>? <common_headers> <crlf>
-# --- TEARDOWN (2326 10.7) ---
-<req_teardown> ::= 'TEARDOWN' <sp> <session_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session> <common_headers> <crlf>
-
-# --- session requests in Init: no Session header, or a stale one ---
-<req_play_no_session> ::= 'PLAY' <sp> <media_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session_stale> <play_headers_any> <common_headers> <crlf>
-<req_record_no_session> ::= 'RECORD' <sp> <record_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session_stale>? <record_headers_any> <common_headers> <crlf>
-<req_pause_no_session> ::= 'PAUSE' <sp> <media_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session_stale>? <pause_headers_any> <common_headers> <crlf>
-# (refused for the session they lack, or ending the connection ("Connection: close"), so either
-# part of the Range split, ";time=" included)
-<play_headers_any> ::= <h_range_any>? <h_scale>? <h_speed>? <h_blocksize>?
-<pause_headers_any> ::= <h_range_point_any>? <h_blocksize>?
-<record_headers_any> ::= <h_range_any>? <h_scale>? <h_blocksize>?
-<h_range_any> ::= <h_range_in_presentation> | <h_range_other>
-<h_range_point_any> ::= <h_range_point_in_presentation> | <h_range_point_other>
-<req_teardown_no_session> ::= 'TEARDOWN' <sp> <media_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session_stale> <common_headers> <crlf>
-# PLAY without SETUP and without a session (2326 A.2, objects that need no SETUP); in its
-# two-state machine PLAY and PAUSE carry the Session the PLAY reply gave
-<req_play_without_setup> ::= 'PLAY' <sp> <media_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <play_headers> <common_headers> <crlf>
-# (C9: <h_session_nosetup> once if a reply of this session gave an identifier, else not at all)
-<req_play_nosetup> ::= 'PLAY' <sp> <media_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session_nosetup>{nosetup_session_count(<h_cseq>)} <play_headers> <common_headers> <crlf>
-<req_pause_nosetup> ::= 'PAUSE' <sp> <media_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session_nosetup>{nosetup_session_count(<h_cseq>)} <pause_headers> <common_headers> <crlf>
-# the same with a Range in any other form (see <h_range_other>, <h_range_point_other>), ";time="
-# included (12.29, F82)
-<req_play_without_setup_any_range> ::= 'PLAY' <sp> <media_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_range_other> <h_scale>? <h_speed>? <h_blocksize>? <common_headers> <crlf>
-<req_play_nosetup_any_range> ::= 'PLAY' <sp> <media_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session_nosetup>{nosetup_session_count(<h_cseq>)} <h_range_other> <h_scale>? <h_speed>? <h_blocksize>? <common_headers> <crlf>
-<req_pause_nosetup_any_point> ::= 'PAUSE' <sp> <media_url> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session_nosetup>{nosetup_session_count(<h_cseq>)} <h_range_point_other> <h_blocksize>? <common_headers> <crlf>
-<h_session_nosetup> ::= <h_session>
-
-# --- requests that ask to close the connection after the reply (2326 12.10, 9112 9.6, F87) ---
-<h_connection_close> ::= <name_connection> ':' <ows_sent> <connection_close> <crlf>
-<connection_close> ::= 'close' | 'Close'
-<req_options_close> ::= 'OPTIONS' <sp> <options_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <common_headers> <crlf>
-<req_describe_close> ::= 'DESCRIBE' <sp> <describe_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <describe_headers> <common_headers> <crlf>
-<req_get_parameter_close> ::= 'GET_PARAMETER' <sp> <parameter_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <common_headers> <get_parameter_entity>
-<req_set_parameter_close> ::= 'SET_PARAMETER' <sp> <parameter_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <common_headers> <parameter_settings_body>
-<req_announce_close> ::= 'ANNOUNCE' <sp> <announce_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <common_headers> <announce_body>
-<req_setup_close> ::= 'SETUP' <sp> <setup_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <setup_transport> <setup_headers> <common_headers> <crlf>
-<req_play_close> ::= 'PLAY' <sp> <session_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <h_session> <play_headers_any> <common_headers> <crlf>
-<req_pause_close> ::= 'PAUSE' <sp> <session_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <h_session> <pause_headers_any> <common_headers> <crlf>
-<req_record_close> ::= 'RECORD' <sp> <session_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <h_session> <record_headers_any> <common_headers> <crlf>
-<req_setup_in_session_close> ::= 'SETUP' <sp> <setup_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <h_session> <setup_transport> <setup_headers> <common_headers> <crlf>
-<req_play_nosetup_close> ::= 'PLAY' <sp> <media_url> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <h_session_nosetup>{nosetup_session_count(<h_cseq>)} <play_headers_any> <common_headers> <crlf>
-<req_pause_nosetup_close> ::= 'PAUSE' <sp> <media_url> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <h_session_nosetup>{nosetup_session_count(<h_cseq>)} <pause_headers_any> <common_headers> <crlf>
-<req_extension_close> ::= <extension_method> <sp> <extension_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <common_headers> <extension_entity>
-<req_extension_in_session_close> ::= <extension_method> <sp> <extension_session_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <h_session>? <common_headers> <extension_entity>
-<req_extension_nosetup_close> ::= <extension_method> <sp> <extension_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <h_session_nosetup>{nosetup_session_count(<h_cseq>)} <common_headers> <extension_entity>
-<req_teardown_close> ::= 'TEARDOWN' <sp> <session_uri> <sp> <rtsp_version> <crlf> <list_headers_close> <h_cseq> <h_connection_close> <h_session> <common_headers> <crlf>
-
-# --- GET_PARAMETER (2326 10.8): body of parameter names (text/parameters), none = liveness ---
-<req_get_parameter> ::= 'GET_PARAMETER' <sp> <parameter_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_blocksize>? <common_headers> <get_parameter_entity>
-<req_get_parameter_in_session> ::= 'GET_PARAMETER' <sp> <parameter_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session> <h_blocksize>? <common_headers> <get_parameter_entity>
-<parameter_uri> ::= <media_url> | <asterisk_uri> | <record_url>
-<get_parameter_entity> ::= <crlf> | <parameter_names_body>
-<parameter_names_body> ::= <h_content_type_parameters> <h_parameters_length> <crlf> <parameter_names> \
-    | <h_content_type_parameters> <h_content_encoding_sent> <h_coded_length> <crlf> <parameter_names_coded>
-<parameter_names_coded> ::= <coded_octets> := encode_body(<parameter_names_source>)
-<parameter_names_source> ::= <parameter_names> := decode_body(<parameter_names_coded>)
-<parameter_names> ::= <parameter_name> <crlf> (<parameter_name> <crlf>){0,2}
-<parameter_name> ::= r'[A-Za-z][A-Za-z0-9_.-]*' := random.choice(["packets_received", "jitter", "position", "x-fandango"])
-<h_parameters_length> ::= <name_content_length> ':' <ows_sent> <parameters_length> <crlf>
-<parameters_length> ::= <digits> := "0"
-
-# --- SET_PARAMETER (2326 10.9): body of "name: value" lines; no transport parameters (C16);
-# within a session with its Session ---
-<req_set_parameter> ::= 'SET_PARAMETER' <sp> <parameter_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_blocksize>? <common_headers> <parameter_settings_body>
-<req_set_parameter_in_session> ::= 'SET_PARAMETER' <sp> <parameter_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session> <h_blocksize>? <common_headers> <parameter_settings_body>
-<parameter_settings_body> ::= <h_content_type_parameters> <h_parameters_length> <crlf> <parameter_settings> \
-    | <h_content_type_parameters> <h_content_encoding_sent> <h_coded_length> <crlf> <parameter_settings_coded>
-<parameter_settings_coded> ::= <coded_octets> := encode_body(<parameter_settings_source>)
-<parameter_settings_source> ::= <parameter_settings> := decode_body(<parameter_settings_coded>)
-<parameter_settings> ::= <parameter_setting> (<parameter_setting>){0,2}
-<parameter_setting> ::= <parameter_name> ':' <ows_sent> <parameter_value> <crlf>
-<parameter_value> ::= r'[!-~]+' := random.choice(["1", "on", "Bob"])
-
-# --- extension method (2326 6.1: extension-method = token); a server without it -> 501 (C25) ---
-# Request-URI "*" or an absolute URL (6.1); within a session also the session's URL and the
-# Session (12.37, Table 3: Session in every method but SETUP and OPTIONS; optional here: the
-# method's needs are unknown); in A.2 the Session as its PLAY and PAUSE carry it; entity
-# headers and a message body as in any request (2326 4.3, 8.1: Content-Type, Content-Encoding,
-# Content-Length with the body's length, C3)
-<req_extension> ::= <extension_method> <sp> <extension_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <common_headers> <extension_entity>
-<req_extension_in_session> ::= <extension_method> <sp> <extension_session_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session>? <common_headers> <extension_entity>
-<req_extension_nosetup> ::= <extension_method> <sp> <extension_uri> <sp> <rtsp_version> <crlf> <list_headers> <h_cseq> <h_session_nosetup>{nosetup_session_count(<h_cseq>)} <common_headers> <extension_entity>
-<extension_uri> ::= <asterisk_uri> | <media_url> | <record_url> | <auth_url>
-<extension_session_uri> ::= <session_uri> | <asterisk_uri> | <auth_url>
-<extension_entity> ::= <crlf> | <parameter_settings_body> | <announce_body>
-# extension-method = token, other than the methods 2326 defines (6.1, case-sensitive); a token
-# that starts with "$" would open interleaved binary data on the connection instead (10.12).
-# The generator picks any such token (letters of both cases, digits, the other tchars).
-<extension_method> ::= r"(?!(?:OPTIONS|DESCRIBE|ANNOUNCE|SETUP|PLAY|PAUSE|RECORD|REDIRECT|TEARDOWN|GET_PARAMETER|SET_PARAMETER)\Z)[!#%&'*+.^_`|~0-9A-Za-z-][!#$%&'*+.^_`|~0-9A-Za-z-]*" := extension_method()
-# --- an RTSP version the server does not speak (2326 6.1, 505 RTSP Version Not Supported) ---
-<req_bad_version> ::= 'OPTIONS' <sp> <media_url> <sp> <unsupported_version> <crlf> <list_headers> <h_cseq> <common_headers> <crlf>
-<unsupported_version> ::= 'RTSP/' r'[2-9]' '.' r'[0-9]'
-
-# --- interleaved binary data of the client while recording (2326 10.12): "$", channel, length ---
-# (the data: one of a few sizes, each with its two-byte length, correct by construction)
-<interleaved_frame_sent> ::= b'$' <channel_byte_sent> <frame_data_sent>
-<channel_byte_sent> ::= <octet> := recalled_channel()
-<frame_data_sent> ::= <frame_12> | <frame_16> | <frame_32> | <frame_64> | <frame_256>
-<frame_12> ::= b'\x00\x0c' <octet>{12}
-<frame_16> ::= b'\x00\x10' <block_16>
-<frame_32> ::= b'\x00\x20' <block_16>{2}
-<frame_64> ::= b'\x00\x40' <block_16>{4}
-<frame_256> ::= b'\x01\x00' <block_256>
-
-# ======================================================================================
-# SDP descriptions the client sends (ANNOUNCE, 2326 C; SDP syntax RFC 2327/8866 is another
-# document: only what 2326 C requires is modeled)
-# ======================================================================================
-
-<sdp_sent> ::= <sdp_v> <sdp_o> <sdp_s> <sdp_c>? <sdp_t> <sdp_session_attribute>* <sdp_media_sent>
-<sdp_v> ::= 'v=0\r\n'
-<sdp_o> ::= 'o=- ' <sdp_number> ' ' <sdp_number> ' IN IP4 ' <unicast_destination> '\r\n'
-<sdp_number> ::= <digits> := str(random.randint(0, 99999))
-<sdp_s> ::= 's=' <sdp_text> '\r\n'
-<sdp_text> ::= r'[ -~]+' := random.choice(["fandango", "test session"])
-<sdp_c> ::= 'c=IN IP4 0.0.0.0\r\n'
-# 2326 C.1.6: t= start and stop times
-<sdp_t> ::= 't=0 0\r\n'
-<sdp_session_attribute> ::= <sdp_a_range> | <sdp_a_control_aggregate> | <sdp_a_etag>
-# 2326 C.1.5: a=range:<range> with any range of 3.5-3.7 (npt, smpte, clock), at session or media
-# level; C.1.1: a=control: "*" or the absolute URL at session level, the stream's URL relative
-# or absolute at media level ("may contain either relative and absolute URLs"); C.1.8: a=etag
-<sdp_a_range> ::= 'a=range:' <ranges_specifier> '\r\n'
-<sdp_a_control_aggregate> ::= 'a=control:' ('*' | <record_url>) '\r\n'
-<sdp_a_etag> ::= 'a=etag:' <etag_chars> '\r\n'
-# 2326 C.1.2/C.1.3: one stream, payload type, its control URL (C.3)
-<sdp_media_sent> ::= 'm=audio 0 RTP/AVP 0\r\n' <sdp_a_range>? 'a=control:' <sdp_stream_control> '\r\n'
-<sdp_stream_control> ::= <record_track> | <record_url> '/' <record_track>
-
-# ======================================================================================
-# Replies of the client to requests of the server (2326 7)
-# ======================================================================================
-
-# Status-Line, CSeq, the Session of the server's request if it carried one (2326 12.37, Table 3:
-# Session in requests and replies of all methods but SETUP and OPTIONS), optional general fields
-# (2326 7, 12.18 Date, 12.43 Via, 8.1), a body where the reply has one: the values of the
-# parameters asked for (2326 10.8). Besides each method's own codes, the codes 2326 7.1.1 Table
-# 1 allows for all methods (<client_refusal>): 400 a malformed request, 454 an unknown session,
-# 455 a method not valid in the state, 551 with Unsupported listing the option-tags of the
-# request's Require the client does not support (2326 12.32)
-<rep_to_announce> ::= <reply_ok> <reply_fields_sent> <crlf> | <client_refusal>
-<rep_to_get_parameter> ::= <reply_ok> <reply_fields_sent> (<crlf> | <parameter_settings_body>) \
-    | <reply_451> <reply_fields_sent> <crlf> | <client_refusal>
-<rep_to_set_parameter> ::= (<reply_ok> | <reply_451> | <reply_458>) <reply_fields_sent> <crlf> | <client_refusal>
-<rep_to_options> ::= <reply_ok> <h_cseq_echo> <h_public_sent> <reply_headers_sent> <crlf> | <client_refusal>
-<rep_to_redirect> ::= <reply_ok> <reply_fields_sent> <crlf> | <client_refusal>
-<rep_to_extension> ::= <rtsp_version> <sp> <code_501> <sp> 'Not Implemented' <crlf> <reply_fields_sent> <crlf>
-<reply_ok> ::= <rtsp_version> <sp> <code_200> <sp> 'OK' <crlf>
-<reply_451> ::= <rtsp_version> <sp> <code_451> <sp> 'Parameter Not Understood' <crlf>
-<reply_458> ::= <rtsp_version> <sp> <code_458> <sp> 'Parameter Is Read-Only' <crlf>
-<reply_fields_sent> ::= <h_cseq_echo> <h_session_echo>{echoed_session_count(<h_cseq_echo>)} <reply_headers_sent>
-<client_refusal> ::= <rtsp_version> <sp> <client_refusal_status> <crlf> <reply_fields_sent> <crlf> \
-    | <rtsp_version> <sp> <code_551> <sp> 'Option not supported' <crlf> <reply_fields_sent> <h_unsupported_sent>{required_by_server(<reply_fields_sent>)} <crlf>
-<client_refusal_status> ::= <code_400> <sp> 'Bad Request' | <code_454> <sp> 'Session Not Found' \
-    | <code_455> <sp> 'Method Not Valid in This State'
-# 2326 12.37: the session of the server's request
-<h_session_echo> ::= <name_session> ':' <ows_sent> <session_id_echo> <crlf>
-<session_id_echo> ::= r'[A-Za-z0-9$_.+-]+' := recalled_server_session()
-# 2326 12.40: Unsupported = 1#option-tag: every option-tag the server's Require named
-<h_unsupported_sent> ::= <name_unsupported> ':' <ows_sent> <unsupported_tags_sent> <crlf>
-<unsupported_tags_sent> ::= <option_tag_echo> <more_option_tag_echo>{required_by_server(<option_tag_echo>, True)}
-<more_option_tag_echo> ::= ',' <ows_sent> <option_tag_echo>
-<name_unsupported> ::= 'Unsupported' | 'unsupported' | 'UNSUPPORTED' := name_case("Unsupported")
-<option_tag_echo> ::= r'[!-+\--~]+' := recalled_required_tag()
-<reply_headers_sent> ::= <h_via>? <h_date>? <h_extension>?
-# 2326 12.17: the reply carries the CSeq of the request
-<h_cseq_echo> ::= <name_cseq> ':' <ows_sent> <cseq_echo> <crlf>
-<cseq_echo> ::= <digits> := recalled_server_cseq()
-# 2326 12.28: Public lists the methods the client supports
-<h_public_sent> ::= 'Public:' <ows_sent> 'OPTIONS, ANNOUNCE, GET_PARAMETER, SET_PARAMETER, REDIRECT' <crlf>
-
-# ======================================================================================
-# Replies of the server (2326 7)
-# ======================================================================================
-
-# 2326 7.1: Status-Line = RTSP-Version SP Status-Code SP Reason-Phrase CRLF
-<rtsp_version_rcv> ::= 'RTSP/' r'[0-9]+' '.' r'[0-9]+'
-<reason_phrase> ::= <text>?
-
-# --- status codes (2326 7.1.1, 11; one nonterminal per code) ---
-<code_100> ::= '100'
-<code_200> ::= '200'
-<code_201> ::= '201'
-<code_250> ::= '250'
-<code_300> ::= '300'
-<code_301> ::= '301'
-<code_302> ::= '302'
-<code_303> ::= '303'
-<code_304> ::= '304'
-<code_305> ::= '305'
-<code_400> ::= '400'
-<code_401> ::= '401'
-<code_402> ::= '402'
-<code_403> ::= '403'
-<code_404> ::= '404'
-<code_405> ::= '405'
-<code_406> ::= '406'
-<code_407> ::= '407'
-<code_408> ::= '408'
-<code_410> ::= '410'
-<code_411> ::= '411'
-<code_412> ::= '412'
-<code_413> ::= '413'
-<code_414> ::= '414'
-<code_415> ::= '415'
-<code_451> ::= '451'
-<code_452> ::= '452'
-<code_453> ::= '453'
-<code_454> ::= '454'
-<code_455> ::= '455'
-<code_456> ::= '456'
-<code_457> ::= '457'
-<code_458> ::= '458'
-<code_459> ::= '459'
-<code_460> ::= '460'
-<code_461> ::= '461'
-<code_462> ::= '462'
-<code_500> ::= '500'
-<code_501> ::= '501'
-<code_502> ::= '502'
-<code_503> ::= '503'
-<code_504> ::= '504'
-<code_505> ::= '505'
-<code_551> ::= '551'
-# 2326 7.1.1: extension-code = 3DIGIT, treated as the x00 code of its class (F33)
-<code_1xx_ext> ::= r'1(?!00)[0-9][0-9]'
-<code_2xx_ext> ::= r'2(?!00|01|50)[0-9][0-9]'
-<code_3xx_ext> ::= r'3(?!0[0-5])[0-9][0-9]'
-<code_4xx_ext> ::= r'4(?!0[0-8]|1[0-5]|5[1-9]|6[0-2])[0-9][0-9]'
-<code_5xx_ext> ::= r'5(?!0[0-5]|51)[0-9][0-9]'
-
-# --- status codes by class (2326 7.1.1) ---
-<status_1xx> ::= <code_100> | <code_1xx_ext>
-<status_2xx> ::= <code_200> | <code_201> | <code_250> | <code_2xx_ext>
-<status_3xx> ::= <code_300> | <code_301> | <code_302> | <code_303> | <code_305> | <code_3xx_ext>
-<status_err> ::= <code_400> | <code_401> | <code_402> | <code_403> | <code_404> | <code_405> \
-    | <code_406> | <code_407> | <code_408> | <code_410> | <code_411> | <code_412> | <code_413> \
-    | <code_414> | <code_415> | <code_451> | <code_452> | <code_453> | <code_454> | <code_455> \
-    | <code_456> | <code_457> | <code_458> | <code_459> | <code_460> | <code_461> | <code_462> \
-    | <code_4xx_ext> \
-    | <code_500> | <code_501> | <code_502> | <code_503> | <code_504> | <code_505> | <code_551> \
-    | <code_5xx_ext>
-
-# --- the reply messages; the body is as long as Content-Length says (2326 4.4) ---
-# 1xx: no body, ends at the empty line (2326 4.4, C7); the final reply follows it
-<rep_1xx> ::= <rtsp_version_rcv> <sp> <status_code_1xx> <sp> <reason_phrase> <crlf> <reply_rest_interim>
-<status_code_1xx> ::= <status_1xx>
-<rep_2xx> ::= <rtsp_version_rcv> <sp> <status_code> <sp> <reason_phrase> <crlf> <reply_rest>
-<rep_err> ::= <rtsp_version_rcv> <sp> <status_code_err> <sp> <reason_phrase> <crlf> <reply_rest>
-<rep_3xx> ::= <rtsp_version_rcv> <sp> <status_code_3xx> <sp> <reason_phrase> <crlf> <reply_rest>
-<status_code> ::= <status_2xx>
-<status_code_err> ::= <status_err>
-<status_code_3xx> ::= <status_3xx>
-# 304 Not Modified (2326 12.23, conditional DESCRIBE and SETUP): no body (2326 4.4)
-<rep_304> ::= <rtsp_version_rcv> <sp> <code_304> <sp> <reason_phrase> <crlf> <reply_rest_bodiless>
-
-# replies by class (2326 7.1.1 Table 1 lists the codes per method; it is no obligation, so
-# every class is accepted after every method)
-<rep_any> ::= <rep_2xx> | <rep_3xx> | <rep_err> | <rep_304>
-<rep_not_3xx> ::= <rep_2xx> | <rep_err> | <rep_304>
-<rep_not_2xx> ::= <rep_3xx> | <rep_err> | <rep_304>
-<rep_setup_2xx> ::= <rep_2xx>
-<rep_describe_2xx> ::= <rep_2xx>
-<rep_announce_2xx> ::= <rep_2xx>
-<rep_play_2xx> ::= <rep_2xx>
-<rep_record_2xx> ::= <rep_2xx>
-<rep_pause_2xx> ::= <rep_2xx>
-<rep_teardown_2xx> ::= <rep_2xx>
-# the reply to an extension method: every class but 3xx, which redirects (C25: see
-# unimplemented_refused, on <rep_2xx>, <rep_err>, <rep_304>)
-<rep_extension> ::= <rep_not_3xx>
-# 9112 9.6: a final reply that carries the "close" connection option (in a Connection field,
-# 2326 12.10) ends the connection: "A client that receives a "close" connection option MUST cease
-# sending requests on that connection", and "The server MUST NOT process any further requests
-# received on that connection", so no reply to a request pipelined behind it follows. A message
-# of its own, of any class, accepted wherever a final reply is (followed by <reply_end_close>);
-# the replies above carry no "close" (<rsp_header>)
-<rep_closing> ::= <rep_2xx_closing> | <rep_3xx_closing> | <rep_err_closing> | <rep_304_closing>
-<rep_2xx_closing> ::= <rtsp_version_rcv> <sp> <status_code> <sp> <reason_phrase> <crlf> <reply_rest_closing>
-<rep_err_closing> ::= <rtsp_version_rcv> <sp> <status_code_err> <sp> <reason_phrase> <crlf> <reply_rest_closing>
-<rep_3xx_closing> ::= <rtsp_version_rcv> <sp> <status_code_3xx> <sp> <reason_phrase> <crlf> <reply_rest_closing>
-<rep_304_closing> ::= <rtsp_version_rcv> <sp> <code_304> <sp> <reason_phrase> <crlf> <reply_rest_bodiless_closing>
-# the same in the place of a pipelined reply, whose request its place in the pipeline names
-<rep_pipelined_first_closing> ::= <rep_closing>
-<rep_pipelined_second_closing> ::= <rep_closing>
-
-# ======================================================================================
-# Header fields of the server's messages (2326 12); names case-insensitive (9110 5.1)
-# ======================================================================================
-
-# 2326 4.4, 12.14: a message without Content-Length has no body and ends at the empty line;
-# with Content-Length, the body has that many octets (C5, C6). 2326 12.17: exactly one CSeq
-# in every reply (C1, C34). The header block without Content-Length, and the one with it.
-# After the header block of a final reply, the deviation a tolerance accepts (empty, counted
-# from the request and the block): <timestamp_not_echoed> (2326 12.38, C13)
-<reply_rest> ::= <rsp_headers> <timestamp_not_echoed>{timestamp_missing(<rsp_headers>)} <crlf> \
-    | <rsp_headers_length> <timestamp_not_echoed>{timestamp_missing(<rsp_headers_length>)} <crlf> <entity_body>
-<timestamp_not_echoed> ::= ''
-# the body: as many octets as Content-Length says (2326 4.4) ...
-<entity_body> ::= <block_256>{content_length(<h_content_length>) // 256} <block_16>{content_length(<h_content_length>) % 256 // 16} <octet>{content_length(<h_content_length>) % 16} := entity_to_octets(<entity>)
-# ... and the same data typed by its Content-Type (2326 12.16; converter pair <entity_body> /
-# <entity>, the type its first octet): an SDP description (2326 C), parameters (text/parameters,
-# 2326 10.8, 10.9), a body the client does not interpret, or none (Content-Length: 0)
-<entity> ::= <entity_sdp> | <entity_parameters> | <entity_opaque> | <entity_empty> := octets_to_entity(<entity_body>)
-<entity_sdp> ::= 'S' <sdp>
-<entity_parameters> ::= 'P' <parameters_rcv>
-<entity_opaque> ::= b'O' <opaque_entity>
-<entity_empty> ::= 'E'
-<opaque_entity> ::= rb'[\x00-\xff]+'
-# 2326 10.8, 10.9 (example type text/parameters): lines of a parameter name, with its value
-# after ":" in replies and SET_PARAMETER; the last line may lack its line end
-<parameters_rcv> ::= <parameter_line_rcv>+ <parameter_last_rcv>? | <parameter_last_rcv>
-<parameter_line_rcv> ::= <parameter_rcv>? <sdp_eol>
-<parameter_last_rcv> ::= <parameter_rcv>
-<parameter_rcv> ::= <parameter_name_rcv> (':' <ows> <parameter_value_rcv>?)?
-<parameter_name_rcv> ::= r'[^:\r\n]+'
-<parameter_value_rcv> ::= r'[^\r\n \t][^\r\n]*'
-# 2326 4.4: 304 replies end at the empty line whatever their header fields (C7)
-<reply_rest_bodiless> ::= <rsp_headers> <timestamp_not_echoed>{timestamp_missing(<rsp_headers>)} <crlf> \
-    | <rsp_headers_length> <timestamp_not_echoed>{timestamp_missing(<rsp_headers_length>)} <crlf>
-# the header block of a reply with "close" (<rep_closing>): the first field that names it is the
-# mandatory one; the fields before it carry no "close", those after it any (9112 9.6)
-<reply_rest_closing> ::= <rsp_headers_closing> <timestamp_not_echoed>{timestamp_missing(<rsp_headers_closing>)} <crlf> \
-    | <rsp_headers_length_closing> <timestamp_not_echoed>{timestamp_missing(<rsp_headers_length_closing>)} <crlf> <entity_body>
-<reply_rest_bodiless_closing> ::= <rsp_headers_closing> <timestamp_not_echoed>{timestamp_missing(<rsp_headers_closing>)} <crlf> \
-    | <rsp_headers_length_closing> <timestamp_not_echoed>{timestamp_missing(<rsp_headers_length_closing>)} <crlf>
-# a 1xx reply is no final reply: a "close" in it ends nothing (9112 9.6 speaks of the final response)
-<reply_rest_interim> ::= <rsp_headers> <crlf> | <rsp_headers_length> <crlf> \
-    | <rsp_headers_closing> <crlf> | <rsp_headers_length_closing> <crlf>
-<rsp_headers> ::= <rsp_header>* <h_cseq_rcv> <rsp_header>*
-<rsp_headers_length> ::= <rsp_header>* <h_cseq_rcv> <rsp_header>* <h_content_length> <rsp_header>* \
-    | <rsp_header>* <h_content_length> <rsp_header>* <h_cseq_rcv> <rsp_header>*
-<rsp_headers_closing> ::= <rsp_header>* <h_cseq_rcv> <rsp_header>* <h_connection_close_rcv> <rsp_header_any>* \
-    | <rsp_header>* <h_connection_close_rcv> <rsp_header_any>* <h_cseq_rcv> <rsp_header_any>*
-<rsp_headers_length_closing> ::= <rsp_header>* <h_cseq_rcv> <rsp_header>* <h_content_length> <rsp_header>* <h_connection_close_rcv> <rsp_header_any>* \
-    | <rsp_header>* <h_content_length> <rsp_header>* <h_cseq_rcv> <rsp_header>* <h_connection_close_rcv> <rsp_header_any>* \
-    | <rsp_header>* <h_cseq_rcv> <rsp_header>* <h_connection_close_rcv> <rsp_header_any>* <h_content_length> <rsp_header_any>* \
-    | <rsp_header>* <h_content_length> <rsp_header>* <h_connection_close_rcv> <rsp_header_any>* <h_cseq_rcv> <rsp_header_any>* \
-    | <rsp_header>* <h_connection_close_rcv> <rsp_header_any>* <h_cseq_rcv> <rsp_header_any>* <h_content_length> <rsp_header_any>* \
-    | <rsp_header>* <h_connection_close_rcv> <rsp_header_any>* <h_content_length> <rsp_header_any>* <h_cseq_rcv> <rsp_header_any>*
-<h_cseq_rcv> ::= r'(?i:cseq)' ':' <ows> <cseq_value_rcv> <ows> <crlf>
-<cseq_value_rcv> ::= <digits>
-
-# the fields of a reply (without "close", see <rep_closing>) and of a request of the server
-<rsp_header> ::= <srv_header_common> | <h_connection_keep_rcv> | <h_range_rcv>
-<rsp_header_any> ::= <rsp_header> | <h_connection_close_rcv>
-<srv_header> ::= <srv_header_no_range> | <h_range_rcv>
-<srv_header_no_range> ::= <srv_header_common> | <h_connection_rcv>
-<srv_header_common> ::= <h_content_type> | <h_content_base> | <h_content_location> \
-    | <h_content_encoding> | <h_content_language> | <h_session_rcv> | <h_transport_rcv> \
-    | <h_public> | <h_allow> | <h_rtp_info> | <h_www_authenticate> \
-    | <h_proxy_authenticate> | <h_unsupported> | <h_location> | <h_scale_rcv> | <h_speed_rcv> \
-    | <h_timestamp_rcv> | <h_cache_control_rcv> | <h_expires> \
-    | <h_last_modified> | <h_known_text> | <h_extension_rcv>
-
-# 2326 12.14: Content-Length = "Content-Length" ":" 1*DIGIT
-<h_content_length> ::= r'(?i:content-length)' ':' <ows> <content_length_value> <ows> <crlf>
-<content_length_value> ::= <digits>
-# 2326 12.16 / 9110 8.3: Content-Type = media-type = type "/" subtype *( OWS ";" OWS parameter )
-<h_content_type> ::= r'(?i:content-type)' ':' <ows> <media_type_rcv> <ows> <crlf>
-<media_type_rcv> ::= <token> '/' <token> (<ows> ';' <ows> <token> '=' (<token> | <quoted_string>))*
-# 2326 12.11 Content-Base, 12.15 Content-Location, 12.25 Location: URLs
-<h_content_base> ::= r'(?i:content-base)' ':' <ows> <uri_rcv> <ows> <crlf>
-<h_content_location> ::= r'(?i:content-location)' ':' <ows> <uri_rcv> <ows> <crlf>
-<h_location> ::= r'(?i:location)' ':' <ows> <uri_rcv> <ows> <crlf>
-<uri_rcv> ::= r'[!-~]+'
-# 2326 12.12 / 9110 8.4: Content-Encoding = 1#content-coding (F22)
-<h_content_encoding> ::= r'(?i:content-encoding)' ':' <ows> <list_lead>* <token> (<list_sep> <token>)* <list_trail>* <ows> <crlf>
-# 2326 12.13 / 9110 8.5: Content-Language = 1#language-tag (F94)
-<h_content_language> ::= r'(?i:content-language)' ':' <ows> <list_lead>* <language_tag_rcv> (<list_sep> <language_tag_rcv>)* <list_trail>* <ows> <crlf>
-<language_tag_rcv> ::= r'[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*'
-# 2326 12.8: Cache-Control = 1#cache-directive; the response directives (F92)
-<h_cache_control_rcv> ::= r'(?i:cache-control)' ':' <ows> <list_lead>* <cache_directive_rcv> (<list_sep> <cache_directive_rcv>)* <list_trail>* <ows> <crlf>
-<cache_directive_rcv> ::= <cdr_public> | <cdr_private> | <cdr_no_cache> | <cdr_no_transform> \
-    | <cdr_must_revalidate> | <cdr_proxy_revalidate> | <cdr_max_age> | <cdr_extension>
-<cdr_public> ::= r'(?i:public)'
-<cdr_private> ::= r'(?i:private)' ('=' <quoted_string>)?
-<cdr_no_cache> ::= r'(?i:no-cache)' ('=' <quoted_string>)?
-<cdr_no_transform> ::= r'(?i:no-transform)'
-<cdr_must_revalidate> ::= r'(?i:must-revalidate)'
-<cdr_proxy_revalidate> ::= r'(?i:proxy-revalidate)'
-<cdr_max_age> ::= r'(?i:max-age)' '=' <digits>
-# cache-extension (and the request directives of a server's request)
-<cdr_extension> ::= r"(?!(?i:public|private|no-cache|no-transform|must-revalidate|proxy-revalidate|max-age)\Z)[!#$%&'*+.^_`|~0-9A-Za-z-]+" ('=' (<token> | <quoted_string>))?
-# 2326 12.19 Expires, 12.24 Last-Modified = HTTP-date; 9110 5.6.7: recipients accept all three
-# formats; 2326 12.19: clients MUST treat invalid Expires dates, e.g. "0", as already expired
-<h_expires> ::= r'(?i:expires)' ':' <ows> (<http_date_rcv> | <expires_invalid>) <ows> <crlf>
-<h_last_modified> ::= r'(?i:last-modified)' ':' <ows> <http_date_rcv> <ows> <crlf>
-<http_date_rcv> ::= <imf_fixdate_rcv> | <rfc850_date_rcv> | <asctime_date_rcv>
-<imf_fixdate_rcv> ::= r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-9]{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT'
-<rfc850_date_rcv> ::= r'(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), [0-9]{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT'
-<asctime_date_rcv> ::= r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?:[0-9]{2}| [0-9]) [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}'
-<expires_invalid> ::= r'(?!(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-9]{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), [0-9]{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?:[0-9]{2}| [0-9]) [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4})\Z)[^\r\n \t](?:[^\r\n]*[^\r\n \t])?'
-
-
-# 2326 12.37: Session = "Session" ":" session-id [ ";" "timeout" "=" delta-seconds ]
-<h_session_rcv> ::= r'(?i:session)' ':' <ows> <session_id_rcv> <session_timeout>? <ows> <crlf>
-# session-id = 1*( ALPHA | DIGIT | safe ), safe = "$" | "-" | "_" | "." | "+"
-<session_id_rcv> ::= r'[A-Za-z0-9$_.+-]+'
-<session_timeout> ::= <ows> ';' <ows> r'(?i:timeout)' '=' <timeout_seconds>
-<timeout_seconds> ::= <digits>
-
-# 2326 12.39: Transport of a reply: the single transport-spec the server chose (C14)
-<h_transport_rcv> ::= r'(?i:transport)' ':' <ows> <list_lead>* <transport_spec_rcv> <list_trail>* <ows> <crlf>
-<transport_spec_rcv> ::= <transport_id_rcv> <transport_param_rcv>*
-<transport_id_rcv> ::= r'(?i:rtp/avp)' <lower_transport_rcv>? | <transport_id_ext>
-<lower_transport_rcv> ::= '/' r'(?i:tcp|udp)'
-# transport protocols and profiles only extensions define (e.g. RTP/SAVP)
-<transport_id_ext> ::= r'(?!(?i:rtp/avp)(?:/(?i:tcp|udp))?\Z)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?'
-<transport_param_rcv> ::= ';' <transport_parameter>
-<transport_parameter> ::= <tp_unicast_rcv> | <tp_multicast_rcv> | <tp_destination_rcv> | <tp_source_rcv> \
-    | <tp_interleaved_rcv> | <tp_append_rcv> | <tp_ttl_rcv> | <tp_layers_rcv> | <tp_port_rcv> \
-    | <tp_client_port_rcv> | <tp_server_port_rcv> | <tp_ssrc_rcv> | <tp_mode_rcv> | <tp_extension_rcv>
-<tp_unicast_rcv> ::= r'(?i:unicast)'
-<tp_multicast_rcv> ::= r'(?i:multicast)'
-<tp_destination_rcv> ::= r'(?i:destination)' ('=' <address_rcv>)?
-# "source" is described in 2326 12.39's text, not its BNF
-<tp_source_rcv> ::= r'(?i:source)' '=' <address_rcv>
-<address_rcv> ::= r'[A-Za-z0-9.:\[\]-]+'
-<tp_interleaved_rcv> ::= r'(?i:interleaved)' '=' <channel> ('-' <channel>)?
-<tp_append_rcv> ::= r'(?i:append)'
-<tp_ttl_rcv> ::= r'(?i:ttl)' '=' r'[0-9]{1,3}'
-<tp_layers_rcv> ::= r'(?i:layers)' '=' <digits>
-<tp_port_rcv> ::= r'(?i:port)' '=' <port_range_rcv>
-<tp_client_port_rcv> ::= r'(?i:client_port)' '=' <port_range_rcv>
-<tp_server_port_rcv> ::= r'(?i:server_port)' '=' <port_range_rcv>
-<port_range_rcv> ::= r'[0-9]{1,5}' ('-' r'[0-9]{1,5}')?
-<tp_ssrc_rcv> ::= r'(?i:ssrc)' '=' r'[0-9A-Fa-f]{8}'
-<tp_mode_rcv> ::= r'(?i:mode)' '=' (<method_rcv> | '"' <method_rcv> (<ows> ',' <ows> <method_rcv>)* '"')
-<method_rcv> ::= <token>
-# parameters only extensions define
-<tp_extension_rcv> ::= r'(?!(?i:unicast|multicast|destination|source|interleaved|append|ttl|layers|port|client_port|server_port|ssrc|mode)\Z)[A-Za-z0-9._-]+' ('=' (r'[^;,\s"]+' | <quoted_string>))?
-
-# 2326 12.28 Public, 12.4 Allow: 1#method
-<h_public> ::= r'(?i:public)' ':' <ows> <method_list_rcv> <ows> <crlf>
-<h_allow> ::= r'(?i:allow)' ':' <ows> <method_list_rcv> <ows> <crlf>
-<method_list_rcv> ::= <list_lead>* <method_rcv> (<list_sep> <method_rcv>)* <list_trail>*
-
-# 2326 12.29: Range of a reply
-<h_range_rcv> ::= r'(?i:range)' ':' <ows> <list_lead>* <ranges_specifier_rcv> (<list_sep> <ranges_specifier_rcv>)* <list_trail>* (';' r'(?i:time)' '=' <utc_time_rcv>)? <ows> <crlf>
-<ranges_specifier_rcv> ::= <npt_range_rcv> | <smpte_range_rcv> | <utc_range_rcv>
-<npt_range_rcv> ::= r'(?i:npt)' '=' (<npt_time_rcv> '-' <npt_time_rcv>? | '-' <npt_time_rcv>)
-<npt_time_rcv> ::= r'(?i:now)' | r'[0-9]+(?:\.[0-9]*)?' | r'[0-9]+:[0-9]{1,2}:[0-9]{1,2}(?:\.[0-9]*)?'
-<smpte_range_rcv> ::= r'(?i:smpte-30-drop|smpte-25|smpte)' '=' <smpte_time_rcv> '-' <smpte_time_rcv>?
-<smpte_time_rcv> ::= r'[0-9]{1,2}:[0-9]{1,2}:[0-9]{1,2}(?::[0-9]{1,2})?(?:\.[0-9]{1,2})?'
-<utc_range_rcv> ::= r'(?i:clock)' '=' <utc_time_rcv> '-' <utc_time_rcv>?
-<utc_time_rcv> ::= r'[0-9]{8}T[0-9]{6}(?:\.[0-9]+)?Z'
-
-# 2326 12.33: RTP-Info = 1#stream-url 1*parameter; parameter = ";" "seq" "=" 1*DIGIT |
-# ";" "rtptime" "=" 1*DIGIT
-<h_rtp_info> ::= r'(?i:rtp-info)' ':' <ows> <list_lead>* <rtp_info_stream> (<list_sep> <rtp_info_stream>)* <list_trail>* <ows> <crlf>
-<rtp_info_stream> ::= r'(?i:url)' '=' <rtp_info_url> <rtp_info_param>*
-<rtp_info_url> ::= r'[^;,\s]+'
-<rtp_info_param> ::= ';' (r'(?i:seq)' '=' <digits> | r'(?i:rtptime)' '=' <digits> | <rtp_info_param_ext>)
-<rtp_info_param_ext> ::= r'(?!(?i:seq|rtptime)\Z)[A-Za-z0-9_-]+' ('=' r'[^;,\s]+')?
-
-# 9110 11.6.1 WWW-Authenticate, 11.7.1 Proxy-Authenticate: 1#challenge;
-# challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
-<h_www_authenticate> ::= r'(?i:www-authenticate)' ':' <ows> <list_lead>* <challenge> (<list_sep> <challenge>)* <list_trail>* <ows> <crlf>
-<h_proxy_authenticate> ::= r'(?i:proxy-authenticate)' ':' <ows> <list_lead>* <challenge> (<list_sep> <challenge>)* <list_trail>* <ows> <crlf>
-<challenge> ::= <auth_scheme> (r' +' <auth_params>)?
-<auth_scheme> ::= <token>
-# #auth-param = [ auth-param ] *( OWS "," OWS [ auth-param ] ): empty elements before and between
-# the parameters; those after the last one, and a list without any parameter, parse as empty
-# elements of the challenge list around it. A leading empty element may have OWS before its comma;
-# r' +' takes all spaces after the scheme, so that OWS starts with HTAB or a fold (<lws_nosp>)
-<auth_params> ::= <auth_param> (<list_sep> <auth_param>)* \
-    | <auth_lead> <list_comma>* <ows> <auth_param> (<list_sep> <auth_param>)* | <token68>
-<auth_lead> ::= <lws_nosp>? ','
-# LWS that does not start with SP (2326 15)
-<lws_nosp> ::= r'(?:\t|\r\n[ \t])(?:[ \t]|\r\n[ \t])*'
-<auth_param> ::= <token> <ows> '=' <ows> (<token> | <quoted_string>)
+    return base64.b64encode((user + ":" + password).encode()).decode()
+
+
+def pick_target():
+    return MEMORY["target"]
+
+
+def pick_publish_target():
+    return MEMORY["publish"]
+
+
+def pick_control():
+    return random.choice(RTSP_CONTROLS)
+
+
+def clen(headers):
+    m = re.search(r"(?im)^content-length:[ \t]*([0-9]+)", str(headers))
+    return int(m.group(1)) if m else 0
+
+
+def prefix_pattern(literal):
+    """A regex for the prefixes of `literal` (the bytes of a message start that have arrived so far)."""
+    out = ""
+    for char in reversed(literal):
+        out = "(?:" + re.escape(char) + out + ")?"
+    return out
+
+
+STATUS_LINE_START = re.compile(rb"RTSP/[0-9]+\.[0-9]+ [0-9]{3} ")
+REQUEST_LINE = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+ [^ \r\n]+ RTSP/[0-9]+\.[0-9]+\r\n")
+REQUEST_LINE_PREFIX = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+(?: (?:[^ \r\n]+(?: " + prefix_pattern("RTSP/").encode() + rb"(?:[0-9]+(?:\.[0-9]*)?)?)?)?)?\r?")
+STATUS_LINE_PREFIX = re.compile(prefix_pattern("RTSP/").encode() + rb"(?:[0-9]+(?:\.[0-9]*)?(?: [0-9]{0,3})?)?")
+
+
+def starts_message(buffer):
+    """Whether `buffer` is, or may still become, the start of an RTSP message (a status line or a request line, 7, 6): False for bytes that no message begins with."""
+    if buffer[:1] == b"$":
+        return True
+    line = buffer.split(b"\r\n", 1)[0] + (b"\r\n" if b"\r\n" in buffer else b"")
+    if line.endswith(b"\r\n"):
+        return bool(STATUS_LINE_START.match(line) or REQUEST_LINE.fullmatch(line))
+    if len(line) > 4000:
+        return False
+    return bool(STATUS_LINE_START.match(line) or STATUS_LINE_PREFIX.fullmatch(line) or REQUEST_LINE_PREFIX.fullmatch(line))
+
+
+def split_stream(buffer, state):
+    """Cuts the bytes of the control connection into RTSP messages and interleaved frames (Section 10.12). Bytes that no message begins with are the payload of a
+    message that has no Content-Length (4.4 rule 2: length zero; 9.2: a payload needs the header): they are handed over behind a marker, as a piece no rule derives."""
+    out = []
+    while buffer:
+        if not starts_message(buffer):
+            out.append(b"\x00body\x00" + buffer)
+            return out, b""
+        if buffer[:1] == b"$":
+            if len(buffer) < 4:
+                break
+            size = 4 + int.from_bytes(buffer[2:4], "big")
+            if len(buffer) < size:
+                break
+            if state["frames"] < RTSP_FRAME_LIMIT:
+                out.append(buffer[:4])
+            state["frames"] += 1
+            buffer = buffer[size:]
+            continue
+        end = buffer.find(b"\r\n\r\n")
+        if end < 0:
+            break
+        head = buffer[:end + 4]
+        size = len(head)
+        first = head.split(b"\r\n", 1)[0]
+        no_body = re.match(rb"^RTSP/\d+\.\d+ (1\d\d|204|304) ", first)
+        if not no_body:
+            size += clen(head.decode("latin-1"))
+        if len(buffer) < size:
+            break
+        out.append(buffer[:size])
+        buffer = buffer[size:]
+    return out, buffer
+
+
+# Every request is followed by the start of a timer (the reply may stay away, 9.2) and every reply by its cancel. A server answers within a few milliseconds, faster than
+# Fandango sends the start, and a reply that arrives while Fandango expects the start or the cancel is an unexpected message. The party therefore hands what the server sends
+# to Fandango while Fandango can take it: from the timer start on, and from the cancel on.
+GATE = True
+
+
+def is_final(piece):
+    """A reply that answers the request (not an interim 1xx), or the close of the connection."""
+    return piece is None or (piece.startswith(b"RTSP/") and not re.match(rb"RTSP/\d+\.\d+ 1\d\d ", piece))
+
+
+class ClientNetworkParty(NetworkParty):
+    def __init__(self, *args, **kwargs):
+        reset_memory()
+        self.pending = b""
+        self.held = []
+        self.shut = False
+        self.watching = False
+        self.outstanding = set()
+        self.last_cseq = None
+        self.expired = False
+        self.lock = threading.RLock()
+        super().__init__(*args, **kwargs)
+
+    def watch_timers(self):
+        timer = self.io_instance.parties.get("TimerControl")
+        if timer is None or self.watching:
+            return
+        self.watching = True
+        send_timer = timer.send
+
+        def timer_send(message, recipient):
+            send_timer(message, recipient)
+            self.open_gate()
+
+        timer.send = timer_send
+        expire = timer._on_timer_expire
+
+        def on_expire(name):
+            self.expired = True
+            expire(name)
+
+        timer._on_timer_expire = on_expire
+
+    def send(self, message, recipient):
+        raw = bytes(message) if isinstance(message, (bytes, bytearray)) else str(message).encode("latin-1", "replace")
+        parts = raw[:300].split(b"\r\n", 1)[0].decode("latin-1").split(" ")
+        if len(parts) == 3 and parts[2].startswith("RTSP/"):
+            cseq = re.search(rb"\r\nCSeq:[ \t]*(\d+)", raw[:2000])
+            if cseq:
+                self.outstanding.add(cseq.group(1))
+                self.last_cseq = cseq.group(1)
+                self.expired = False
+            if parts[1] != "*":
+                MEMORY["request_url"] = parts[1]
+            if GATE:
+                self.watch_timers()
+                with self.lock:
+                    self.shut = True
+        super().send(message, recipient)
+
+    def mark_late(self, piece):
+        """A final reply to an earlier request that the client has stopped waiting for (its timer expired, or a later request has been sent): the reply is late (9.2)
+        and is handed over behind a marker, as a message of its own that is not the reply of the exchange running now."""
+        if not piece.startswith(b"RTSP/") or re.match(rb"RTSP/\d+\.\d+ 1\d\d ", piece):
+            return piece
+        cseq = re.search(rb"\r\nCSeq:[ \t]*(\d+)", piece[:2000])
+        if not cseq or cseq.group(1) not in self.outstanding:
+            return piece
+        self.outstanding.discard(cseq.group(1))
+        if cseq.group(1) != self.last_cseq or self.expired:
+            return b"\x00late\x00" + piece
+        return piece
+
+    def open_gate(self):
+        with self.lock:
+            self.shut = False
+            held, self.held = self.held, []
+            for piece, sender in held:
+                self.hand_over(piece, sender)
+
+    def hand_over(self, piece, sender):
+        with self.lock:
+            if GATE and self.shut:
+                self.held.append((piece, sender))
+                return
+            if piece is None:
+                super().receive(b"\x00closed\x00", sender)
+            else:
+                if not piece.startswith(b"$"):
+                    # Content-Base and Content-Location belong to the message that carries them (C.1.1): a message without them has none
+                    MEMORY["base"], MEMORY["location"] = message_base(piece)
+                    MEMORY["message_url"] = message_url(piece)
+                super().receive(piece, sender)
+            if GATE and is_final(piece):
+                self.shut = True
+
+    def receive(self, message, sender):
+        with self.lock:
+            if message is None:
+                # The server closed the connection: the grammar sees it as a message of its own
+                if self.pending:
+                    # the start of a message that the close cut off
+                    self.hand_over(self.pending, sender)
+                    self.pending = b""
+                self.hand_over(None, sender)
+                return
+            pieces, self.pending = split_stream(self.pending + bytes(message), MEMORY)
+            for piece in pieces:
+                self.hand_over(self.mark_late(piece), sender)
+
+
+# ============================================================================================
+# Sessions: one connection; the client states of Appendix A.1.
+# ============================================================================================
+# A session opens with OPTIONS (10.1), which may be issued at any time and does not influence the server state
+# A connection may open with any request the Init state allows (OPTIONS first is not required, 9, A.1); the exchange and the state it leads to are the Init rules
+<start> ::= <init_exchange>
+
+# Init: SETUP has not succeeded yet (A.1: Init -SETUP-> Ready, TEARDOWN keeps Init)
+<init_exchange> ::= (<x_options_init> <state_init>
+    | <x_options_init_closed>
+    | <x_options_headers_init> <state_init>
+    | <x_options_headers_init_closed>
+    | <x_describe_init> <state_init>
+    | <x_describe_init_closed>
+    | <x_describe_conditional_init> <state_init>
+    | <x_describe_conditional_init_closed>
+    | <x_describe_unknown_init_ok> <state_init>
+    | <x_describe_unknown_init_redirect> <state_init>
+    | <x_describe_unknown_init_err> <state_init>
+    | <x_describe_unknown_init_closed>
+    | <x_get_parameter_init> <state_init>
+    | <x_get_parameter_init_closed>
+    | <x_blocksize_init> <state_init>
+    | <x_blocksize_init_closed>
+    | <x_set_parameter_init> <state_init>
+    | <x_set_parameter_init_closed>
+    | <x_announce_init> <state_init>
+    | <x_announce_init_closed>
+    | <x_announce_publish_init> <state_init>
+    | <x_announce_publish_init_closed>
+    | <x_extension_init> <state_init>
+    | <x_extension_init_closed>
+    | <x_version_init> <state_init>
+    | <x_version_init_closed>
+    | <x_auth_init> <state_init>
+    | <x_auth_init_closed>
+    | <x_auth_wrong_init> <state_init>
+    | <x_auth_wrong_init_closed>
+    | <x_options_close_init> <state_closing>
+    | <x_options_close_init_closed>
+    | <x_setup_init_ok> <state_ready>
+    | <x_setup_init_redirect> <state_init>
+    | <x_setup_init_err> <state_init>
+    | <x_setup_init_closed>
+    | <x_setup_record_init_ok> <state_ready>
+    | <x_setup_record_init_redirect> <state_init>
+    | <x_setup_record_init_err> <state_init>
+    | <x_setup_record_init_closed>
+    | <x_setup_full_init_ok> <state_ready>
+    | <x_setup_full_init_redirect> <state_init>
+    | <x_setup_full_init_err> <state_init>
+    | <x_setup_full_init_closed>
+    | <x_teardown_init_ok> <state_init>
+    | <x_teardown_init_redirect> <state_init>
+    | <x_teardown_init_err> <state_init>
+    | <x_teardown_init_closed>
+    | <x_play_without_setup_init_ok> <state_playing>
+    | <x_play_without_setup_init_redirect> <state_init>
+    | <x_play_without_setup_init_err> <state_init>
+    | <x_play_without_setup_init_closed>
+    | <x_play_unknown_session_init_ok> <state_init>
+    | <x_play_unknown_session_init_redirect> <state_init>
+    | <x_play_unknown_session_init_err> <state_init>
+    | <x_play_unknown_session_init_closed>
+    | <x_pause_unknown_session_init_ok> <state_init>
+    | <x_pause_unknown_session_init_redirect> <state_init>
+    | <x_pause_unknown_session_init_err> <state_init>
+    | <x_pause_unknown_session_init_closed>
+    | <x_record_unknown_session_init_ok> <state_init>
+    | <x_record_unknown_session_init_redirect> <state_init>
+    | <x_record_unknown_session_init_err> <state_init>
+    | <x_record_unknown_session_init_closed>
+    | <x_teardown_unknown_session_init_ok> <state_init>
+    | <x_teardown_unknown_session_init_redirect> <state_init>
+    | <x_teardown_unknown_session_init_err> <state_init>
+    | <x_teardown_unknown_session_init_closed>
+    | <x_get_parameter_unknown_session_init_ok> <state_init>
+    | <x_get_parameter_unknown_session_init_redirect> <state_init>
+    | <x_get_parameter_unknown_session_init_err> <state_init>
+    | <x_get_parameter_unknown_session_init_closed>
+    | <x_set_parameter_unknown_session_init_ok> <state_init>
+    | <x_set_parameter_unknown_session_init_redirect> <state_init>
+    | <x_set_parameter_unknown_session_init_err> <state_init>
+    | <x_set_parameter_unknown_session_init_closed>
+    | <x_init_options_init_silent> <state_init>
+    | <x_init_options_headers_init_silent> <state_init>
+    | <x_init_describe_init_silent> <state_init>
+    | <x_init_describe_conditional_init_silent> <state_init>
+    | <x_init_describe_unknown_init_silent> <state_init>
+    | <x_init_get_parameter_init_silent> <state_init>
+    | <x_init_blocksize_init_silent> <state_init>
+    | <x_init_set_parameter_init_silent> <state_init>
+    | <x_init_announce_init_silent> <state_init>
+    | <x_init_announce_publish_init_silent> <state_init>
+    | <x_init_extension_init_silent> <state_init>
+    | <x_init_version_init_silent> <state_init>
+    | <x_init_auth_init_silent> <state_init>
+    | <x_init_auth_wrong_init_silent> <state_init>
+    | <x_init_options_close_init_silent> <state_init>
+    | <x_init_setup_silent> <state_init>
+    | <x_init_setup_record_silent> <state_init>
+    | <x_init_setup_full_silent> <state_init>
+    | <x_init_teardown_init_silent> <state_init>
+    | <x_init_play_without_setup_silent> <state_init>
+    | <x_init_play_unknown_session_silent> <state_init>
+    | <x_init_pause_unknown_session_silent> <state_init>
+    | <x_init_record_unknown_session_silent> <state_init>
+    | <x_init_teardown_unknown_session_silent> <state_init>
+    | <x_init_get_parameter_unknown_session_silent> <state_init>
+    | <x_init_set_parameter_unknown_session_silent> <state_init>)
+
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<state_init> ::= (<init_exchange>
+    | <x_frame> <state_init>
+    | <x_server_request> <state_init>
+    | <x_server_redirect> <state_init>
+    | <x_closed>
+    | <x_late_reply> <state_init>
+    | <end_of_session>)
+
+# Ready: SETUP reply received, or PAUSE reply received while playing or recording
+<state_ready> ::= (<x_options_ready> <state_ready>
+    | <x_options_ready_redirect> <state_init>
+    | <x_options_ready_closed>
+    | <x_options_headers_ready> <state_ready>
+    | <x_options_headers_ready_redirect> <state_init>
+    | <x_options_headers_ready_closed>
+    | <x_describe_ready> <state_ready>
+    | <x_describe_ready_redirect> <state_init>
+    | <x_describe_ready_closed>
+    | <x_describe_conditional_ready> <state_ready>
+    | <x_describe_conditional_ready_redirect> <state_init>
+    | <x_describe_conditional_ready_closed>
+    | <x_play_unknown_session_ready_ok> <state_ready>
+    | <x_play_unknown_session_ready_redirect> <state_init>
+    | <x_play_unknown_session_ready_err> <state_ready>
+    | <x_play_unknown_session_ready_closed>
+    | <x_pause_unknown_session_ready_ok> <state_ready>
+    | <x_pause_unknown_session_ready_redirect> <state_init>
+    | <x_pause_unknown_session_ready_err> <state_ready>
+    | <x_pause_unknown_session_ready_closed>
+    | <x_record_unknown_session_ready_ok> <state_ready>
+    | <x_record_unknown_session_ready_redirect> <state_init>
+    | <x_record_unknown_session_ready_err> <state_ready>
+    | <x_record_unknown_session_ready_closed>
+    | <x_teardown_unknown_session_ready_ok> <state_ready>
+    | <x_teardown_unknown_session_ready_redirect> <state_init>
+    | <x_teardown_unknown_session_ready_err> <state_ready>
+    | <x_teardown_unknown_session_ready_closed>
+    | <x_get_parameter_unknown_session_ready_ok> <state_ready>
+    | <x_get_parameter_unknown_session_ready_redirect> <state_init>
+    | <x_get_parameter_unknown_session_ready_err> <state_ready>
+    | <x_get_parameter_unknown_session_ready_closed>
+    | <x_set_parameter_unknown_session_ready_ok> <state_ready>
+    | <x_set_parameter_unknown_session_ready_redirect> <state_init>
+    | <x_set_parameter_unknown_session_ready_err> <state_ready>
+    | <x_set_parameter_unknown_session_ready_closed>
+    | <x_describe_session_ready> <state_ready>
+    | <x_describe_session_ready_redirect> <state_init>
+    | <x_describe_session_ready_closed>
+    | <x_announce_session_ready> <state_ready>
+    | <x_announce_session_ready_redirect> <state_init>
+    | <x_announce_session_ready_closed>
+    | <x_setup_full_session_ready_ok> <state_ready>
+    | <x_setup_full_session_ready_redirect> <state_init>
+    | <x_setup_full_session_ready_err> <state_ready>
+    | <x_setup_full_session_ready_closed>
+    | <x_describe_unknown_ready_ok> <state_ready>
+    | <x_describe_unknown_ready_redirect> <state_init>
+    | <x_describe_unknown_ready_err> <state_ready>
+    | <x_describe_unknown_ready_closed>
+    | <x_get_parameter_ready> <state_ready>
+    | <x_get_parameter_ready_redirect> <state_init>
+    | <x_get_parameter_ready_closed>
+    | <x_blocksize_ready> <state_ready>
+    | <x_blocksize_ready_redirect> <state_init>
+    | <x_blocksize_ready_closed>
+    | <x_blocksize_session_ready> <state_ready>
+    | <x_blocksize_session_ready_redirect> <state_init>
+    | <x_blocksize_session_ready_closed>
+    | <x_set_parameter_ready> <state_ready>
+    | <x_set_parameter_ready_redirect> <state_init>
+    | <x_set_parameter_ready_closed>
+    | <x_announce_ready> <state_ready>
+    | <x_announce_ready_redirect> <state_init>
+    | <x_announce_ready_closed>
+    | <x_announce_publish_ready> <state_ready>
+    | <x_announce_publish_ready_redirect> <state_init>
+    | <x_announce_publish_ready_closed>
+    | <x_extension_ready> <state_ready>
+    | <x_extension_ready_redirect> <state_init>
+    | <x_extension_ready_closed>
+    | <x_version_ready> <state_ready>
+    | <x_version_ready_redirect> <state_init>
+    | <x_version_ready_closed>
+    | <x_auth_ready> <state_ready>
+    | <x_auth_ready_redirect> <state_init>
+    | <x_auth_ready_closed>
+    | <x_auth_wrong_ready> <state_ready>
+    | <x_auth_wrong_ready_redirect> <state_init>
+    | <x_auth_wrong_ready_closed>
+    | <x_options_close_ready> <state_closing>
+    | <x_options_close_ready_closed>
+    | <x_play_ready_ok> <state_playing>
+    | <x_play_ready_redirect> <state_init>
+    | <x_play_ready_err> <state_ready>
+    | <x_play_ready_closed>
+    | <x_record_ready_ok> <state_recording>
+    | <x_record_ready_redirect> <state_init>
+    | <x_record_ready_err> <state_ready>
+    | <x_record_ready_closed>
+    | <x_setup_ready_ok> <state_ready>
+    | <x_setup_ready_redirect> <state_init>
+    | <x_setup_ready_err> <state_ready>
+    | <x_setup_ready_closed>
+    | <x_setup_record_ready_ok> <state_ready>
+    | <x_setup_record_ready_redirect> <state_init>
+    | <x_setup_record_ready_err> <state_ready>
+    | <x_setup_record_ready_closed>
+    | <x_setup_second_ready_ok> <state_ready>
+    | <x_setup_second_ready_redirect> <state_init>
+    | <x_setup_second_ready_err> <state_ready>
+    | <x_setup_second_ready_closed>
+    | <x_setup_second_narrow_ready_ok> <state_ready>
+    | <x_setup_second_narrow_ready_redirect> <state_init>
+    | <x_setup_second_narrow_ready_err> <state_ready>
+    | <x_setup_second_narrow_ready_closed>
+    | <x_teardown_ready_ok> <state_init>
+    | <x_teardown_ready_redirect> <state_init>
+    | <x_teardown_ready_err> <state_ready>
+    | <x_teardown_ready_closed>
+    | <x_pause_ready> <state_ready>
+    | <x_pause_ready_redirect> <state_init>
+    | <x_pause_ready_closed>
+    | <x_teardown_stream_ready> <state_ready>
+    | <x_teardown_stream_ready_redirect> <state_init>
+    | <x_teardown_stream_ready_closed>
+    | <x_ready_options_ready_silent> <state_ready>
+    | <x_ready_options_headers_ready_silent> <state_ready>
+    | <x_ready_describe_ready_silent> <state_ready>
+    | <x_ready_describe_conditional_ready_silent> <state_ready>
+    | <x_ready_play_unknown_session_ready_silent> <state_ready>
+    | <x_ready_pause_unknown_session_ready_silent> <state_ready>
+    | <x_ready_record_unknown_session_ready_silent> <state_ready>
+    | <x_ready_teardown_unknown_session_ready_silent> <state_ready>
+    | <x_ready_get_parameter_unknown_session_ready_silent> <state_ready>
+    | <x_ready_set_parameter_unknown_session_ready_silent> <state_ready>
+    | <x_ready_describe_session_ready_silent> <state_ready>
+    | <x_ready_announce_session_ready_silent> <state_ready>
+    | <x_ready_setup_full_session_ready_silent> <state_ready>
+    | <x_ready_describe_unknown_ready_silent> <state_ready>
+    | <x_ready_get_parameter_ready_silent> <state_ready>
+    | <x_ready_blocksize_ready_silent> <state_ready>
+    | <x_ready_blocksize_session_ready_silent> <state_ready>
+    | <x_ready_set_parameter_ready_silent> <state_ready>
+    | <x_ready_announce_ready_silent> <state_ready>
+    | <x_ready_announce_publish_ready_silent> <state_ready>
+    | <x_ready_extension_ready_silent> <state_ready>
+    | <x_ready_version_ready_silent> <state_ready>
+    | <x_ready_auth_ready_silent> <state_ready>
+    | <x_ready_auth_wrong_ready_silent> <state_ready>
+    | <x_ready_options_close_ready_silent> <state_ready>
+    | <x_ready_play_silent> <state_ready>
+    | <x_ready_record_silent> <state_ready>
+    | <x_ready_setup_again_silent> <state_ready>
+    | <x_ready_setup_record_again_silent> <state_ready>
+    | <x_ready_setup_second_session_silent> <state_ready>
+    | <x_ready_setup_second_narrow_silent> <state_ready>
+    | <x_ready_teardown_silent> <state_ready>
+    | <x_ready_pause_ready_silent> <state_ready>
+    | <x_ready_teardown_stream_ready_silent> <state_ready>
+    | <x_frame> <state_ready>
+    | <x_server_request> <state_ready>
+    | <x_server_redirect> <state_init>
+    | <x_closed>
+    | <x_late_reply> <state_ready>
+    | <end_of_session>)
+
+# Playing: PLAY reply received
+<state_playing> ::= (<x_options_playing> <state_playing>
+    | <x_options_playing_redirect> <state_init>
+    | <x_options_playing_closed>
+    | <x_options_headers_playing> <state_playing>
+    | <x_options_headers_playing_redirect> <state_init>
+    | <x_options_headers_playing_closed>
+    | <x_describe_playing> <state_playing>
+    | <x_describe_playing_redirect> <state_init>
+    | <x_describe_playing_closed>
+    | <x_describe_conditional_playing> <state_playing>
+    | <x_describe_conditional_playing_redirect> <state_init>
+    | <x_describe_conditional_playing_closed>
+    | <x_play_unknown_session_playing_ok> <state_playing>
+    | <x_play_unknown_session_playing_redirect> <state_init>
+    | <x_play_unknown_session_playing_err> <state_playing>
+    | <x_play_unknown_session_playing_closed>
+    | <x_pause_unknown_session_playing_ok> <state_playing>
+    | <x_pause_unknown_session_playing_redirect> <state_init>
+    | <x_pause_unknown_session_playing_err> <state_playing>
+    | <x_pause_unknown_session_playing_closed>
+    | <x_record_unknown_session_playing_ok> <state_playing>
+    | <x_record_unknown_session_playing_redirect> <state_init>
+    | <x_record_unknown_session_playing_err> <state_playing>
+    | <x_record_unknown_session_playing_closed>
+    | <x_teardown_unknown_session_playing_ok> <state_playing>
+    | <x_teardown_unknown_session_playing_redirect> <state_init>
+    | <x_teardown_unknown_session_playing_err> <state_playing>
+    | <x_teardown_unknown_session_playing_closed>
+    | <x_get_parameter_unknown_session_playing_ok> <state_playing>
+    | <x_get_parameter_unknown_session_playing_redirect> <state_init>
+    | <x_get_parameter_unknown_session_playing_err> <state_playing>
+    | <x_get_parameter_unknown_session_playing_closed>
+    | <x_set_parameter_unknown_session_playing_ok> <state_playing>
+    | <x_set_parameter_unknown_session_playing_redirect> <state_init>
+    | <x_set_parameter_unknown_session_playing_err> <state_playing>
+    | <x_set_parameter_unknown_session_playing_closed>
+    | <x_describe_session_playing> <state_playing>
+    | <x_describe_session_playing_redirect> <state_init>
+    | <x_describe_session_playing_closed>
+    | <x_announce_session_playing> <state_playing>
+    | <x_announce_session_playing_redirect> <state_init>
+    | <x_announce_session_playing_closed>
+    | <x_setup_full_session_playing_ok> <state_playing>
+    | <x_setup_full_session_playing_redirect> <state_init>
+    | <x_setup_full_session_playing_err> <state_playing>
+    | <x_setup_full_session_playing_closed>
+    | <x_describe_unknown_playing_ok> <state_playing>
+    | <x_describe_unknown_playing_redirect> <state_init>
+    | <x_describe_unknown_playing_err> <state_playing>
+    | <x_describe_unknown_playing_closed>
+    | <x_get_parameter_playing> <state_playing>
+    | <x_get_parameter_playing_redirect> <state_init>
+    | <x_get_parameter_playing_closed>
+    | <x_blocksize_playing> <state_playing>
+    | <x_blocksize_playing_redirect> <state_init>
+    | <x_blocksize_playing_closed>
+    | <x_blocksize_session_playing> <state_playing>
+    | <x_blocksize_session_playing_redirect> <state_init>
+    | <x_blocksize_session_playing_closed>
+    | <x_set_parameter_playing> <state_playing>
+    | <x_set_parameter_playing_redirect> <state_init>
+    | <x_set_parameter_playing_closed>
+    | <x_announce_playing> <state_playing>
+    | <x_announce_playing_redirect> <state_init>
+    | <x_announce_playing_closed>
+    | <x_announce_publish_playing> <state_playing>
+    | <x_announce_publish_playing_redirect> <state_init>
+    | <x_announce_publish_playing_closed>
+    | <x_extension_playing> <state_playing>
+    | <x_extension_playing_redirect> <state_init>
+    | <x_extension_playing_closed>
+    | <x_version_playing> <state_playing>
+    | <x_version_playing_redirect> <state_init>
+    | <x_version_playing_closed>
+    | <x_auth_playing> <state_playing>
+    | <x_auth_playing_redirect> <state_init>
+    | <x_auth_playing_closed>
+    | <x_auth_wrong_playing> <state_playing>
+    | <x_auth_wrong_playing_redirect> <state_init>
+    | <x_auth_wrong_playing_closed>
+    | <x_options_close_playing> <state_closing>
+    | <x_options_close_playing_closed>
+    | <x_pause_playing_ok> <state_ready>
+    | <x_pause_playing_redirect> <state_init>
+    | <x_pause_playing_err> <state_playing>
+    | <x_pause_playing_closed>
+    | <x_play_playing_ok> <state_playing>
+    | <x_play_playing_redirect> <state_init>
+    | <x_play_playing_err> <state_playing>
+    | <x_play_playing_closed>
+    | <x_setup_playing_ok> <state_playing>
+    | <x_setup_playing_redirect> <state_init>
+    | <x_setup_playing_err> <state_playing>
+    | <x_setup_playing_closed>
+    | <x_setup_narrow_playing_ok> <state_playing>
+    | <x_setup_narrow_playing_redirect> <state_init>
+    | <x_setup_narrow_playing_err> <state_playing>
+    | <x_setup_narrow_playing_closed>
+    | <x_teardown_playing_ok> <state_init>
+    | <x_teardown_playing_redirect> <state_init>
+    | <x_teardown_playing_err> <state_playing>
+    | <x_teardown_playing_closed>
+    | <x_record_playing> <state_playing>
+    | <x_record_playing_redirect> <state_init>
+    | <x_record_playing_closed>
+    | <x_teardown_stream_playing> <state_playing>
+    | <x_teardown_stream_playing_redirect> <state_init>
+    | <x_teardown_stream_playing_closed>
+    | <x_playing_options_playing_silent> <state_playing>
+    | <x_playing_options_headers_playing_silent> <state_playing>
+    | <x_playing_describe_playing_silent> <state_playing>
+    | <x_playing_describe_conditional_playing_silent> <state_playing>
+    | <x_playing_play_unknown_session_playing_silent> <state_playing>
+    | <x_playing_pause_unknown_session_playing_silent> <state_playing>
+    | <x_playing_record_unknown_session_playing_silent> <state_playing>
+    | <x_playing_teardown_unknown_session_playing_silent> <state_playing>
+    | <x_playing_get_parameter_unknown_session_playing_silent> <state_playing>
+    | <x_playing_set_parameter_unknown_session_playing_silent> <state_playing>
+    | <x_playing_describe_session_playing_silent> <state_playing>
+    | <x_playing_announce_session_playing_silent> <state_playing>
+    | <x_playing_setup_full_session_playing_silent> <state_playing>
+    | <x_playing_describe_unknown_playing_silent> <state_playing>
+    | <x_playing_get_parameter_playing_silent> <state_playing>
+    | <x_playing_blocksize_playing_silent> <state_playing>
+    | <x_playing_blocksize_session_playing_silent> <state_playing>
+    | <x_playing_set_parameter_playing_silent> <state_playing>
+    | <x_playing_announce_playing_silent> <state_playing>
+    | <x_playing_announce_publish_playing_silent> <state_playing>
+    | <x_playing_extension_playing_silent> <state_playing>
+    | <x_playing_version_playing_silent> <state_playing>
+    | <x_playing_auth_playing_silent> <state_playing>
+    | <x_playing_auth_wrong_playing_silent> <state_playing>
+    | <x_playing_options_close_playing_silent> <state_playing>
+    | <x_playing_pause_silent> <state_playing>
+    | <x_playing_play_playing_silent> <state_playing>
+    | <x_playing_setup_change_playing_silent> <state_playing>
+    | <x_playing_setup_change_narrow_playing_silent> <state_playing>
+    | <x_playing_teardown_playing_silent> <state_playing>
+    | <x_playing_record_playing_silent> <state_playing>
+    | <x_playing_teardown_stream_playing_silent> <state_playing>
+    | <x_frame> <state_playing>
+    | <x_frame_up> <state_playing>
+    | <x_play_queued_start> <play_queued_outcome>
+    | <x_server_request> <state_playing>
+    | <x_server_redirect> <state_init>
+    | <x_closed>
+    | <x_late_reply> <state_playing>
+    | <end_of_session>)
+
+# Recording: RECORD reply received
+<state_recording> ::= (<x_options_recording> <state_recording>
+    | <x_options_recording_redirect> <state_init>
+    | <x_options_recording_closed>
+    | <x_options_headers_recording> <state_recording>
+    | <x_options_headers_recording_redirect> <state_init>
+    | <x_options_headers_recording_closed>
+    | <x_describe_recording> <state_recording>
+    | <x_describe_recording_redirect> <state_init>
+    | <x_describe_recording_closed>
+    | <x_describe_conditional_recording> <state_recording>
+    | <x_describe_conditional_recording_redirect> <state_init>
+    | <x_describe_conditional_recording_closed>
+    | <x_play_unknown_session_recording_ok> <state_recording>
+    | <x_play_unknown_session_recording_redirect> <state_init>
+    | <x_play_unknown_session_recording_err> <state_recording>
+    | <x_play_unknown_session_recording_closed>
+    | <x_pause_unknown_session_recording_ok> <state_recording>
+    | <x_pause_unknown_session_recording_redirect> <state_init>
+    | <x_pause_unknown_session_recording_err> <state_recording>
+    | <x_pause_unknown_session_recording_closed>
+    | <x_record_unknown_session_recording_ok> <state_recording>
+    | <x_record_unknown_session_recording_redirect> <state_init>
+    | <x_record_unknown_session_recording_err> <state_recording>
+    | <x_record_unknown_session_recording_closed>
+    | <x_teardown_unknown_session_recording_ok> <state_recording>
+    | <x_teardown_unknown_session_recording_redirect> <state_init>
+    | <x_teardown_unknown_session_recording_err> <state_recording>
+    | <x_teardown_unknown_session_recording_closed>
+    | <x_get_parameter_unknown_session_recording_ok> <state_recording>
+    | <x_get_parameter_unknown_session_recording_redirect> <state_init>
+    | <x_get_parameter_unknown_session_recording_err> <state_recording>
+    | <x_get_parameter_unknown_session_recording_closed>
+    | <x_set_parameter_unknown_session_recording_ok> <state_recording>
+    | <x_set_parameter_unknown_session_recording_redirect> <state_init>
+    | <x_set_parameter_unknown_session_recording_err> <state_recording>
+    | <x_set_parameter_unknown_session_recording_closed>
+    | <x_describe_session_recording> <state_recording>
+    | <x_describe_session_recording_redirect> <state_init>
+    | <x_describe_session_recording_closed>
+    | <x_announce_session_recording> <state_recording>
+    | <x_announce_session_recording_redirect> <state_init>
+    | <x_announce_session_recording_closed>
+    | <x_setup_full_session_recording_ok> <state_recording>
+    | <x_setup_full_session_recording_redirect> <state_init>
+    | <x_setup_full_session_recording_err> <state_recording>
+    | <x_setup_full_session_recording_closed>
+    | <x_describe_unknown_recording_ok> <state_recording>
+    | <x_describe_unknown_recording_redirect> <state_init>
+    | <x_describe_unknown_recording_err> <state_recording>
+    | <x_describe_unknown_recording_closed>
+    | <x_get_parameter_recording> <state_recording>
+    | <x_get_parameter_recording_redirect> <state_init>
+    | <x_get_parameter_recording_closed>
+    | <x_blocksize_recording> <state_recording>
+    | <x_blocksize_recording_redirect> <state_init>
+    | <x_blocksize_recording_closed>
+    | <x_blocksize_session_recording> <state_recording>
+    | <x_blocksize_session_recording_redirect> <state_init>
+    | <x_blocksize_session_recording_closed>
+    | <x_set_parameter_recording> <state_recording>
+    | <x_set_parameter_recording_redirect> <state_init>
+    | <x_set_parameter_recording_closed>
+    | <x_announce_recording> <state_recording>
+    | <x_announce_recording_redirect> <state_init>
+    | <x_announce_recording_closed>
+    | <x_announce_publish_recording> <state_recording>
+    | <x_announce_publish_recording_redirect> <state_init>
+    | <x_announce_publish_recording_closed>
+    | <x_extension_recording> <state_recording>
+    | <x_extension_recording_redirect> <state_init>
+    | <x_extension_recording_closed>
+    | <x_version_recording> <state_recording>
+    | <x_version_recording_redirect> <state_init>
+    | <x_version_recording_closed>
+    | <x_auth_recording> <state_recording>
+    | <x_auth_recording_redirect> <state_init>
+    | <x_auth_recording_closed>
+    | <x_auth_wrong_recording> <state_recording>
+    | <x_auth_wrong_recording_redirect> <state_init>
+    | <x_auth_wrong_recording_closed>
+    | <x_options_close_recording> <state_closing>
+    | <x_options_close_recording_closed>
+    | <x_pause_recording_ok> <state_ready>
+    | <x_pause_recording_redirect> <state_init>
+    | <x_pause_recording_err> <state_recording>
+    | <x_pause_recording_closed>
+    | <x_record_recording_ok> <state_recording>
+    | <x_record_recording_redirect> <state_init>
+    | <x_record_recording_err> <state_recording>
+    | <x_record_recording_closed>
+    | <x_setup_recording_ok> <state_recording>
+    | <x_setup_recording_redirect> <state_init>
+    | <x_setup_recording_err> <state_recording>
+    | <x_setup_recording_closed>
+    | <x_setup_narrow_recording_ok> <state_recording>
+    | <x_setup_narrow_recording_redirect> <state_init>
+    | <x_setup_narrow_recording_err> <state_recording>
+    | <x_setup_narrow_recording_closed>
+    | <x_teardown_recording_ok> <state_init>
+    | <x_teardown_recording_redirect> <state_init>
+    | <x_teardown_recording_err> <state_recording>
+    | <x_teardown_recording_closed>
+    | <x_play_recording> <state_recording>
+    | <x_play_recording_redirect> <state_init>
+    | <x_play_recording_closed>
+    | <x_teardown_stream_recording> <state_recording>
+    | <x_teardown_stream_recording_redirect> <state_init>
+    | <x_teardown_stream_recording_closed>
+    | <x_recording_options_recording_silent> <state_recording>
+    | <x_recording_options_headers_recording_silent> <state_recording>
+    | <x_recording_describe_recording_silent> <state_recording>
+    | <x_recording_describe_conditional_recording_silent> <state_recording>
+    | <x_recording_play_unknown_session_recording_silent> <state_recording>
+    | <x_recording_pause_unknown_session_recording_silent> <state_recording>
+    | <x_recording_record_unknown_session_recording_silent> <state_recording>
+    | <x_recording_teardown_unknown_session_recording_silent> <state_recording>
+    | <x_recording_get_parameter_unknown_session_recording_silent> <state_recording>
+    | <x_recording_set_parameter_unknown_session_recording_silent> <state_recording>
+    | <x_recording_describe_session_recording_silent> <state_recording>
+    | <x_recording_announce_session_recording_silent> <state_recording>
+    | <x_recording_setup_full_session_recording_silent> <state_recording>
+    | <x_recording_describe_unknown_recording_silent> <state_recording>
+    | <x_recording_get_parameter_recording_silent> <state_recording>
+    | <x_recording_blocksize_recording_silent> <state_recording>
+    | <x_recording_blocksize_session_recording_silent> <state_recording>
+    | <x_recording_set_parameter_recording_silent> <state_recording>
+    | <x_recording_announce_recording_silent> <state_recording>
+    | <x_recording_announce_publish_recording_silent> <state_recording>
+    | <x_recording_extension_recording_silent> <state_recording>
+    | <x_recording_version_recording_silent> <state_recording>
+    | <x_recording_auth_recording_silent> <state_recording>
+    | <x_recording_auth_wrong_recording_silent> <state_recording>
+    | <x_recording_options_close_recording_silent> <state_recording>
+    | <x_recording_pause_recording_silent> <state_recording>
+    | <x_recording_record_recording_silent> <state_recording>
+    | <x_recording_setup_change_recording_silent> <state_recording>
+    | <x_recording_setup_change_narrow_recording_silent> <state_recording>
+    | <x_recording_teardown_recording_silent> <state_recording>
+    | <x_recording_play_recording_silent> <state_recording>
+    | <x_recording_teardown_stream_recording_silent> <state_recording>
+    | <x_frame> <state_recording>
+    | <x_frame_up> <state_recording>
+    | <x_server_request> <state_recording>
+    | <x_server_redirect> <state_init>
+    | <x_closed>
+    | <x_late_reply> <state_recording>
+    | <end_of_session>)
+
+# Messages the server sends on its own initiative, accepted between two exchanges in every state
+<x_frame> ::= <Server:interleaved_frame>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<x_frame_up> ::= <Client:interleaved_frame_sent>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<x_closed> ::= <Server:server_closed>
+# A reply that arrives after the client's timer expired (9.2), marked by the party: accepted between two exchanges and inside an exchange before its reply
+<x_late_reply> ::= <Server:server_late_reply>
+
+# Timers (Fandango's built-in parties): one per reply the server may leave unsent; the timeout is the longest the client waits
+#   1: the reply to a PLAY the server queues behind the running PLAY (10.5)
+#   2: the close of the connection after a request with Connection: close (RFC 9112 9.6 is HTTP's; RTSP 12.10 only refers to it), which a server may leave out
+#   3: the reply to any request (9.2: requests are acknowledged, and the sender may resend after a timeout when there is none)
+<timer_start_1> ::= 'start: ' <timer_id_1> ' (' <timer_timeout_1> ')\n'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_cancel_1> ::= 'cancel: ' <timer_id_1> '\n'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_expired_1> ::= 'expired: ' <timer_id> '\n'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_id_1> ::= <timer_id> := '1'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_timeout_1> ::= <timer_timeout> := reply_wait(RTSP_WAIT)
+where forall <m> in <timer_expired_1>: <m>.<timer_id> == '1'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_start_2> ::= 'start: ' <timer_id_2> ' (' <timer_timeout_2> ')\n'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_cancel_2> ::= 'cancel: ' <timer_id_2> '\n'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_expired_2> ::= 'expired: ' <timer_id> '\n'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_id_2> ::= <timer_id> := '2'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_timeout_2> ::= <timer_timeout> := reply_wait(RTSP_CLOSE_WAIT)
+where forall <m> in <timer_expired_2>: <m>.<timer_id> == '2'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_start_3> ::= 'start: ' <timer_id_3> ' (' <timer_timeout_3> ')\n'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_cancel_3> ::= 'cancel: ' <timer_id_3> '\n'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_expired_3> ::= 'expired: ' <timer_id> '\n'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_id_3> ::= <timer_id> := '3'
+# Fandango timers (built-in TimerControl/TimerEvent parties)
+<timer_timeout_3> ::= <timer_timeout> := reply_wait(RTSP_REPLY_WAIT)
+where forall <m> in <timer_expired_3>: <m>.<timer_id> == '3'
+# The server closes the connection after a reply to a request with Connection: close
+<state_closing> ::= (<x_frame> <state_closing> | <TimerControl:timer_start_2> <x_frame>* (<x_closed> <TimerControl:timer_cancel_2> | <TimerEvent:timer_expired_2>))
+# TODO: RFC 2326 9 - one connection per transaction (nearest <end_of_session>): the next transaction of the same RTSP session runs on a new connection that carries the Session identifier over;
+#   a session of the test setup is one connection, so a second connection after the first one closed cannot be held. Connectionless operation is the TODO at <rtsp_scheme>.
+<end_of_session> ::= ''
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<server_closed> ::= '\x00closed\x00'
+
+# Exchanges: a request and the reply class that selects the next state (A.1: 2xx next state, 3xx Init, 4xx no change)
+<x_options_init> ::= <Client:req_options_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_init_closed> ::= <Client:req_options_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_headers_init> ::= <Client:req_options_headers_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_headers_init_closed> ::= <Client:req_options_headers_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_init> ::= <Client:req_describe_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_init_closed> ::= <Client:req_describe_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_conditional_init> ::= <Client:req_describe_conditional_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_conditional_init_closed> ::= <Client:req_describe_conditional_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_init_ok> ::= <Client:req_describe_unknown_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_init_redirect> ::= <Client:req_describe_unknown_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_init_err> ::= <Client:req_describe_unknown_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_init_closed> ::= <Client:req_describe_unknown_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_init> ::= <Client:req_get_parameter_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_init_closed> ::= <Client:req_get_parameter_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_init> ::= <Client:req_blocksize_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_init_closed> ::= <Client:req_blocksize_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_init> ::= <Client:req_set_parameter_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_init_closed> ::= <Client:req_set_parameter_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_init> ::= <Client:req_announce_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_init_closed> ::= <Client:req_announce_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_publish_init> ::= <Client:req_announce_publish_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_publish_init_closed> ::= <Client:req_announce_publish_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_extension_init> ::= <Client:req_extension_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_extension_init_closed> ::= <Client:req_extension_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_version_init> ::= <Client:req_version_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_version_init_closed> ::= <Client:req_version_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_init> ::= <Client:req_auth_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_init_closed> ::= <Client:req_auth_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_wrong_init> ::= <Client:req_auth_wrong_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_wrong_init_closed> ::= <Client:req_auth_wrong_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_close_init> ::= <Client:req_options_close_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_close_init_closed> ::= <Client:req_options_close_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_ready> ::= <Client:req_options_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_ready_redirect> ::= <Client:req_options_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_ready_closed> ::= <Client:req_options_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_headers_ready> ::= <Client:req_options_headers_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_headers_ready_redirect> ::= <Client:req_options_headers_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_headers_ready_closed> ::= <Client:req_options_headers_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_ready> ::= <Client:req_describe_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_ready_redirect> ::= <Client:req_describe_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_ready_closed> ::= <Client:req_describe_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_conditional_ready> ::= <Client:req_describe_conditional_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_conditional_ready_redirect> ::= <Client:req_describe_conditional_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_conditional_ready_closed> ::= <Client:req_describe_conditional_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_ready_ok> ::= <Client:req_play_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_ready_redirect> ::= <Client:req_play_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_ready_err> ::= <Client:req_play_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_ready_closed> ::= <Client:req_play_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_ready_ok> ::= <Client:req_pause_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_ready_redirect> ::= <Client:req_pause_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_ready_err> ::= <Client:req_pause_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_ready_closed> ::= <Client:req_pause_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_ready_ok> ::= <Client:req_record_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_ready_redirect> ::= <Client:req_record_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_ready_err> ::= <Client:req_record_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_ready_closed> ::= <Client:req_record_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_ready_ok> ::= <Client:req_teardown_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_ready_redirect> ::= <Client:req_teardown_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_ready_err> ::= <Client:req_teardown_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_ready_closed> ::= <Client:req_teardown_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_ready_ok> ::= <Client:req_get_parameter_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_ready_redirect> ::= <Client:req_get_parameter_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_ready_err> ::= <Client:req_get_parameter_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_ready_closed> ::= <Client:req_get_parameter_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_ready_ok> ::= <Client:req_set_parameter_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_ready_redirect> ::= <Client:req_set_parameter_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_ready_err> ::= <Client:req_set_parameter_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_ready_closed> ::= <Client:req_set_parameter_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_session_ready> ::= <Client:req_describe_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_session_ready_redirect> ::= <Client:req_describe_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_session_ready_closed> ::= <Client:req_describe_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_session_ready> ::= <Client:req_announce_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_session_ready_redirect> ::= <Client:req_announce_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_session_ready_closed> ::= <Client:req_announce_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_session_ready_ok> ::= <Client:req_setup_full_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_session_ready_redirect> ::= <Client:req_setup_full_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_session_ready_err> ::= <Client:req_setup_full_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_session_ready_closed> ::= <Client:req_setup_full_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_ready_ok> ::= <Client:req_describe_unknown_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_ready_redirect> ::= <Client:req_describe_unknown_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_ready_err> ::= <Client:req_describe_unknown_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_ready_closed> ::= <Client:req_describe_unknown_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_ready> ::= <Client:req_get_parameter_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_ready_redirect> ::= <Client:req_get_parameter_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_ready_closed> ::= <Client:req_get_parameter_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_ready> ::= <Client:req_blocksize_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_ready_redirect> ::= <Client:req_blocksize_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_ready_closed> ::= <Client:req_blocksize_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_session_ready> ::= <Client:req_blocksize_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_session_ready_redirect> ::= <Client:req_blocksize_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_session_ready_closed> ::= <Client:req_blocksize_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_ready> ::= <Client:req_set_parameter_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_ready_redirect> ::= <Client:req_set_parameter_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_ready_closed> ::= <Client:req_set_parameter_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_ready> ::= <Client:req_announce_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_ready_redirect> ::= <Client:req_announce_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_ready_closed> ::= <Client:req_announce_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_publish_ready> ::= <Client:req_announce_publish_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_publish_ready_redirect> ::= <Client:req_announce_publish_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_publish_ready_closed> ::= <Client:req_announce_publish_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_extension_ready> ::= <Client:req_extension_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_extension_ready_redirect> ::= <Client:req_extension_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_extension_ready_closed> ::= <Client:req_extension_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_version_ready> ::= <Client:req_version_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_version_ready_redirect> ::= <Client:req_version_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_version_ready_closed> ::= <Client:req_version_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_ready> ::= <Client:req_auth_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_ready_redirect> ::= <Client:req_auth_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_ready_closed> ::= <Client:req_auth_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_wrong_ready> ::= <Client:req_auth_wrong_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_wrong_ready_redirect> ::= <Client:req_auth_wrong_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_wrong_ready_closed> ::= <Client:req_auth_wrong_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_close_ready> ::= <Client:req_options_close_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_close_ready_closed> ::= <Client:req_options_close_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_playing> ::= <Client:req_options_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_playing_redirect> ::= <Client:req_options_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_playing_closed> ::= <Client:req_options_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_headers_playing> ::= <Client:req_options_headers_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_headers_playing_redirect> ::= <Client:req_options_headers_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_headers_playing_closed> ::= <Client:req_options_headers_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_playing> ::= <Client:req_describe_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_playing_redirect> ::= <Client:req_describe_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_playing_closed> ::= <Client:req_describe_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_conditional_playing> ::= <Client:req_describe_conditional_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_conditional_playing_redirect> ::= <Client:req_describe_conditional_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_conditional_playing_closed> ::= <Client:req_describe_conditional_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_playing_ok> ::= <Client:req_play_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_playing_redirect> ::= <Client:req_play_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_playing_err> ::= <Client:req_play_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_playing_closed> ::= <Client:req_play_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_playing_ok> ::= <Client:req_pause_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_playing_redirect> ::= <Client:req_pause_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_playing_err> ::= <Client:req_pause_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_playing_closed> ::= <Client:req_pause_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_playing_ok> ::= <Client:req_record_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_playing_redirect> ::= <Client:req_record_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_playing_err> ::= <Client:req_record_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_playing_closed> ::= <Client:req_record_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_playing_ok> ::= <Client:req_teardown_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_playing_redirect> ::= <Client:req_teardown_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_playing_err> ::= <Client:req_teardown_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_playing_closed> ::= <Client:req_teardown_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_playing_ok> ::= <Client:req_get_parameter_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_playing_redirect> ::= <Client:req_get_parameter_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_playing_err> ::= <Client:req_get_parameter_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_playing_closed> ::= <Client:req_get_parameter_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_playing_ok> ::= <Client:req_set_parameter_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_playing_redirect> ::= <Client:req_set_parameter_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_playing_err> ::= <Client:req_set_parameter_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_playing_closed> ::= <Client:req_set_parameter_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_session_playing> ::= <Client:req_describe_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_session_playing_redirect> ::= <Client:req_describe_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_session_playing_closed> ::= <Client:req_describe_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_session_playing> ::= <Client:req_announce_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_session_playing_redirect> ::= <Client:req_announce_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_session_playing_closed> ::= <Client:req_announce_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_session_playing_ok> ::= <Client:req_setup_full_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_session_playing_redirect> ::= <Client:req_setup_full_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_session_playing_err> ::= <Client:req_setup_full_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_session_playing_closed> ::= <Client:req_setup_full_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_playing_ok> ::= <Client:req_describe_unknown_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_playing_redirect> ::= <Client:req_describe_unknown_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_playing_err> ::= <Client:req_describe_unknown_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_playing_closed> ::= <Client:req_describe_unknown_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_playing> ::= <Client:req_get_parameter_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_playing_redirect> ::= <Client:req_get_parameter_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_playing_closed> ::= <Client:req_get_parameter_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_playing> ::= <Client:req_blocksize_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_playing_redirect> ::= <Client:req_blocksize_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_playing_closed> ::= <Client:req_blocksize_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_session_playing> ::= <Client:req_blocksize_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_session_playing_redirect> ::= <Client:req_blocksize_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_session_playing_closed> ::= <Client:req_blocksize_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_playing> ::= <Client:req_set_parameter_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_playing_redirect> ::= <Client:req_set_parameter_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_playing_closed> ::= <Client:req_set_parameter_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_playing> ::= <Client:req_announce_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_playing_redirect> ::= <Client:req_announce_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_playing_closed> ::= <Client:req_announce_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_publish_playing> ::= <Client:req_announce_publish_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_publish_playing_redirect> ::= <Client:req_announce_publish_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_publish_playing_closed> ::= <Client:req_announce_publish_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_extension_playing> ::= <Client:req_extension_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_extension_playing_redirect> ::= <Client:req_extension_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_extension_playing_closed> ::= <Client:req_extension_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_version_playing> ::= <Client:req_version_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_version_playing_redirect> ::= <Client:req_version_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_version_playing_closed> ::= <Client:req_version_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_playing> ::= <Client:req_auth_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_playing_redirect> ::= <Client:req_auth_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_playing_closed> ::= <Client:req_auth_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_wrong_playing> ::= <Client:req_auth_wrong_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_wrong_playing_redirect> ::= <Client:req_auth_wrong_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_wrong_playing_closed> ::= <Client:req_auth_wrong_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_close_playing> ::= <Client:req_options_close_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_close_playing_closed> ::= <Client:req_options_close_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_recording> ::= <Client:req_options_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_recording_redirect> ::= <Client:req_options_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_recording_closed> ::= <Client:req_options_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_headers_recording> ::= <Client:req_options_headers_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_headers_recording_redirect> ::= <Client:req_options_headers_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_headers_recording_closed> ::= <Client:req_options_headers_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_recording> ::= <Client:req_describe_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_recording_redirect> ::= <Client:req_describe_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_recording_closed> ::= <Client:req_describe_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_conditional_recording> ::= <Client:req_describe_conditional_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_conditional_recording_redirect> ::= <Client:req_describe_conditional_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_conditional_recording_closed> ::= <Client:req_describe_conditional_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_recording_ok> ::= <Client:req_play_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_recording_redirect> ::= <Client:req_play_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_recording_err> ::= <Client:req_play_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_recording_closed> ::= <Client:req_play_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_recording_ok> ::= <Client:req_pause_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_recording_redirect> ::= <Client:req_pause_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_recording_err> ::= <Client:req_pause_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_recording_closed> ::= <Client:req_pause_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_recording_ok> ::= <Client:req_record_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_recording_redirect> ::= <Client:req_record_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_recording_err> ::= <Client:req_record_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_recording_closed> ::= <Client:req_record_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_recording_ok> ::= <Client:req_teardown_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_recording_redirect> ::= <Client:req_teardown_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_recording_err> ::= <Client:req_teardown_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_recording_closed> ::= <Client:req_teardown_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_recording_ok> ::= <Client:req_get_parameter_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_recording_redirect> ::= <Client:req_get_parameter_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_recording_err> ::= <Client:req_get_parameter_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_recording_closed> ::= <Client:req_get_parameter_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_recording_ok> ::= <Client:req_set_parameter_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_recording_redirect> ::= <Client:req_set_parameter_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_recording_err> ::= <Client:req_set_parameter_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_recording_closed> ::= <Client:req_set_parameter_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_session_recording> ::= <Client:req_describe_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_session_recording_redirect> ::= <Client:req_describe_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_session_recording_closed> ::= <Client:req_describe_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_session_recording> ::= <Client:req_announce_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_session_recording_redirect> ::= <Client:req_announce_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_session_recording_closed> ::= <Client:req_announce_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_session_recording_ok> ::= <Client:req_setup_full_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_session_recording_redirect> ::= <Client:req_setup_full_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_session_recording_err> ::= <Client:req_setup_full_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_session_recording_closed> ::= <Client:req_setup_full_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_recording_ok> ::= <Client:req_describe_unknown_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_recording_redirect> ::= <Client:req_describe_unknown_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_recording_err> ::= <Client:req_describe_unknown_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_describe_unknown_recording_closed> ::= <Client:req_describe_unknown_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_recording> ::= <Client:req_get_parameter_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_recording_redirect> ::= <Client:req_get_parameter_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_recording_closed> ::= <Client:req_get_parameter_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_recording> ::= <Client:req_blocksize_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_recording_redirect> ::= <Client:req_blocksize_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_recording_closed> ::= <Client:req_blocksize_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_session_recording> ::= <Client:req_blocksize_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_session_recording_redirect> ::= <Client:req_blocksize_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_blocksize_session_recording_closed> ::= <Client:req_blocksize_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_recording> ::= <Client:req_set_parameter_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_recording_redirect> ::= <Client:req_set_parameter_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_recording_closed> ::= <Client:req_set_parameter_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_recording> ::= <Client:req_announce_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_recording_redirect> ::= <Client:req_announce_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_recording_closed> ::= <Client:req_announce_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_publish_recording> ::= <Client:req_announce_publish_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_publish_recording_redirect> ::= <Client:req_announce_publish_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_announce_publish_recording_closed> ::= <Client:req_announce_publish_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_extension_recording> ::= <Client:req_extension_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_extension_recording_redirect> ::= <Client:req_extension_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_extension_recording_closed> ::= <Client:req_extension_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_version_recording> ::= <Client:req_version_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_version_recording_redirect> ::= <Client:req_version_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_version_recording_closed> ::= <Client:req_version_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_recording> ::= <Client:req_auth_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_recording_redirect> ::= <Client:req_auth_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_recording_closed> ::= <Client:req_auth_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_wrong_recording> ::= <Client:req_auth_wrong_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_wrong_recording_redirect> ::= <Client:req_auth_wrong_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_auth_wrong_recording_closed> ::= <Client:req_auth_wrong_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_close_recording> ::= <Client:req_options_close_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_any_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_options_close_recording_closed> ::= <Client:req_options_close_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_init_ok> ::= <Client:req_setup> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_init_redirect> ::= <Client:req_setup> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_init_err> ::= <Client:req_setup> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_init_closed> ::= <Client:req_setup> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_record_init_ok> ::= <Client:req_setup_record> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_record_init_redirect> ::= <Client:req_setup_record> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_record_init_err> ::= <Client:req_setup_record> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_record_init_closed> ::= <Client:req_setup_record> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_init_ok> ::= <Client:req_setup_full> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_init_redirect> ::= <Client:req_setup_full> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_init_err> ::= <Client:req_setup_full> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_full_init_closed> ::= <Client:req_setup_full> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_init_ok> ::= <Client:req_teardown_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_init_redirect> ::= <Client:req_teardown_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_init_err> ::= <Client:req_teardown_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_init_closed> ::= <Client:req_teardown_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_without_setup_init_ok> ::= <Client:req_play_without_setup> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_without_setup_init_redirect> ::= <Client:req_play_without_setup> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_without_setup_init_err> ::= <Client:req_play_without_setup> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_without_setup_init_closed> ::= <Client:req_play_without_setup> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_init_ok> ::= <Client:req_play_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_init_redirect> ::= <Client:req_play_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_init_err> ::= <Client:req_play_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_unknown_session_init_closed> ::= <Client:req_play_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_init_ok> ::= <Client:req_pause_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_init_redirect> ::= <Client:req_pause_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_init_err> ::= <Client:req_pause_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_unknown_session_init_closed> ::= <Client:req_pause_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_init_ok> ::= <Client:req_record_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_init_redirect> ::= <Client:req_record_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_init_err> ::= <Client:req_record_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_unknown_session_init_closed> ::= <Client:req_record_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_init_ok> ::= <Client:req_teardown_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_init_redirect> ::= <Client:req_teardown_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_init_err> ::= <Client:req_teardown_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_unknown_session_init_closed> ::= <Client:req_teardown_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_init_ok> ::= <Client:req_get_parameter_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_init_redirect> ::= <Client:req_get_parameter_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_init_err> ::= <Client:req_get_parameter_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_get_parameter_unknown_session_init_closed> ::= <Client:req_get_parameter_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_init_ok> ::= <Client:req_set_parameter_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_init_redirect> ::= <Client:req_set_parameter_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_init_err> ::= <Client:req_set_parameter_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_set_parameter_unknown_session_init_closed> ::= <Client:req_set_parameter_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_ready_ok> ::= <Client:req_play> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_ready_redirect> ::= <Client:req_play> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_ready_err> ::= <Client:req_play> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_ready_closed> ::= <Client:req_play> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_ready_ok> ::= <Client:req_record> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_ready_redirect> ::= <Client:req_record> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_ready_err> ::= <Client:req_record> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_ready_closed> ::= <Client:req_record> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_ready_ok> ::= <Client:req_setup_again> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_ready_redirect> ::= <Client:req_setup_again> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_ready_err> ::= <Client:req_setup_again> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_ready_closed> ::= <Client:req_setup_again> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_record_ready_ok> ::= <Client:req_setup_record_again> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_record_ready_redirect> ::= <Client:req_setup_record_again> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_record_ready_err> ::= <Client:req_setup_record_again> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_record_ready_closed> ::= <Client:req_setup_record_again> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_second_ready_ok> ::= <Client:req_setup_second_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_second_session> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_second_ready_redirect> ::= <Client:req_setup_second_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_second_ready_err> ::= <Client:req_setup_second_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_second_ready_closed> ::= <Client:req_setup_second_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_second_narrow_ready_ok> ::= <Client:req_setup_second_narrow> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_second_session> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_second_narrow_ready_redirect> ::= <Client:req_setup_second_narrow> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_second_narrow_ready_err> ::= <Client:req_setup_second_narrow> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_second_narrow_ready_closed> ::= <Client:req_setup_second_narrow> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_ready_ok> ::= <Client:req_teardown> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_ready_redirect> ::= <Client:req_teardown> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_ready_err> ::= <Client:req_teardown> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_ready_closed> ::= <Client:req_teardown> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_ready> ::= <Client:req_pause_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_ready_redirect> ::= <Client:req_pause_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_ready_closed> ::= <Client:req_pause_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_stream_ready> ::= <Client:req_teardown_stream_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_stream_ready_redirect> ::= <Client:req_teardown_stream_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_stream_ready_closed> ::= <Client:req_teardown_stream_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_queued_start> ::= <Client:req_play_queued_playing> <TimerControl:timer_start_1>
+# RFC 2326
+<play_queued_outcome> ::= (<Server:reply_2xx_media> <TimerControl:timer_cancel_1> <state_playing>
+    | <Server:reply_err_media> <TimerControl:timer_cancel_1> <state_playing>
+    | <Server:reply_3xx_media> <TimerControl:timer_cancel_1> <state_init>
+    | <x_frame>* (<x_closed> <TimerControl:timer_cancel_1> | <TimerEvent:timer_expired_1> <state_playing>))
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_playing_ok> ::= <Client:req_pause> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_playing_redirect> ::= <Client:req_pause> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_playing_err> ::= <Client:req_pause> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_playing_closed> ::= <Client:req_pause> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_playing_ok> ::= <Client:req_play_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_playing_redirect> ::= <Client:req_play_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_playing_err> ::= <Client:req_play_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_playing_closed> ::= <Client:req_play_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_playing_ok> ::= <Client:req_setup_change_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_playing_redirect> ::= <Client:req_setup_change_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_playing_err> ::= <Client:req_setup_change_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_playing_closed> ::= <Client:req_setup_change_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_narrow_playing_ok> ::= <Client:req_setup_change_narrow_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_narrow_playing_redirect> ::= <Client:req_setup_change_narrow_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_narrow_playing_err> ::= <Client:req_setup_change_narrow_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_narrow_playing_closed> ::= <Client:req_setup_change_narrow_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_playing_ok> ::= <Client:req_teardown_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_playing_redirect> ::= <Client:req_teardown_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_playing_err> ::= <Client:req_teardown_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_playing_closed> ::= <Client:req_teardown_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_playing> ::= <Client:req_record_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_playing_redirect> ::= <Client:req_record_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_playing_closed> ::= <Client:req_record_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_stream_playing> ::= <Client:req_teardown_stream_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_stream_playing_redirect> ::= <Client:req_teardown_stream_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_stream_playing_closed> ::= <Client:req_teardown_stream_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_recording_ok> ::= <Client:req_pause_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_recording_redirect> ::= <Client:req_pause_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_recording_err> ::= <Client:req_pause_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_pause_recording_closed> ::= <Client:req_pause_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_recording_ok> ::= <Client:req_record_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_recording_redirect> ::= <Client:req_record_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_recording_err> ::= <Client:req_record_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_record_recording_closed> ::= <Client:req_record_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_recording_ok> ::= <Client:req_setup_change_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_recording_redirect> ::= <Client:req_setup_change_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_recording_err> ::= <Client:req_setup_change_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_recording_closed> ::= <Client:req_setup_change_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_narrow_recording_ok> ::= <Client:req_setup_change_narrow_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_narrow_recording_redirect> ::= <Client:req_setup_change_narrow_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_narrow_recording_err> ::= <Client:req_setup_change_narrow_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_setup_narrow_recording_closed> ::= <Client:req_setup_change_narrow_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_recording_ok> ::= <Client:req_teardown_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_2xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_recording_redirect> ::= <Client:req_teardown_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_recording_err> ::= <Client:req_teardown_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_err_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_recording_closed> ::= <Client:req_teardown_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_recording> ::= <Client:req_play_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_recording_redirect> ::= <Client:req_play_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_play_recording_closed> ::= <Client:req_play_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_stream_recording> ::= <Client:req_teardown_stream_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_non_redirect_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_stream_recording_redirect> ::= <Client:req_teardown_stream_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <Server:reply_3xx_media> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_teardown_stream_recording_closed> ::= <Client:req_teardown_stream_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <x_closed> <TimerControl:timer_cancel_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_options_init_silent> ::= <Client:req_options_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_options_headers_init_silent> ::= <Client:req_options_headers_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_describe_init_silent> ::= <Client:req_describe_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_describe_conditional_init_silent> ::= <Client:req_describe_conditional_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_describe_unknown_init_silent> ::= <Client:req_describe_unknown_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_get_parameter_init_silent> ::= <Client:req_get_parameter_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_blocksize_init_silent> ::= <Client:req_blocksize_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_set_parameter_init_silent> ::= <Client:req_set_parameter_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_announce_init_silent> ::= <Client:req_announce_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_announce_publish_init_silent> ::= <Client:req_announce_publish_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_extension_init_silent> ::= <Client:req_extension_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_version_init_silent> ::= <Client:req_version_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_auth_init_silent> ::= <Client:req_auth_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_auth_wrong_init_silent> ::= <Client:req_auth_wrong_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_options_close_init_silent> ::= <Client:req_options_close_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_setup_silent> ::= <Client:req_setup> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_setup_record_silent> ::= <Client:req_setup_record> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_setup_full_silent> ::= <Client:req_setup_full> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_teardown_init_silent> ::= <Client:req_teardown_init> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_play_without_setup_silent> ::= <Client:req_play_without_setup> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_play_unknown_session_silent> ::= <Client:req_play_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_pause_unknown_session_silent> ::= <Client:req_pause_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_record_unknown_session_silent> ::= <Client:req_record_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_teardown_unknown_session_silent> ::= <Client:req_teardown_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_get_parameter_unknown_session_silent> ::= <Client:req_get_parameter_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_init_set_parameter_unknown_session_silent> ::= <Client:req_set_parameter_unknown_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_options_ready_silent> ::= <Client:req_options_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_options_headers_ready_silent> ::= <Client:req_options_headers_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_describe_ready_silent> ::= <Client:req_describe_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_describe_conditional_ready_silent> ::= <Client:req_describe_conditional_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_play_unknown_session_ready_silent> ::= <Client:req_play_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_pause_unknown_session_ready_silent> ::= <Client:req_pause_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_record_unknown_session_ready_silent> ::= <Client:req_record_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_teardown_unknown_session_ready_silent> ::= <Client:req_teardown_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_get_parameter_unknown_session_ready_silent> ::= <Client:req_get_parameter_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_set_parameter_unknown_session_ready_silent> ::= <Client:req_set_parameter_unknown_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_describe_session_ready_silent> ::= <Client:req_describe_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_announce_session_ready_silent> ::= <Client:req_announce_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_setup_full_session_ready_silent> ::= <Client:req_setup_full_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_describe_unknown_ready_silent> ::= <Client:req_describe_unknown_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_get_parameter_ready_silent> ::= <Client:req_get_parameter_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_blocksize_ready_silent> ::= <Client:req_blocksize_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_blocksize_session_ready_silent> ::= <Client:req_blocksize_session_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_set_parameter_ready_silent> ::= <Client:req_set_parameter_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_announce_ready_silent> ::= <Client:req_announce_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_announce_publish_ready_silent> ::= <Client:req_announce_publish_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_extension_ready_silent> ::= <Client:req_extension_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_version_ready_silent> ::= <Client:req_version_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_auth_ready_silent> ::= <Client:req_auth_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_auth_wrong_ready_silent> ::= <Client:req_auth_wrong_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_options_close_ready_silent> ::= <Client:req_options_close_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_play_silent> ::= <Client:req_play> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_record_silent> ::= <Client:req_record> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_setup_again_silent> ::= <Client:req_setup_again> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_setup_record_again_silent> ::= <Client:req_setup_record_again> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_setup_second_session_silent> ::= <Client:req_setup_second_session> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_setup_second_narrow_silent> ::= <Client:req_setup_second_narrow> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_teardown_silent> ::= <Client:req_teardown> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_pause_ready_silent> ::= <Client:req_pause_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_ready_teardown_stream_ready_silent> ::= <Client:req_teardown_stream_ready> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_options_playing_silent> ::= <Client:req_options_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_options_headers_playing_silent> ::= <Client:req_options_headers_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_describe_playing_silent> ::= <Client:req_describe_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_describe_conditional_playing_silent> ::= <Client:req_describe_conditional_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_play_unknown_session_playing_silent> ::= <Client:req_play_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_pause_unknown_session_playing_silent> ::= <Client:req_pause_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_record_unknown_session_playing_silent> ::= <Client:req_record_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_teardown_unknown_session_playing_silent> ::= <Client:req_teardown_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_get_parameter_unknown_session_playing_silent> ::= <Client:req_get_parameter_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_set_parameter_unknown_session_playing_silent> ::= <Client:req_set_parameter_unknown_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_describe_session_playing_silent> ::= <Client:req_describe_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_announce_session_playing_silent> ::= <Client:req_announce_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_setup_full_session_playing_silent> ::= <Client:req_setup_full_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_describe_unknown_playing_silent> ::= <Client:req_describe_unknown_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_get_parameter_playing_silent> ::= <Client:req_get_parameter_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_blocksize_playing_silent> ::= <Client:req_blocksize_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_blocksize_session_playing_silent> ::= <Client:req_blocksize_session_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_set_parameter_playing_silent> ::= <Client:req_set_parameter_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_announce_playing_silent> ::= <Client:req_announce_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_announce_publish_playing_silent> ::= <Client:req_announce_publish_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_extension_playing_silent> ::= <Client:req_extension_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_version_playing_silent> ::= <Client:req_version_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_auth_playing_silent> ::= <Client:req_auth_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_auth_wrong_playing_silent> ::= <Client:req_auth_wrong_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_options_close_playing_silent> ::= <Client:req_options_close_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_pause_silent> ::= <Client:req_pause> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_play_playing_silent> ::= <Client:req_play_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_setup_change_playing_silent> ::= <Client:req_setup_change_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_setup_change_narrow_playing_silent> ::= <Client:req_setup_change_narrow_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_teardown_playing_silent> ::= <Client:req_teardown_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_record_playing_silent> ::= <Client:req_record_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_playing_teardown_stream_playing_silent> ::= <Client:req_teardown_stream_playing> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_options_recording_silent> ::= <Client:req_options_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_options_headers_recording_silent> ::= <Client:req_options_headers_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_describe_recording_silent> ::= <Client:req_describe_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_describe_conditional_recording_silent> ::= <Client:req_describe_conditional_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_play_unknown_session_recording_silent> ::= <Client:req_play_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_pause_unknown_session_recording_silent> ::= <Client:req_pause_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_record_unknown_session_recording_silent> ::= <Client:req_record_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_teardown_unknown_session_recording_silent> ::= <Client:req_teardown_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_get_parameter_unknown_session_recording_silent> ::= <Client:req_get_parameter_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_set_parameter_unknown_session_recording_silent> ::= <Client:req_set_parameter_unknown_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_describe_session_recording_silent> ::= <Client:req_describe_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_announce_session_recording_silent> ::= <Client:req_announce_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_setup_full_session_recording_silent> ::= <Client:req_setup_full_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_describe_unknown_recording_silent> ::= <Client:req_describe_unknown_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_get_parameter_recording_silent> ::= <Client:req_get_parameter_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_blocksize_recording_silent> ::= <Client:req_blocksize_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_blocksize_session_recording_silent> ::= <Client:req_blocksize_session_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_set_parameter_recording_silent> ::= <Client:req_set_parameter_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_announce_recording_silent> ::= <Client:req_announce_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_announce_publish_recording_silent> ::= <Client:req_announce_publish_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_extension_recording_silent> ::= <Client:req_extension_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_version_recording_silent> ::= <Client:req_version_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_auth_recording_silent> ::= <Client:req_auth_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_auth_wrong_recording_silent> ::= <Client:req_auth_wrong_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_options_close_recording_silent> ::= <Client:req_options_close_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_pause_recording_silent> ::= <Client:req_pause_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_record_recording_silent> ::= <Client:req_record_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_setup_change_recording_silent> ::= <Client:req_setup_change_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_setup_change_narrow_recording_silent> ::= <Client:req_setup_change_narrow_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_teardown_recording_silent> ::= <Client:req_teardown_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_play_recording_silent> ::= <Client:req_play_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+# RFC 2326 A.1 Client State Machine (exchange: request and reply class)
+<x_recording_teardown_stream_recording_silent> ::= <Client:req_teardown_stream_recording> <TimerControl:timer_start_3> <x_late_reply>{0,2} <TimerEvent:timer_expired_3>
+
+# A reply may follow interim replies (7.1.1: 1xx) and, where media flows, interleaved frames (10.12) the server sends on its own initiative
+<reply_2xx> ::= <resp_1xx>* <resp_2xx>
+# RFC 2326 7.1.1 (1xx before the final reply), 10.12 (frames)
+<reply_3xx> ::= <resp_1xx>* <resp_3xx>
+# RFC 2326 7.1.1 (1xx before the final reply), 10.12 (frames)
+<reply_err> ::= <resp_1xx>* <resp_err>
+# RFC 2326 7.1.1 (1xx before the final reply), 10.12 (frames)
+<reply_any> ::= <resp_1xx>* <resp_any>
+# RFC 2326 7.1.1 (1xx before the final reply), 10.12 (frames)
+<reply_non_redirect> ::= <resp_1xx>* <resp_non_redirect>
+# RFC 2326 7.1.1 (1xx before the final reply), 10.12 (frames)
+<reply_2xx_second_session> ::= <resp_1xx>* <resp_2xx>
+# RFC 2326 7.1.1 (1xx before the final reply), 10.12 (frames)
+<reply_2xx_media> ::= <prelude_media>* <resp_2xx>
+# RFC 2326 7.1.1 (1xx before the final reply), 10.12 (frames)
+<reply_3xx_media> ::= <prelude_media>* <resp_3xx>
+# RFC 2326 7.1.1 (1xx before the final reply), 10.12 (frames)
+<reply_err_media> ::= <prelude_media>* <resp_err>
+# RFC 2326 7.1.1 (1xx before the final reply), 10.12 (frames)
+<reply_any_media> ::= <prelude_media>* <resp_any>
+# RFC 2326 7.1.1 (1xx before the final reply), 10.12 (frames)
+<reply_non_redirect_media> ::= <prelude_media>* <resp_non_redirect>
+# RFC 2326 7.1.1 (1xx before the final reply), 10.12 (frames)
+<prelude_media> ::= <resp_1xx> | <interleaved_frame>
+
+# Requests and replies the server starts on its own (Table 2: S->C); the reply each requires is the client's
+# TODO: RFC 2326 9.1 - pipelined requests (nearest <req_play>): a second request is sent before the reply to the first arrives, which depends on the time between messages;
+#   a reply that arrives while Fandango generates the second request is an unexpected message. A queued PLAY is modeled without pipelining (<x_play_queued_*>).
+# TODO: RFC 2326 11.3.5, 12.37 - session timeout (nearest <srv_options>): the idle timeout of a session lasts 60 s by default; the test setup has no clock beyond Fandango's timers, so a session is not left idle.
+<srv_options> ::= <method_options> ' ' <uri_options_received> ' ' <rtsp_version> <crlf> <resp_rest>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<srv_get_parameter> ::= <method_get_parameter> ' ' <absolute_uri_received> ' ' <rtsp_version> <crlf> <resp_rest>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<srv_set_parameter> ::= <method_set_parameter> ' ' <absolute_uri_received> ' ' <rtsp_version> <crlf> <resp_rest>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<srv_announce> ::= <method_announce> ' ' <absolute_uri_received> ' ' <rtsp_version> <crlf> <resp_rest>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<srv_extension> ::= <method_other_received> ' ' <absolute_uri_received> ' ' <rtsp_version> <crlf> <resp_rest>
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_other_received> ::= r"(?:[A](?:[N](?:[N](?:[O](?:[U](?:[N](?:[C](?:[E](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-TV-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[D](?:[E](?:[S](?:[C](?:[R](?:[I](?:[B](?:[E](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9AC-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-RT-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[G](?:[E](?:[T](?:[_](?:[P](?:[A](?:[R](?:[A](?:[M](?:[E](?:[T](?:[E](?:[R](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-QS-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-LN-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-OQ-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-Z\^`-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[O](?:[P](?:[T](?:[I](?:[O](?:[N](?:[S](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-RT-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-OQ-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[P](?:[A](?:[U](?:[S](?:[E](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-RT-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-TV-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[L](?:[A](?:[Y](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-XZ\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-KM-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[R](?:[E](?:[C](?:[O](?:[R](?:[D](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-CE-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[D](?:[I](?:[R](?:[E](?:[C](?:[T](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-SU-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABE-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[S](?:[E](?:[T](?:[U](?:[P](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-OQ-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[_](?:[P](?:[A](?:[R](?:[A](?:[M](?:[E](?:[T](?:[E](?:[R](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-QS-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-LN-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-OQ-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-TV-Z\^`-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[T](?:[E](?:[A](?:[R](?:[D](?:[O](?:[W](?:[N](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-MO-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-VX-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-CE-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9BCEFH-NQU-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)"
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<srv_redirect> ::= <method_redirect> ' ' <absolute_uri_received> ' ' <rtsp_version> <crlf> <resp_rest>
+# 6.1: Request-URI = "*" | absolute_URI; "*" is only for a method that applies to no resource (6.2, OPTIONS)
+<uri_options_received> ::= '*' | <absolute_uri_received>
+# RFC 2326
+<absolute_uri_received> ::= r'[A-Za-z][A-Za-z0-9+.-]*:[^\s]*'
+# The client's answer to a request of the server (D.1): positively or negatively. A method it does not support gets 501 (10, Notes on Table 2).
+<x_server_request> ::= (<x_server_options> | <x_server_get_parameter> | <x_server_set_parameter> | <x_server_announce> | <x_server_extension>)
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<x_server_options> ::= <Server:srv_options> <Client:cli_reply_options>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<x_server_get_parameter> ::= <Server:srv_get_parameter> <Client:cli_reply_get_parameter>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<x_server_set_parameter> ::= <Server:srv_set_parameter> <Client:cli_reply_set_parameter>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<x_server_announce> ::= <Server:srv_announce> <Client:cli_reply_announce>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<x_server_extension> ::= <Server:srv_extension> <Client:cli_reply_extension>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<x_server_redirect> ::= <Server:srv_redirect> <Client:cli_reply_redirect>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<cli_reply_options> ::= (<cli_reply_ok_options> | <cli_reply_error>)
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<cli_reply_get_parameter> ::= (<cli_reply_ok_get_parameter> | <cli_reply_error>)
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<cli_reply_set_parameter> ::= (<cli_reply_ok> | <cli_reply_error>)
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<cli_reply_announce> ::= (<cli_reply_ok> | <cli_reply_error>)
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<cli_reply_redirect> ::= (<cli_reply_ok> | <cli_reply_error>)
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<cli_reply_extension> ::= <cli_reply_501>
+# TODO: RFC 2326 7.1.1, 11 - replies of the client to a request of the server (nearest <cli_reply_error>): the status codes are drawn from the shared <code_*> and <code_extension_*> rules of the 4xx and 5xx classes;
+#   2xx codes other than 200 and the 3xx class are not sent (a client has nothing to redirect or to create); 401/407 carry a Basic challenge, 405 Allow, 551 Unsupported, as 7.1.1 and 12.40 require.
+<cli_reply_ok> ::= <rtsp_version_10> ' ' <code_200> ' OK' <crlf> <h_cseq_echo> <h_session_sent>? <cli_reply_headers> <crlf>
+# An OPTIONS reply names the methods the client supports (Public); a GET_PARAMETER reply carries the values asked for
+<cli_reply_ok_options> ::= <rtsp_version_10> ' ' <code_200> ' OK' <crlf> <h_cseq_echo> <h_session_sent>? <h_public_sent>? <cli_reply_headers> <crlf>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<cli_reply_ok_get_parameter> ::= <rtsp_version_10> ' ' <code_200> ' OK' <crlf> <h_cseq_echo> <h_session_sent>? <cli_reply_headers> (<crlf> | <parameter_assignment_content>)
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<cli_reply_error> ::= (<rtsp_version_10> ' ' <cli_status_plain> ' ' <reason_phrase_sent> <crlf> <h_cseq_echo> <h_session_sent>? <cli_reply_headers> <crlf>
+    | <rtsp_version_10> ' ' <code_401> ' ' <reason_phrase_sent> <crlf> <h_cseq_echo> <h_www_authenticate_sent> <cli_reply_headers> <crlf>
+    | <rtsp_version_10> ' ' <code_405> ' ' <reason_phrase_sent> <crlf> <h_cseq_echo> <h_allow_sent> <cli_reply_headers> <crlf>
+    | <rtsp_version_10> ' ' <code_407> ' ' <reason_phrase_sent> <crlf> <h_cseq_echo> <h_proxy_authenticate_sent> <cli_reply_headers> <crlf>
+    | <rtsp_version_10> ' ' <code_551> ' ' <reason_phrase_sent> <crlf> <h_cseq_echo> <h_unsupported_sent> <cli_reply_headers> <crlf>)
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<cli_reply_501> ::= <rtsp_version_10> ' ' <code_501> ' ' <reason_phrase_sent> <crlf> <h_cseq_echo> <h_session_sent>? <cli_reply_headers> <crlf>
+# every 4xx and 5xx code of the shared rules but the ones that need a header of their own (401, 405, 407, 551, above)
+<cli_status_plain> ::= (<code_400> | <code_402> | <code_403> | <code_404> | <code_406> | <code_408> | <code_410> | <code_411> | <code_412> | <code_413> | <code_414> | <code_415>
+    | <code_451> | <code_452> | <code_453> | <code_454> | <code_455> | <code_456> | <code_457> | <code_458> | <code_459> | <code_460> | <code_461> | <code_462>
+    | <code_500> | <code_501> | <code_502> | <code_503> | <code_504> | <code_505> | <code_extension_4xx> | <code_extension_5xx>)
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<reason_phrase_sent> ::= <reason_phrase> := 'Declined'
+# Header fields a response may carry besides the ones of the method (7.1.2, 12)
+<cli_reply_headers> ::= <h_date_sent>? <h_server_sent>? <h_extension_sent>? <h_connection_other_sent>?
+# RFC 2326
+<h_server_sent> ::= 'Server: ' <product> <crlf>
+# RFC 2326
+<h_public_sent> ::= 'Public: ' <public_methods> <crlf>
+# RFC 2326
+<h_allow_sent> ::= 'Allow: ' <public_methods> <crlf>
+# RFC 2326
+<public_methods> ::= <method_sent> (',' <ows> <method_sent>){0,3}
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_sent> ::= <token> := random.choice(['OPTIONS', 'GET_PARAMETER', 'SET_PARAMETER', 'ANNOUNCE', 'REDIRECT'])
+# RFC 2326
+<h_unsupported_sent> ::= 'Unsupported: ' <option_tag_list> <crlf>
+# RFC 2326
+<h_www_authenticate_sent> ::= 'WWW-Authenticate: ' <challenge_basic> <crlf>
+# RFC 2326
+<h_proxy_authenticate_sent> ::= 'Proxy-Authenticate: ' <challenge_basic> <crlf>
+# RFC 9110 11.3 Challenge and Response, 11.6.1, 11.7.1
+<challenge_basic> ::= 'Basic realm=' <quoted_string>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<h_cseq_echo> ::= 'CSeq: ' <cseq_echoed> <crlf>
+# RFC 2326 10 Table 2 (requests of the server), 10.12 (frames), 9 (connection)
+<cseq_echoed> ::= <cseq_value> := recall_cseq()
+
+# --------------------------------------------------------------------------------------------
+# Requests (6): Request-Line, headers, CRLF, body. Methods are case-sensitive (10).
+# --------------------------------------------------------------------------------------------
+<req_options_init> ::= <req_options>
+# RFC 2326 10.1 OPTIONS, 6.2 (Request-URI "*")
+<req_options_close_init> ::= <req_options_close>
+# RFC 2326 10.1 OPTIONS, 6.2 (Request-URI "*")
+<req_options_headers_init> ::= <req_options_headers>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_init> ::= <req_describe>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_conditional_init> ::= <req_describe_conditional>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_unknown_init> ::= <req_describe_unknown>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_get_parameter_init> ::= <req_get_parameter>
+# RFC 2326
+<req_blocksize_init> ::= <req_blocksize>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_set_parameter_init> ::= <req_set_parameter>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<req_announce_init> ::= <req_announce>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<req_announce_publish_init> ::= <req_announce_publish>
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<req_extension_init> ::= <req_extension>
+# RFC 2326 3.1, 6.1 RTSP-Version
+<req_version_init> ::= <req_version>
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
+<req_auth_init> ::= <req_auth>
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
+<req_auth_wrong_init> ::= <req_auth_wrong>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<req_announce_session_ready> ::= <req_announce_session>
+# RFC 2326 10.4 SETUP
+<req_setup_full_session_ready> ::= <req_setup_full_session>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_session_ready> ::= <req_describe_session>
+# RFC 2326 10.1 OPTIONS, 6.2 (Request-URI "*")
+<req_options_ready> ::= <req_options>
+# RFC 2326 10.1 OPTIONS, 6.2 (Request-URI "*")
+<req_options_close_ready> ::= <req_options_close>
+# RFC 2326 10.1 OPTIONS, 6.2 (Request-URI "*")
+<req_options_headers_ready> ::= <req_options_headers>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_ready> ::= <req_describe>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_conditional_ready> ::= <req_describe_conditional>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_unknown_ready> ::= <req_describe_unknown>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_get_parameter_ready> ::= <req_get_parameter>
+# RFC 2326
+<req_blocksize_ready> ::= <req_blocksize>
+# RFC 2326
+<req_blocksize_session_ready> ::= <req_blocksize_session>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_set_parameter_ready> ::= <req_set_parameter>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<req_announce_ready> ::= <req_announce>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<req_announce_publish_ready> ::= <req_announce_publish>
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<req_extension_ready> ::= <req_extension>
+# RFC 2326 3.1, 6.1 RTSP-Version
+<req_version_ready> ::= <req_version>
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
+<req_auth_ready> ::= <req_auth>
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
+<req_auth_wrong_ready> ::= <req_auth_wrong>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<req_announce_session_playing> ::= <req_announce_session>
+# RFC 2326 10.4 SETUP
+<req_setup_full_session_playing> ::= <req_setup_full_session>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_session_playing> ::= <req_describe_session>
+# RFC 2326 10.1 OPTIONS, 6.2 (Request-URI "*")
+<req_options_playing> ::= <req_options>
+# RFC 2326 10.1 OPTIONS, 6.2 (Request-URI "*")
+<req_options_close_playing> ::= <req_options_close>
+# RFC 2326 10.1 OPTIONS, 6.2 (Request-URI "*")
+<req_options_headers_playing> ::= <req_options_headers>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_playing> ::= <req_describe>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_conditional_playing> ::= <req_describe_conditional>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_unknown_playing> ::= <req_describe_unknown>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_get_parameter_playing> ::= <req_get_parameter>
+# RFC 2326
+<req_blocksize_playing> ::= <req_blocksize>
+# RFC 2326
+<req_blocksize_session_playing> ::= <req_blocksize_session>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_set_parameter_playing> ::= <req_set_parameter>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<req_announce_playing> ::= <req_announce>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<req_announce_publish_playing> ::= <req_announce_publish>
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<req_extension_playing> ::= <req_extension>
+# RFC 2326 3.1, 6.1 RTSP-Version
+<req_version_playing> ::= <req_version>
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
+<req_auth_playing> ::= <req_auth>
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
+<req_auth_wrong_playing> ::= <req_auth_wrong>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<req_announce_session_recording> ::= <req_announce_session>
+# RFC 2326 10.4 SETUP
+<req_setup_full_session_recording> ::= <req_setup_full_session>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_session_recording> ::= <req_describe_session>
+# RFC 2326 10.1 OPTIONS, 6.2 (Request-URI "*")
+<req_options_recording> ::= <req_options>
+# RFC 2326 10.1 OPTIONS, 6.2 (Request-URI "*")
+<req_options_close_recording> ::= <req_options_close>
+# RFC 2326 10.1 OPTIONS, 6.2 (Request-URI "*")
+<req_options_headers_recording> ::= <req_options_headers>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_recording> ::= <req_describe>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_conditional_recording> ::= <req_describe_conditional>
+# RFC 2326 10.2 DESCRIBE
+<req_describe_unknown_recording> ::= <req_describe_unknown>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_get_parameter_recording> ::= <req_get_parameter>
+# RFC 2326
+<req_blocksize_recording> ::= <req_blocksize>
+# RFC 2326
+<req_blocksize_session_recording> ::= <req_blocksize_session>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_set_parameter_recording> ::= <req_set_parameter>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<req_announce_recording> ::= <req_announce>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<req_announce_publish_recording> ::= <req_announce_publish>
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<req_extension_recording> ::= <req_extension>
+# RFC 2326 3.1, 6.1 RTSP-Version
+<req_version_recording> ::= <req_version>
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
+<req_auth_recording> ::= <req_auth>
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
+<req_auth_wrong_recording> ::= <req_auth_wrong>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_play_unknown_session_ready> ::= <req_play_unknown_session>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_pause_unknown_session_ready> ::= <req_pause_unknown_session>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_record_unknown_session_ready> ::= <req_record_unknown_session>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_teardown_unknown_session_ready> ::= <req_teardown_unknown_session>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_get_parameter_unknown_session_ready> ::= <req_get_parameter_unknown_session>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_set_parameter_unknown_session_ready> ::= <req_set_parameter_unknown_session>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_play_unknown_session_playing> ::= <req_play_unknown_session>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_pause_unknown_session_playing> ::= <req_pause_unknown_session>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_record_unknown_session_playing> ::= <req_record_unknown_session>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_teardown_unknown_session_playing> ::= <req_teardown_unknown_session>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_get_parameter_unknown_session_playing> ::= <req_get_parameter_unknown_session>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_set_parameter_unknown_session_playing> ::= <req_set_parameter_unknown_session>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_play_unknown_session_recording> ::= <req_play_unknown_session>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_pause_unknown_session_recording> ::= <req_pause_unknown_session>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_record_unknown_session_recording> ::= <req_record_unknown_session>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_teardown_unknown_session_recording> ::= <req_teardown_unknown_session>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_get_parameter_unknown_session_recording> ::= <req_get_parameter_unknown_session>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_set_parameter_unknown_session_recording> ::= <req_set_parameter_unknown_session>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_teardown_stream_ready> ::= <req_teardown_stream>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_teardown_stream_playing> ::= <req_teardown_stream>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_teardown_stream_recording> ::= <req_teardown_stream>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_play_queued_playing> ::= <req_play_queued>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_teardown_init> ::= <req_teardown>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_pause_ready> ::= <req_pause>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_play_playing> ::= <req_play>
+# RFC 2326 10.4 SETUP
+<req_setup_change_playing> ::= <req_setup_change>
+# RFC 2326 10.4 SETUP
+<req_setup_change_narrow_playing> ::= <req_setup_change_narrow>
+# RFC 2326 10.4 SETUP
+<req_setup_change_narrow_recording> ::= <req_setup_change_narrow>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_teardown_playing> ::= <req_teardown>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_record_playing> ::= <req_record>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_pause_recording> ::= <req_pause>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_record_recording> ::= <req_record>
+# RFC 2326 10.4 SETUP
+<req_setup_change_recording> ::= <req_setup_change>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_teardown_recording> ::= <req_teardown>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_play_recording> ::= <req_play>
+
+# OPTIONS (10.1): may be issued at any time, with the request URI "*" for the server itself (6.2)
+<req_options> ::= <method_options> ' ' <uri_options> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <crlf>
+# Header fields that may be in any request (6.2, 7.1.2, 8.1, 12): sent in this one exchange, in every state
+<req_options_headers> ::= (<method_options> ' ' <uri_options> ' ' <rtsp_version_10> <crlf> <h_cseq_sent>
+    <h_require_sent>? <h_proxy_require_sent>? <h_timestamp_sent>? <h_user_agent_sent>? <h_from_sent>? <h_referer_sent>?
+    <h_accept_language_sent>? <h_bandwidth_sent>? <h_date_sent>? <h_via_sent>? <h_proxy_authorization_sent>? <h_extension_sent>? <h_connection_other_sent>? <crlf>)
+
+# Connection: close (RFC 9112 9.6): the server closes the connection after the reply
+<req_options_close> ::= <method_options> ' ' <uri_options> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_connection_close_sent> <crlf>
+# RFC 2326 10.1 OPTIONS, 6.2 (Request-URI "*")
+<h_connection_close_sent> ::= 'Connection:' <connection_close_value> <crlf>
+# TODO: RFC 9110 7.6.1, 5.6.1 - Connection option lists (nearest <connection_close_value>): the value is the shared list rule <token_list> (elements <ws>? <token>? <ws>?, separated by commas) with one element "close"
+#   in any of its 32 casings, none to two other elements before it and after it (some of them empty), and whitespace of spaces and tabs around every element or none at all (obs-fold, a line break inside the value, is left out:
+#   the tested servers answer a folded header with 400 and close the connection). Lists of more than three elements and quoted values are left out; other option names come from five fixed tokens (<connection_other_option>).
+#   A server either closes after the reply or keeps the connection; both are accepted (<state_closing>).
+<connection_close_value> ::= (<connection_elem_other> ','){0,2} <connection_elem_close> (',' <connection_elem_other>){0,2}
+# RFC 2326
+<connection_elem_close> ::= <ws_sent>? <close_option> <ws_sent>?
+# RFC 2326
+<connection_elem_other> ::= <ws_sent>? (<connection_other_option> <ws_sent>?)?
+# RFC 2326
+<ws_sent> ::= r'[ \t]+'
+# 15.1/RFC 9110 7.6.1: connection-option = token, compared case-insensitively; "close" in each of its 32 casings
+<close_option> ::= ('c' | 'C') ('l' | 'L') ('o' | 'O') ('s' | 'S') ('e' | 'E')
+# RFC 2326
+<connection_other_option> ::= <token> := random.choice(['keep-alive', 'Keep-Alive', 'upgrade', 'x-foo', 'X-Bar-1'])
+
+# RFC 2326
+<h_connection_other_sent> ::= 'Connection:' <connection_elem_other> (',' <connection_elem_other>){0,2} <crlf>
+
+# DESCRIBE (10.2)
+<req_describe> ::= (<method_describe> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_accept_sent>?
+    <h_accept_encoding_sent>? <h_accept_language_sent>? <h_blocksize_sent>? <crlf>)
+# DESCRIBE inside a session (12 Table 3: Session and Blocksize are valid for all methods but SETUP/OPTIONS and OPTIONS/TEARDOWN)
+<req_describe_session> ::= (<method_describe> ' ' <presentation_url_recalled> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent>
+    <h_accept_sent>? <h_accept_encoding_sent>? <h_accept_language_sent>? <h_blocksize_sent>? <crlf>)
+# RFC 2326 10.2 DESCRIBE
+<req_describe_conditional> ::= (<method_describe> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_accept_sent>?
+    <h_accept_encoding_sent>? <h_if_modified_since_sent> <h_if_match_sent>? <crlf>)
+# RFC 2326 10.2 DESCRIBE
+<req_describe_unknown> ::= <method_describe> ' ' <unknown_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_accept_sent> <crlf>
+
+# ANNOUNCE (10.3): posts a presentation description
+<req_announce_session> ::= (<method_announce> ' ' <publish_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent>
+    <h_date_sent>? <h_expires_sent>? <h_last_modified_sent>? <sdp_content_any>)
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<req_announce> ::= (<method_announce> ' ' <publish_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent>
+    <h_date_sent>? <h_expires_sent>? <h_last_modified_sent>? <sdp_content_any>)
+# A body with a content coding (12.12, 8.1): the coded octets come from the plain description by a converter pair (gzip, deflate)
+<sdp_content_any> ::= <sdp_content> | <sdp_content_gzip> | <sdp_content_deflate>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<sdp_content_gzip> ::= 'Content-Type: application/sdp' <crlf> <h_content_base_any_sent>? <h_content_location_any_sent>? 'Content-Encoding: gzip' <crlf> 'Content-Length: ' <content_length_sent> <crlf> <crlf> <sdp_gzip>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_gzip> ::= <body_octet>+ := gzip_encode(<sdp_gzip_plain>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_gzip_plain> ::= <sdp_sent> := gzip_decode(<sdp_gzip>)
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<sdp_content_deflate> ::= 'Content-Type: application/sdp' <crlf> <h_content_base_any_sent>? <h_content_location_any_sent>? 'Content-Encoding: deflate' <crlf> 'Content-Length: ' <content_length_sent> <crlf> <crlf> <sdp_deflate>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_deflate> ::= <body_octet>+ := deflate_encode(<sdp_deflate_plain>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_deflate_plain> ::= <sdp_sent> := deflate_decode(<sdp_deflate>)
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<parameter_assignment_content_gzip> ::= 'Content-Type: text/parameters' <crlf> 'Content-Encoding: gzip' <crlf> 'Content-Length: ' <content_length_sent> <crlf> <crlf> <parameter_gzip>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<parameter_gzip> ::= <body_octet>+ := gzip_encode(<parameter_gzip_plain>)
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<parameter_gzip_plain> ::= <parameter_assignments> := gzip_decode(<parameter_gzip>)
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<sdp_content> ::= 'Content-Type: application/sdp' <crlf> <h_content_base_any_sent>? <h_content_location_any_sent>? <h_content_encoding_sent>? <h_content_language_sent>? 'Content-Length: ' <content_length_sent> <crlf> <crlf> <sdp_sent>
+# TODO: RFC 2326 C.1 - descriptions the narrowed ANNOUNCE leaves out (nearest <sdp_publish>): codecs other than H.264 and PCMU, multicast c=, t=, b=, a=range and a=etag lines, session-level aggregate and '*' controls, gzip/deflate bodies;
+#   they are sent by <req_announce>; the tested servers answer them with 400, 406 or 415 and close the connection, so the narrowing is the way to the deeper states (Ready, Recording).
+# On the way to RECORD (deeper states) the tested servers accept an ANNOUNCE with a description of H.264 and/or PCMU with the Content-Base of the presentation and the controls of their streams
+# (other descriptions are refused with 400 or 406, which <req_announce> sends): this narrowing of <sdp_sent> is an exchange of its own.
+<req_announce_publish> ::= (<method_announce> ' ' <publish_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <sdp_content_publish>)
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<sdp_content_publish> ::= 'Content-Type: application/sdp' <crlf> <h_content_base_sent> 'Content-Length: ' <content_length_sent> <crlf> <crlf> <sdp_publish>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_publish> ::= 'v=0' <crlf> <sdp_o_sent> 's=' <sdp_name_sent> <crlf> 'c=IN IP4 0.0.0.0' <crlf> 't=0 0' <crlf> <sdp_publish_media>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_publish_media> ::= (<sdp_video_h264> <sdp_pub_control_0> | <sdp_audio_pcmu> <sdp_pub_control_0> | <sdp_video_h264> <sdp_pub_control_0> <sdp_audio_pcmu> <sdp_pub_control_1>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_pub_control_0> ::= 'a=control:' ('streamid=0' | <publish_url> '/streamid=0') <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_pub_control_1> ::= 'a=control:' ('streamid=1' | <publish_url> '/streamid=1') <crlf>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<parameter_names_content> ::= 'Content-Type: text/parameters' <crlf> <h_content_encoding_sent>? <h_content_language_sent>? 'Content-Length: ' <content_length_sent> <crlf> <crlf> <parameter_names>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<parameter_assignment_content> ::= 'Content-Type: text/parameters' <crlf> <h_content_encoding_sent>? <h_content_language_sent>? 'Content-Length: ' <content_length_sent> <crlf> <crlf> <parameter_assignments>
+# RFC 2326
+<content_length_sent> ::= <digits>
+
+# SETUP (10.4): the transport parameters are always indicated (C11). Header fields that only SETUP takes (Table 3) are optional in every form.
+<setup_extra_headers> ::= <h_cache_control_sent>? <h_blocksize_sent>? <h_if_modified_since_sent>? <h_if_match_sent>? <h_conference_sent>?
+# RFC 2326 10.4 SETUP
+<req_setup> ::= (<method_setup> ' ' <setup_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_transport_sent> <setup_extra_headers> <crlf>)
+# RFC 2326 10.4 SETUP
+<req_setup_record> ::= <method_setup> ' ' <publish_setup_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_transport_record_sent> <setup_extra_headers> <crlf>
+# RFC 2326 10.4 SETUP
+<req_setup_full> ::= <method_setup> ' ' <setup_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_transport_any_sent> <setup_extra_headers> <crlf>
+# RFC 2326 10.4 SETUP
+<req_setup_full_session> ::= <method_setup> ' ' <setup_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_transport_any_sent> <h_session_sent> <setup_extra_headers> <crlf>
+# The next stream of an announced presentation: RECORD needs every announced stream set up (10.11)
+<req_setup_record_again> ::= <method_setup> ' ' <publish_setup_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_transport_record_sent> <h_session_sent> <setup_extra_headers> <crlf>
+# RFC 2326 10.4 SETUP
+<req_setup_again> ::= <method_setup> ' ' <setup_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_transport_sent> <h_session_sent> <setup_extra_headers> <crlf>
+# A change of the transport of the stream already set up names that stream (10.4); the whole Transport rule is sent, as the state does not change
+<req_setup_second_session> ::= (<method_setup> ' ' <setup_url_same> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_transport_any_sent> <setup_extra_headers> <crlf>)
+# RFC 2326 10.4 SETUP
+<req_setup_change> ::= (<method_setup> ' ' <setup_url_same> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_transport_any_sent> <h_session_sent> <setup_extra_headers> <crlf>)
+# The same two requests with the Transport the tested servers accept (the whole rule above is refused by them with 461 or 400)
+<req_setup_second_narrow> ::= (<method_setup> ' ' <setup_url_same> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_transport_sent> <setup_extra_headers> <crlf>)
+# RFC 2326 10.4 SETUP
+<req_setup_change_narrow> ::= (<method_setup> ' ' <setup_url_same> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_transport_sent> <h_session_sent> <setup_extra_headers> <crlf>)
+# RFC 2326 10.4 SETUP
+<setup_url_same> ::= <rtsp_scheme> '://' <authority> <setup_path_same>
+# RFC 2326 10.4 SETUP
+<setup_path_same> ::= <abs_path> := recall_setup_path()
+where forall <r> in <reply_2xx_second_session>: new_session_differs(<r>)
+where forall <u> in <setup_url_same>: <u>.<setup_path_same> == last_setup_path_before(<u>)
+
+# PLAY (10.5), PAUSE (10.6), RECORD (10.11), TEARDOWN (10.7)
+<req_play> ::= (<method_play> ' ' <presentation_url_recalled> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent>
+    <h_range_play_sent>? <h_scale_sent>? <h_speed_sent>? <h_blocksize_sent>? <crlf>
+    | <method_play> ' ' <setup_url_same> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent>
+    <h_range_play_sent>? <h_scale_sent>? <h_speed_sent>? <h_blocksize_sent>? <crlf>)
+# A PLAY with a finite range, sent while the previous PLAY runs (10.5: queued behind it)
+<req_play_queued> ::= (<method_play> ' ' <presentation_url_recalled> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent>
+    <h_range_queued_sent> <crlf>
+    | <method_play> ' ' <setup_url_same> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent> <h_range_queued_sent> <crlf>)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<h_range_queued_sent> ::= 'Range: ' <range_queued> <crlf>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<range_queued> ::= 'npt=' <npt_finite> | 'npt=' <npt_hhmmss_finite> | 'npt=' <npt_fraction_finite> | 'clock=' <utc_finite>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_pause> ::= (<method_pause> ' ' <presentation_url_recalled> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent>
+    <h_range_pause_sent>? <crlf>
+    | <method_pause> ' ' <setup_url_same> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent> <h_range_pause_sent>? <crlf>)
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_record> ::= (<method_record> ' ' <publish_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent>
+    <h_range_record_sent>? <h_scale_sent>? <crlf>
+    | <method_record> ' ' <publish_setup_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent> <h_range_record_sent>? <crlf>
+    | <method_record> ' ' <presentation_url_recalled> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent> <h_range_record_sent>? <crlf>)
+# TEARDOWN of the presentation URL ends the session (10.7); of a stream URL it stops that stream only and the session stays
+<req_teardown> ::= <method_teardown> ' ' <presentation_url_recalled> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent> <crlf>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_teardown_stream> ::= <method_teardown> ' ' <setup_url_same> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent> <crlf>
+
+# Blocksize (12.7, Table 3) is valid in all methods but OPTIONS and TEARDOWN: one exchange of its own carries it, outside and inside a session
+<req_blocksize> ::= <method_get_parameter> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_blocksize_sent> <crlf>
+# RFC 2326
+<req_blocksize_session> ::= <method_get_parameter> ' ' <presentation_url_recalled> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent> <h_blocksize_sent> <crlf>
+
+# GET_PARAMETER (10.8), SET_PARAMETER (10.9)
+# Accept and Accept-Encoding are valid for the entity methods DESCRIBE and GET_PARAMETER (12.1, 12.2, Table 3)
+<req_get_parameter> ::= (<method_get_parameter> ' ' <presentation_url_recalled> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent> <h_accept_sent>? <h_accept_encoding_sent>? <crlf>
+    | <method_get_parameter> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_accept_sent>? <h_accept_encoding_sent>? <crlf>
+    | <method_get_parameter> ' ' <setup_url_same> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent> <h_accept_sent>? <h_accept_encoding_sent>? <crlf>
+    | <method_get_parameter> ' ' <presentation_url_recalled> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent>
+      <parameter_names_content>)
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_set_parameter> ::= (<method_set_parameter> ' ' <presentation_url_recalled> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_sent>
+    (<parameter_assignment_content> | <parameter_assignment_content_gzip>)
+    | <method_set_parameter> ' ' <setup_url_same> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> (<parameter_assignment_content> | <parameter_assignment_content_gzip>))
+# TODO: RFC 2326 10.8, 10.9 - parameter names and values with a meaning (nearest <parameter_name>): the method is loosely defined by the RFC ("left to the implementation"); free values are sent.
+<parameter_names> ::= (<parameter_name> <crlf>){1,3}
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<parameter_assignments> ::= <parameter_assignment>{1,3}
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<parameter_assignment> ::= <parameter_name> ': ' <parameter_value> <crlf>
+# TODO: RFC 2326 10.9 - a SET_PARAMETER that sets a transport parameter (nearest <parameter_assignment>): 10.9 says transport parameters "MUST only be set with the SETUP command", so a request that sets one breaks the MUST and is not sent;
+#   the RFC defines no refusal for it. The server that sends one is rejected on the received side (<srv_set_parameter>, no_transport_parameters).
+# Transport parameters are set with SETUP only (10.9): no name of the Transport header or of one of its parameters is sent
+<parameter_name> ::= r'(?:[Aa](?:[Pp](?:[Pp](?:[Ee](?:[Nn](?:[Dd](?:[_a-z][_a-z]*)|[_a-ce-z][_a-z]*|)|[_a-mo-z][_a-z]*|)|[_a-df-z][_a-z]*|)|[_a-oq-z][_a-z]*|)|[_a-oq-z][_a-z]*|)|[Cc](?:[Ll](?:[Ii](?:[Ee](?:[Nn](?:[Tt](?:[_](?:[Pp](?:[Oo](?:[Rr](?:[Tt](?:[_a-z][_a-z]*)|[_a-su-z][_a-z]*|)|[_a-qs-z][_a-z]*|)|[_a-np-z][_a-z]*|)|[_a-oq-z][_a-z]*|)|[a-z][_a-z]*|)|[_a-su-z][_a-z]*|)|[_a-mo-z][_a-z]*|)|[_a-df-z][_a-z]*|)|[_a-hj-z][_a-z]*|)|[_a-km-z][_a-z]*|)|[Dd](?:[Ee](?:[Ss](?:[Tt](?:[Ii](?:[Nn](?:[Aa](?:[Tt](?:[Ii](?:[Oo](?:[Nn](?:[_a-z][_a-z]*)|[_a-mo-z][_a-z]*|)|[_a-np-z][_a-z]*|)|[_a-hj-z][_a-z]*|)|[_a-su-z][_a-z]*|)|[_b-z][_a-z]*|)|[_a-mo-z][_a-z]*|)|[_a-hj-z][_a-z]*|)|[_a-su-z][_a-z]*|)|[_a-rt-z][_a-z]*|)|[_a-df-z][_a-z]*|)|[Ii](?:[Nn](?:[Tt](?:[Ee](?:[Rr](?:[Ll](?:[Ee](?:[Aa](?:[Vv](?:[Ee](?:[Dd](?:[_a-z][_a-z]*)|[_a-ce-z][_a-z]*|)|[_a-df-z][_a-z]*|)|[_a-uw-z][_a-z]*|)|[_b-z][_a-z]*|)|[_a-df-z][_a-z]*|)|[_a-km-z][_a-z]*|)|[_a-qs-z][_a-z]*|)|[_a-df-z][_a-z]*|)|[_a-su-z][_a-z]*|)|[_a-mo-z][_a-z]*|)|[Ll](?:[Aa](?:[Yy](?:[Ee](?:[Rr](?:[Ss](?:[_a-z][_a-z]*)|[_a-rt-z][_a-z]*|)|[_a-qs-z][_a-z]*|)|[_a-df-z][_a-z]*|)|[_a-xz][_a-z]*|)|[_b-z][_a-z]*|)|[Mm](?:[Oo](?:[Dd](?:[Ee](?:[_a-z][_a-z]*)|[_a-df-z][_a-z]*|)|[_a-ce-z][_a-z]*|)|[Uu](?:[Ll](?:[Tt](?:[Ii](?:[Cc](?:[Aa](?:[Ss](?:[Tt](?:[_a-z][_a-z]*)|[_a-su-z][_a-z]*|)|[_a-rt-z][_a-z]*|)|[_b-z][_a-z]*|)|[_abd-z][_a-z]*|)|[_a-hj-z][_a-z]*|)|[_a-su-z][_a-z]*|)|[_a-km-z][_a-z]*|)|[_a-np-tv-z][_a-z]*|)|[Pp](?:[Oo](?:[Rr](?:[Tt](?:[_a-z][_a-z]*)|[_a-su-z][_a-z]*|)|[_a-qs-z][_a-z]*|)|[_a-np-z][_a-z]*|)|[Ss](?:[Ee](?:[Rr](?:[Vv](?:[Ee](?:[Rr](?:[_](?:[Pp](?:[Oo](?:[Rr](?:[Tt](?:[_a-z][_a-z]*)|[_a-su-z][_a-z]*|)|[_a-qs-z][_a-z]*|)|[_a-np-z][_a-z]*|)|[_a-oq-z][_a-z]*|)|[a-z][_a-z]*|)|[_a-qs-z][_a-z]*|)|[_a-df-z][_a-z]*|)|[_a-uw-z][_a-z]*|)|[_a-qs-z][_a-z]*|)|[Oo](?:[Uu](?:[Rr](?:[Cc](?:[Ee](?:[_a-z][_a-z]*)|[_a-df-z][_a-z]*|)|[_abd-z][_a-z]*|)|[_a-qs-z][_a-z]*|)|[_a-tv-z][_a-z]*|)|[Ss](?:[Rr](?:[Cc](?:[_a-z][_a-z]*)|[_abd-z][_a-z]*|)|[_a-qs-z][_a-z]*|)|[_a-df-np-rt-z][_a-z]*|)|[Tt](?:[Rr](?:[Aa](?:[Nn](?:[Ss](?:[Pp](?:[Oo](?:[Rr](?:[Tt](?:[_a-z][_a-z]*)|[_a-su-z][_a-z]*|)|[_a-qs-z][_a-z]*|)|[_a-np-z][_a-z]*|)|[_a-oq-z][_a-z]*|)|[_a-rt-z][_a-z]*|)|[_a-mo-z][_a-z]*|)|[_b-z][_a-z]*|)|[Tt](?:[Ll](?:[_a-z][_a-z]*)|[_a-km-z][_a-z]*|)|[_a-qsu-z][_a-z]*|)|[Uu](?:[Nn](?:[Ii](?:[Cc](?:[Aa](?:[Ss](?:[Tt](?:[_a-z][_a-z]*)|[_a-su-z][_a-z]*|)|[_a-rt-z][_a-z]*|)|[_b-z][_a-z]*|)|[_abd-z][_a-z]*|)|[_a-hj-z][_a-z]*|)|[_a-mo-z][_a-z]*|)|[_be-hjknoqrv-z][_a-z]*)'
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<parameter_value> ::= r'[a-z0-9_.]{1,16}'
+
+# Requests with a session that only an earlier session could have created (12.37): refused with 454
+# An object that needs no SETUP (multicast): the state machine starts at Ready (A.1, A.2)
+<req_play_without_setup> ::= (<method_play> ' ' <play_target_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent>
+    <h_range_play_sent>? <h_scale_sent>? <h_speed_sent>? <h_blocksize_sent>? <crlf>)
+# the object that needs no SETUP: PLAY names the presentation, the aggregate control URL of a description or a stream (10.5, C.1.1)
+<play_target_url> ::= <presentation_url> | <presentation_url_recalled> | <setup_url>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_play_unknown_session> ::= <method_play> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_unknown> <crlf>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_pause_unknown_session> ::= <method_pause> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_unknown> <crlf>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_record_unknown_session> ::= <method_record> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_unknown> <crlf>
+# RFC 2326 10.5-10.7, 10.11 (PLAY, PAUSE, TEARDOWN, RECORD)
+<req_teardown_unknown_session> ::= <method_teardown> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_unknown> <crlf>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_get_parameter_unknown_session> ::= <method_get_parameter> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_unknown> <crlf>
+# RFC 2326 10.8 GET_PARAMETER, 10.9 SET_PARAMETER
+<req_set_parameter_unknown_session> ::= (<method_set_parameter> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_session_unknown>
+    <parameter_assignment_content>)
+
+# An extension method (6.1, 10): a server that does not understand it answers 501
+<req_extension> ::= <extension_method> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <crlf>
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<extension_method> ::= <method_xtest> | <method_xping> | <method_foobar> | <method_dummy_test>
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_xtest> ::= 'XTEST'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_xping> ::= 'X-PING'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_foobar> ::= 'FOOBAR'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_dummy_test> ::= 'DUMMY_TEST'
+# Another RTSP version than 1.0 (3.1)
+<req_version> ::= <method_options> ' ' <uri_options> ' ' <rtsp_version_other> <crlf> <h_cseq_sent> <crlf>
+# TODO: RFC 2326 3.1 - RTSP-Version values: a version other than 1.0 is chosen from the major numbers 0, 1, 2, 3, 10, 99 and the minor numbers 0, 1, 2, 9, 10, 00 (leading zeros included); servers answer 505 or tolerate it.
+<rtsp_version_other> ::= <rtsp_version> := other_rtsp_version()
+# Credentials (RFC 9110 11.4): the accepting request sends the configured ones
+<req_auth> ::= (<method_describe> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_accept_sent>
+    <h_authorization_valid> <crlf>)
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
+<req_auth_wrong> ::= (<method_describe> ' ' <presentation_url> ' ' <rtsp_version_10> <crlf> <h_cseq_sent> <h_accept_sent>
+    <h_authorization_wrong> <crlf>)
+
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_options> ::= 'OPTIONS'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_describe> ::= 'DESCRIBE'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_announce> ::= 'ANNOUNCE'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_setup> ::= 'SETUP'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_play> ::= 'PLAY'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_pause> ::= 'PAUSE'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_teardown> ::= 'TEARDOWN'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_get_parameter> ::= 'GET_PARAMETER'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_set_parameter> ::= 'SET_PARAMETER'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_record> ::= 'RECORD'
+# RFC 2326 6.1 Request-Line (Method, extension-method)
+<method_redirect> ::= 'REDIRECT'
+
+# Request-URI = "*" | absolute_URI (6.1); the URL of RTSP (3.2); host and port from the test setup
+<uri_options> ::= '*' | <presentation_url>
+# RFC 2326 3.2 RTSP URL, 6.1 Request-URI
+<presentation_url> ::= <rtsp_scheme> '://' <authority> <target_path>
+# RFC 2326 3.2 RTSP URL, 6.1 Request-URI
+<presentation_url_recalled> ::= <rtsp_scheme> '://' <authority> <presentation_path_recalled>
+# RFC 2326 10.4 SETUP
+<setup_url> ::= <rtsp_scheme> '://' <authority> <setup_path>
+# RFC 2326 3.2 RTSP URL, 6.1 Request-URI
+<publish_url> ::= <rtsp_scheme> '://' <authority> <publish_path>
+# The stream a SETUP or RECORD names is the one of the description announced earlier in the session (C.1.1)
+<publish_setup_url> ::= <rtsp_scheme> '://' <authority> <publish_setup_path>
+# RFC 2326 10.4 SETUP
+<publish_setup_path> ::= <abs_path> := publish_default_path()
+where forall <u> in <publish_setup_url>: <u>.<publish_setup_path> == announced_stream_path_before(<u>)
+# RFC 2326 3.2 RTSP URL, 6.1 Request-URI
+<unknown_url> ::= <rtsp_scheme> '://' <authority> '/' <unknown_name>
+# TODO: RFC 2326 3.2, 16 - the schemes rtspu (RTSP over UDP) and rtsps/TLS (nearest <rtsp_scheme>): both change the transport of the control connection (UDP datagrams, TLS records of RFC 8446 on their own port);
+#   each is a server setup of its own with a matching endpoint, none of the three servers is set up with one.
+<rtsp_scheme> ::= 'rtsp'
+# RFC 2326 3.2 RTSP URL, 6.1 Request-URI
+<authority> ::= r'[A-Za-z0-9.:\[\]-]+' := RTSP_AUTHORITY
+# RFC 2326 3.2 RTSP URL, 6.1 Request-URI
+<target_path> ::= <abs_path> := pick_target()
+# RFC 2326 3.2 RTSP URL, 6.1 Request-URI
+<publish_path> ::= <abs_path> := pick_publish_target()
+# RFC 2326 3.2 RTSP URL, 6.1 Request-URI
+<presentation_path_recalled> ::= <abs_path> := recall_presentation_path()
+where forall <u> in <presentation_url_recalled>: <u>.<presentation_path_recalled> == presentation_path_before(<u>)
+# RFC 2326 10.4 SETUP
+<setup_path> ::= <abs_path> := recall_setup_path()
+# RFC 2326 3.2 RTSP URL, 6.1 Request-URI
+<unknown_name> ::= r'[a-z]{3,10}'
+# RFC 2326 3.2 RTSP URL, 6.1 Request-URI
+<abs_path> ::= r'(/[A-Za-z0-9._~=!$&()*+,;:@%-]*)+'
+# RFC 2326 3.1, 6.1 RTSP-Version
+<rtsp_version_10> ::= <rtsp_version> := 'RTSP/1.0'
+# RFC 2326 3.1, 6.1 RTSP-Version
+<rtsp_version> ::= 'RTSP/' r'[0-9]+' '.' r'[0-9]+'
+
+# --------------------------------------------------------------------------------------------
+# Header fields that Fandango sends
+# --------------------------------------------------------------------------------------------
+# CSeq (12.17): one more than the last request
+# TODO: RFC 2326 9.2, 12.17 - a request resent without acknowledgement keeps its CSeq (nearest <h_cseq_sent>): the resend exists only over an unreliable
+#   transport (TCP forbids it in 9.2); every server endpoint of the test setup is TCP, the same messages over UDP need a server setup of their own with a UDP control endpoint.
+<h_cseq_sent> ::= 'CSeq: ' <cseq_next> <crlf>
+# RFC 2326 12.17 CSeq
+<cseq_next> ::= <cseq_value> := next_cseq()
+# Session (12.37): the identifier of the SETUP reply, sent without the timeout parameter (C9)
+# A reply without a Session header names a stream identified by other means (dynamic URLs, 12.37): the requests that follow carry none
+<h_session_sent> ::= <session_line>{session_count()}
+# RFC 2326 12.37 Session, 3.4 Session Identifiers
+<session_line> ::= 'Session: ' <session_recalled> <crlf>
+# RFC 2326 12.37 Session, 3.4 Session Identifiers
+<session_recalled> ::= <session_id> := recall_session()
+# RFC 2326 12.37 Session, 3.4 Session Identifiers
+<h_session_unknown> ::= 'Session: ' <session_id> <crlf>
+# Accept (12.1), Accept-Encoding, Accept-Language (12.2, 12.3)
+# TODO: RFC 2326 12.1-12.3 (HTTP: RFC 9110 12.5.1-12.5.4, 12.4.2) - Accept, Accept-Encoding and Accept-Language lists (nearest <accept_value>): the lists of the formal grammar are sent with one to four items, the weight with OWS around ";" as sent by <ows> (one space);
+#   media types, subtypes and codings are drawn from short lists of tokens by generators on the leaf tokens (<media_type_token>, <media_subtype_token>, <coding_token>), language subtags are random alphanumerics;
+#   longer lists, empty list elements and the tab as OWS are left out (the servers pick a body or a language from the first items; no other behaviour depends on the length).
+<h_accept_sent> ::= 'Accept: ' <accept_value> <crlf>
+# RFC 2326
+<accept_value> ::= <accept_item> (',' <ows> <accept_item>){0,3}
+# RFC 2326
+<accept_item> ::= <media_range> <weight>?
+# RFC 2326 12.1-12.3 Accept, Accept-Encoding, Accept-Language
+<media_range> ::= <media_type_token> '/' <media_subtype_token> <media_range_param>{0,2}
+# RFC 2326 12.16 Content-Type (RFC 9110 8.3.1)
+<media_type_token> ::= <token> := random.choice(['application', 'application', '*', 'text', 'video', 'audio', 'x-test'])
+# RFC 2326
+<media_subtype_token> ::= <token> := random.choice(['sdp', 'sdp', '*', 'rtsl', 'mheg', 'parameters', 'x-test', 'octet-stream'])
+# RFC 2326 12.1-12.3 Accept, Accept-Encoding, Accept-Language
+<media_range_param> ::= <ows> ';' <ows> <media_range_param_name> '=' (<token> | <quoted_string>)
+# RFC 2326 12.1-12.3 Accept, Accept-Encoding, Accept-Language
+<media_range_param_name> ::= r"(?:[Qq](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-PR-Z\^-pr-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)"
+# weight = OWS ";" OWS "q=" qvalue; qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] )
+<weight> ::= <ows> ';' <ows> 'q=' <qvalue>
+# RFC 2326
+<qvalue> ::= ('0' ('.' <qdigit>{0,3})? | '1' ('.' '0'{0,3})?)
+# RFC 2326
+<qdigit> ::= r'[0-9]'
+# RFC 2326 12.1-12.3 Accept, Accept-Encoding, Accept-Language
+<h_accept_encoding_sent> ::= 'Accept-Encoding: ' <accept_encoding_value> <crlf>
+# RFC 2326
+<accept_encoding_value> ::= <coding_item> (',' <ows> <coding_item>){0,3}
+# RFC 2326
+<coding_item> ::= <coding_token> <weight>?
+# RFC 2326
+<coding_token> ::= <token> := random.choice(['gzip', 'identity', 'deflate', '*', 'compress', 'x-gzip', 'br'])
+# RFC 2326 12.1-12.3 Accept, Accept-Encoding, Accept-Language
+<h_accept_language_sent> ::= 'Accept-Language: ' <language_item> (',' <ows> <language_item>){0,3} <crlf>
+# language-range = (1*8ALPHA *("-" 1*8alphanum)) / "*"
+<language_item> ::= <language_range> <weight>?
+# RFC 2326 12.1-12.3 Accept, Accept-Encoding, Accept-Language
+<language_range> ::= (r'[A-Za-z]{1,8}' ('-' r'[A-Za-z0-9]{1,8}'){0,3} | '*')
+# If-Modified-Since (12.23)
+<h_if_modified_since_sent> ::= 'If-Modified-Since: ' <imf_fixdate> <crlf>
+# Require, Proxy-Require (12.32, 12.27, 3.8)
+<h_require_sent> ::= 'Require: ' <option_tag_list> <crlf>
+# RFC 2326 12.32 Require, 12.27 Proxy-Require, 3.8 Option Tags
+<h_proxy_require_sent> ::= 'Proxy-Require: ' <option_tag_list> <crlf>
+# RFC 2326 12.32 Require, 12.27 Proxy-Require, 3.8 Option Tags
+<option_tag_list> ::= <option_tag> (',' <option_tag>){0,2}
+# RFC 2326 12.32 Require, 12.27 Proxy-Require, 3.8 Option Tags
+<option_tag> ::= r'[a-z]{2,8}\.[a-z]{2,8}\.[a-z]{2,8}'
+# Timestamp (12.38), User-Agent, From, Referer, Bandwidth (12.6), Date, Via
+<h_timestamp_sent> ::= 'Timestamp: ' <timestamp_number> <crlf>
+# RFC 2326 12.41 User-Agent, 12.20 From, 12.30 Referer, 12.43 Via, 8.1 extension-header
+<h_user_agent_sent> ::= 'User-Agent: ' <product> <crlf>
+# RFC 2326 12.41 User-Agent, 12.20 From, 12.30 Referer, 12.43 Via, 8.1 extension-header
+<product> ::= <token> '/' <token>
+# TODO: RFC 2326 12.20, 12.30, 12.41, 12.43 - shapes of From, Referer, User-Agent and Via (nearest <h_from_sent>, <h_referer_sent>, <h_user_agent_sent>, <h_via_sent>): servers store or ignore these
+#   informational headers; one shape of each (mailbox, absolute http URI, product, protocol and host) is sent; comments, product lists and Via chains are left out.
+<h_from_sent> ::= 'From: ' <mailbox> <crlf>
+# RFC 2326 12.41 User-Agent, 12.20 From, 12.30 Referer, 12.43 Via, 8.1 extension-header
+<mailbox> ::= r'[a-z]{1,8}' '@' r'[a-z]{2,8}' '.' r'[a-z]{2,3}'
+# RFC 2326 12.41 User-Agent, 12.20 From, 12.30 Referer, 12.43 Via, 8.1 extension-header
+<h_referer_sent> ::= 'Referer: http://' r'[a-z]{2,8}' '.example/' r'[a-z]{1,8}' <crlf>
+# RFC 2326 12.6 Bandwidth
+<h_bandwidth_sent> ::= 'Bandwidth: ' <digits> <crlf>
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<h_date_sent> ::= 'Date: ' <imf_fixdate> <crlf>
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<h_expires_sent> ::= 'Expires: ' (<imf_fixdate> | <expires_invalid>) <crlf>
+# 12.19: a value in any other format, "0" included, counts as already expired
+<expires_invalid> ::= '0' | r'[a-z]{3,8}'
+# TODO: RFC 2326 12.24, RFC 9110 5.6.7 - the date of Last-Modified (nearest <h_last_modified_sent>): a date in the past (years 1990-2023, days 01-28 of every month) in each of the three HTTP-date formats, built from the parts of the shared date rules with the weekday
+#   computed from the date (an equality); a later date is left out because it could not be earlier than Date (C32), and so are the days 29-31.
+<h_last_modified_sent> ::= 'Last-Modified: ' (<imf_fixdate_past> | <rfc850_date_past> | <asctime_date_past>) <crlf>
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<imf_fixdate_past> ::= <day_name> ',' ' ' <day_of_month_past> ' ' <month> ' ' <year4_past> ' ' <time_of_day> ' ' 'GMT'
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<rfc850_date_past> ::= <day_name_long> ',' ' ' <day_of_month_past> '-' <month> '-' <year2_past> ' ' <time_of_day> ' ' 'GMT'
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<asctime_date_past> ::= <day_name> ' ' <month> ' ' <day_of_month_past> ' ' <time_of_day> ' ' <year4_past>
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<day_of_month_past> ::= r'(?:0[1-9]|1[0-9]|2[0-8])'
+# RFC 2326
+<year4_past> ::= r'[0-9]{4}' := str(random.randint(1990, 2023))
+# RFC 2326
+<year2_past> ::= r'[0-9]{2}' := "%02d" % random.choice(list(range(90, 100)) + list(range(0, 24)))
+where forall <d> in <imf_fixdate_past>: <d>.<day_name> == past_weekday(<d>, "imf")
+where forall <d> in <rfc850_date_past>: <d>.<day_name_long> == past_weekday(<d>, "rfc850")
+where forall <d> in <asctime_date_past>: <d>.<day_name> == past_weekday(<d>, "asctime")
+# TODO: RFC 2326 13 - caching with a proxy cache (nearest <h_via_sent>): a cache is a third party on the path.
+# TODO: RFC 2326 12.12, RFC 9110 8.4 - content codings other than gzip and deflate and lists of codings (nearest <h_content_encoding_sent>): ANNOUNCE (gzip, deflate) and SET_PARAMETER (gzip) bodies are coded by a converter pair, compress/x-gzip and coding lists are left out.
+# Content-Encoding (12.12), Content-Language (12.13): the body is sent as it is (identity); a compressed body is not produced
+<h_content_base_sent> ::= 'Content-Base: ' <publish_url> '/' <crlf>
+# RFC 2326
+<h_content_location_sent> ::= 'Content-Location: ' <publish_url> '/' <crlf>
+# The broad ANNOUNCE (and every description) names its base in any of the forms RFC 1808 resolves differently: with and without the trailing slash, one directory deeper, and (Content-Location only,
+# RFC 9110 8.7: absolute or partial URI) as a relative reference to the request URL. The narrowed ANNOUNCE of the publishing path (<req_announce_publish>) sends <h_content_base_sent>.
+# TODO: RFC 2326 C.1.1 - a base that names another host or another scheme (nearest <base_any_sent>): the streams it resolves to live on another server, a second connection that the test setup does not hold (a session is one connection).
+<h_content_base_any_sent> ::= 'Content-Base: ' <base_any_sent> <crlf>
+# RFC 2326
+<h_content_location_any_sent> ::= 'Content-Location: ' (<base_any_sent> | <location_relative_sent>) <crlf>
+# RFC 2326
+<base_any_sent> ::= <publish_url> '/' | <publish_url> | <publish_url> '/' <base_dir_sent> '/' | <publish_url> '/?' <control_query>
+# RFC 2326
+<location_relative_sent> ::= <base_dir_sent> '/' | './' | '../' <base_dir_sent> '/'
+# RFC 2326
+<base_dir_sent> ::= r'[a-z]{3,8}'
+# RFC 2326
+<h_content_encoding_sent> ::= 'Content-Encoding: identity' <crlf>
+# RFC 2326
+<h_content_language_sent> ::= 'Content-Language: ' <language_range_plain> <crlf>
+# RFC 2326 12.1-12.3 Accept, Accept-Encoding, Accept-Language
+<language_range_plain> ::= r'[a-z]{2}' ('-' r'[a-z]{2}')?
+# RFC 2326 12.41 User-Agent, 12.20 From, 12.30 Referer, 12.43 Via, 8.1 extension-header
+<h_via_sent> ::= 'Via: RTSP/1.0 ' <reg_name> <crlf>
+# RFC 2326 12.41 User-Agent, 12.20 From, 12.30 Referer, 12.43 Via, 8.1 extension-header
+<h_extension_sent> ::= 'X-' r'[A-Za-z]{2,10}' ': ' r'[A-Za-z0-9]{1,10}' <crlf>
+# Cache-Control (12.8), Blocksize (12.7), Conference (12.9), If-Match (12.22)
+# TODO: RFC 2326 12.8 - cache-directive forms (nearest <h_cache_control_sent>): one to three directives per header, each derived by the shared rule <cache_directive> (every fixed string of the formal grammar, max-age with a delta,
+#   and the extension forms with random tokens); nothing of the rule is left out, only longer lists (the number of directives a server evaluates does not change what it does).
+<h_cache_control_sent> ::= 'Cache-Control: ' <cache_directive> (',' <ows> <cache_directive>){0,2} <crlf>
+# RFC 2326 12.7 Blocksize
+<h_blocksize_sent> ::= 'Blocksize: ' <blocksize_value> <crlf>
+# 12.7: the size is a positive decimal number; a syntactically invalid value is refused with 416
+<blocksize_value> ::= <blocksize_number> | <blocksize_invalid>
+# RFC 2326 12.7 Blocksize
+<blocksize_number> ::= <digits> := str(random.choice([512, 1024, 1400, 4096, 1, 65535, 100000]))
+# RFC 2326 12.7 Blocksize
+<blocksize_invalid> ::= (r'[a-z]{1,6}' | '-' <digits> | <digits> '.' <digits> | '0x' r'[0-9a-f]{1,4}')
+# RFC 2326 12.9 Conference, 3.3 Conference Identifiers
+<h_conference_sent> ::= 'Conference: ' <conference_id> <crlf>
+# conference-id = 1*xchar (12.9, 15.1): the first Conference header of a session draws the id from the grammar, every later one repeats it (an equality with the earlier header)
+# TODO: RFC 2326 12.9 - the conference identifiers (nearest <conference_id>): the identifier cannot change within a session (3.3), a server that does not know it answers 452 (<code_452>), which every reply class accepts;
+#   a second, different identifier within one session is left out.
+<conference_id> ::= <xchar>+
+where forall <h> in <h_conference_sent>: <h>.<conference_id> == conference_before(<h>)
+# RFC 2326
+<xchar> ::= <unreserved> | <reserved> | <escape>
+# RFC 2326
+<unreserved> ::= <alpha> | <digit> | <safe> | <extra>
+# RFC 2326
+<safe> ::= '$' | '-' | '_' | '.' | '+'
+# RFC 2326
+<extra> ::= '!' | '*' | "'" | '(' | ')' | ','
+# RFC 2326
+<reserved> ::= ';' | '/' | '?' | ':' | '@' | '&' | '='
+# RFC 2326
+<escape> ::= '%' <hex> <hex>
+# RFC 2326
+<alpha> ::= r'[A-Za-z]'
+# RFC 2326
+<digit> ::= r'[0-9]'
+# RFC 2326
+<hex> ::= r'[0-9A-Fa-f]'
+
+# RFC 2326 12.22 If-Match, 12.23 If-Modified-Since
+<h_if_match_sent> ::= 'If-Match: ' <if_match_value> <crlf>
+# RFC 2326
+<if_match_value> ::= '*' | <entity_tag_item> (',' <entity_tag_item>){0,2}
+# RFC 2326 12.22 If-Match, 12.23 If-Modified-Since
+<entity_tag_item> ::= <entity_tag_recalled> | 'W/' <entity_tag_recalled>
+# The tag of the description (a=etag, C.1.8) is recalled; the others never match
+<entity_tag_recalled> ::= '"' <etag_recalled> '"'
+# RFC 2326
+<etag_recalled> ::= <etag_chars> := recall_etag()
+# RFC 2326
+<etag_chars> ::= r'[\x21\x23-\x7e]+'
+where forall <e> in <entity_tag_recalled>: <e>.<etag_recalled> == last_etag_before(<e>)
+# Proxy-Authorization (RFC 9110 11.7.2)
+<h_proxy_authorization_sent> ::= 'Proxy-Authorization: Basic ' <basic_credentials_valid> <crlf>
+# Authorization (RFC 9110 11.6.2)
+# TODO: RFC 2326 16, D.2.2 - Digest authentication (nearest <h_authorization_valid>): the Digest scheme is defined by RFC 7616/2617, which refs/spec does not contain and which the allowed
+#   sources do not give; the challenge is parsed (<challenge_list>), only Basic credentials are sent.
+# TODO: RFC 2326 12.40, 12.27 - Proxy-Require answered by a proxy with 551 (nearest <h_proxy_require_sent>): a proxy is a third party on the path; the servers under test are no proxies.
+# TODO: RFC 2326 12.5, RFC 9110 11.6.2 - the Basic credentials (nearest <basic_credentials_valid>): the scheme is defined by RFC 7617, which refs/spec does not contain (manifest: over_budget);
+#   the user-pass is sent as base64 of "user:password" from the configured credentials, received Authorization headers (S->C requests) are not parsed beyond <token68>.
+<h_authorization_valid> ::= 'Authorization: Basic ' <basic_credentials_valid> <crlf>
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
+<h_authorization_wrong> ::= 'Authorization: Basic ' <basic_credentials_wrong> <crlf>
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
+<basic_credentials_valid> ::= <token68> := basic_credentials(RTSP_USER, RTSP_PASSWORD)
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
+<basic_credentials_wrong> ::= <token68> := basic_credentials(RTSP_USER, RTSP_PASSWORD + "x")
+# RFC 2326 12.5 Authorization, RFC 9110 11 (authentication)
 <token68> ::= r'[A-Za-z0-9._~+/-]+=*'
 
-# 2326 12.40: Unsupported = 1#option-tag
-<h_unsupported> ::= r'(?i:unsupported)' ':' <ows> <list_lead>* <option_tag_rcv> (<list_sep> <option_tag_rcv>)* <list_trail>* <ows> <crlf>
-<option_tag_rcv> ::= r'[!-+\--~]+'
+# Range (12.29, 3.5-3.7): the sent forms are narrowed from the shared rules <range_value>, <ranges_specifier>, <npt_range>, <smpte_range> and <utc_range>
+# TODO: RFC 2326 12.29, 3.5-3.7 - Range forms the sent header leaves out (nearest <range_play_value>): byte ranges ("MUST NOT be used", 12.29); npt-sec and hh:mm:ss values beyond a few magnitudes
+#   (a start beyond the media is sent as <npt_far>, which the servers refuse with 457 or 416); more than two ranges-specifiers in a list; the end of a finite range is the start plus 3 s (an equality), beyond the media (<npt_beyond>), before the start (<npt_backwards> in integer seconds) or "now" as the start;
+#   other ends and a backwards range in hh:mm:ss are left out (they lead to the same refusals).
+<h_range_play_sent> ::= 'Range: ' <range_play_value> <crlf>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<range_play_value> ::= <range_play_item> (',' <range_play_item>)? (';time=' <utc_time_param>)?
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_time_param> ::= <utc_start_sent>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<range_play_item> ::= <npt_range_play> | <smpte_range_play> | <utc_range_play>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_range_play> ::= 'npt=' (<npt_time_play> '-' | '-' <npt_time_play> | <npt_finite> | <npt_hhmmss_finite> | <npt_fraction_finite> | <npt_second> '-' <npt_now> | <npt_now> '-' (<npt_second> | <npt_far>) | <npt_beyond> | <npt_backwards>)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_time_play> ::= <npt_second> | <npt_second_fraction> | <npt_far> | <npt_hhmmss_small> | <npt_now>
+# the sent values are built from the leaves of the shared rules; a generator sits on a leaf only
+<npt_hhmmss_small> ::= <npt_hours_small> ':' <npt_minutes_any> ':' <npt_seconds_any> '.' <npt_fraction_digit>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_far> ::= <npt_int_far>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_int_far> ::= <npt_int> := str(random.choice([100000, 2147483647, 99999999]))
+# a finite range whose end lies beyond the media (the server clips it or stops at the end), and one that ends before its start
+<npt_beyond> ::= (<npt_second> | <npt_second_fraction> | <npt_hhmmss_small>) '-' (<npt_far> | <npt_hhmmss_far>)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_hhmmss_far> ::= <npt_hours_far> ':' <npt_minutes_any> ':' <npt_seconds_any>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_backwards> ::= <npt_late> '-' <npt_early>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_late> ::= <npt_int> := str(random.randint(4, 9))
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_early> ::= <npt_int> := str(random.randint(0, 3))
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_hhmmss_finite> ::= <npt_hhmmss_start> '-' <npt_hhmmss_end>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_hhmmss_start> ::= <npt_hours_start> ':' <npt_minutes_start> ':' <npt_seconds_any>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_hhmmss_end> ::= <npt_hhmmss>
+where forall <r> in <npt_hhmmss_finite>: <r>.<npt_hhmmss_end> == time_plus(<r>.<npt_hhmmss_start>, 3)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_fraction_finite> ::= <npt_fraction_start> '-' <npt_fraction_end>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_fraction_start> ::= <npt_int_small> '.' <npt_fraction_digit_nonzero>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_fraction_end> ::= <npt_sec>
+where forall <r> in <npt_fraction_finite>: <r>.<npt_fraction_end> == sec_plus(<r>.<npt_fraction_start>, 3)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_finite> ::= <npt_start> '-' <npt_end>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_start> ::= <npt_int_small>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_end> ::= <npt_sec>
+where forall <r> in <npt_finite>: <r>.<npt_end> == str(int(<r>.<npt_start>) + 3)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_second> ::= <npt_int_small>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_second_fraction> ::= <npt_int_small> '.' <npt_fraction_digit>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_int_small> ::= <npt_int> := str(random.randint(0, 5))
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_fraction_digit> ::= <npt_fraction_digits> := str(random.randint(0, 9))
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_fraction_digit_nonzero> ::= <npt_fraction_digits> := str(random.randint(1, 9))
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_hours_small> ::= <npt_hours> := str(random.randint(0, 2))
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_hours_far> ::= <npt_hours> := str(random.choice([10, 24, 99]))
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_hours_start> ::= <npt_hours> := str(random.choice([0, 0, 1, 12]))
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_minutes_start> ::= <npt_minutes> := "%02d" % random.choice([0, 0, 59, 30])
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_minutes_any> ::= <npt_minutes> := "%02d" % random.randint(0, 59)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_seconds_any> ::= <npt_seconds> := "%02d" % random.randint(0, 59)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_range_play> ::= <smpte_type> '=' (<smpte_time_start> '-' | <smpte_frames_start> '-' | <smpte_finite> | <smpte_frames_finite>)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_time_start> ::= <smpte_hours_zero> ':' <smpte_minutes_zero> ':' <smpte_seconds_small>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_frames_start> ::= <smpte_hours_zero> ':' <smpte_minutes_zero> ':' <smpte_seconds_small> ':' <smpte_frames_small> '.' <smpte_subframes_any>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_hours_zero> ::= <smpte_hours> := "00"
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_minutes_zero> ::= <smpte_minutes> := "00"
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_seconds_small> ::= <smpte_seconds> := "%02d" % random.randint(0, 5)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_frames_small> ::= <smpte_frames> := "%02d" % random.randint(0, 24)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_subframes_any> ::= <smpte_subframes> := "%02d" % random.randint(0, 99)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_finite> ::= <smpte_time_start> '-' <smpte_time_end>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_frames_finite> ::= <smpte_frames_start> '-' <smpte_time_end>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_time_end> ::= <smpte_time>
+where forall <r> in <smpte_finite>: <r>.<smpte_time_end> == time_plus(<r>.<smpte_time_start>, 3)
+where forall <r> in <smpte_frames_finite>: <r>.<smpte_time_end> == time_plus(<r>.<smpte_frames_start>, 3)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_range_play> ::= 'clock=' (<utc_start_sent> '-' | <utc_finite>)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_finite> ::= <utc_start_sent> '-' <utc_end_sent>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_start_sent> ::= <utc_date_sent> 'T' <utc_clock_sent> ('.' <utc_fraction_sent>)? 'Z'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_date_sent> ::= <utc_date> := random.choice(["20200101", "20200101", "20990101", "19961108"])
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_clock_sent> ::= <utc_clock> := random.choice(["000000", "000000", "142300"])
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_fraction_sent> ::= <utc_fraction> := "25"
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_end_sent> ::= <utc_datetime>
+where forall <r> in <utc_finite>: <r>.<utc_end_sent> == utc_plus(<r>.<utc_start_sent>, 10)
+# PAUSE has exactly one time point (10.6, C22): a time of any unit of 3.5-3.7
+<h_range_pause_sent> ::= 'Range: ' <pause_point> (';time=' <utc_time_param>)? <crlf>
+# RFC 2326
+<pause_point> ::= 'npt=' <npt_time_play> | <smpte_type> '=' (<smpte_time_start> | <smpte_frames_start>) | 'clock=' <utc_start_sent>
+# RECORD: absolute time, open or finite (10.11)
+<h_range_record_sent> ::= 'Range: ' <utc_range_record> (';time=' <utc_time_param>)? <crlf>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_range_record> ::= 'clock=' (<utc_start_sent> '-' | <utc_finite>)
+# RFC 2326 12.34 Scale
+<h_scale_sent> ::= 'Scale: ' <scale_chosen> <crlf>
+# TODO: RFC 2326 12.34, 12.35 - Scale and Speed values (nearest <scale_chosen>, <speed_chosen>): a sample of signs, magnitudes and spellings of the shared rule is sent (including the invalid zero speed);
+#   the servers answer a value they cannot honour with 406/456 or clamp it, which the replies accept.
+<scale_chosen> ::= <scale_value> := random.choice(["1", "2", "0.5", "-1", "1.0", "-3.5", "0", "100", "1.", "-0.25", "0001", "1000000"])
+# RFC 2326 12.35 Speed
+<h_speed_sent> ::= 'Speed: ' <speed_chosen> <crlf>
+# RFC 2326 12.35 Speed
+<speed_chosen> ::= <speed_value> := random.choice(["1", "2.5", "1.0", "0.5", "10", "0", "2.", "0.001", "1000000"])
 
-# 2326 12.34 Scale, 12.35 Speed, 12.38 Timestamp of a reply
-<h_scale_rcv> ::= r'(?i:scale)' ':' <ows> r'-?[0-9]+(?:\.[0-9]*)?' <ows> <crlf>
-<h_speed_rcv> ::= r'(?i:speed)' ':' <ows> r'[0-9]+(?:\.[0-9]*)?' <ows> <crlf>
-<h_timestamp_rcv> ::= r'(?i:timestamp)' ':' <ows> <timestamp_value_rcv> (<lws> <delay_rcv>)? <ows> <crlf>
-<timestamp_value_rcv> ::= r'[0-9]+(?:\.[0-9]*)?|\.[0-9]*'
-<delay_rcv> ::= r'[0-9]+(?:\.[0-9]*)?'
+# Transport (12.39). The accepted forms of the servers are put together from the rules the replies share.
+<h_transport_sent> ::= 'Transport: ' <transport_sent> <crlf>
+# RFC 2326 12.39 Transport
+<h_transport_record_sent> ::= 'Transport: ' <transport_record> <crlf>
+# RFC 2326 12.39 Transport
+<h_transport_any_sent> ::= 'Transport: ' <transport_list> <crlf>
+# TODO: RFC 2326 12.39 - transport-specs the accepted request leaves out (nearest <transport_sent>): destination, source, layers, ssrc, port and ttl on a unicast spec, mode lists, other lower transports.
+#   They are sent by <req_setup_full> with the full rule <transport_list>; the tested servers refuse them with 461 (<code_461>) or 400, which <reply_err> accepts.
+<transport_sent> ::= (<transport_udp_unicast> | <transport_tcp_interleaved> | <transport_udp_unicast_mode>
+    | <transport_tcp_unicast_list> | <transport_both_cast>)
+# RFC 2326 12.39 Transport
+<transport_udp_unicast> ::= <transport_name> '/' <transport_profile> <tp_unicast> <tp_client_port_pair>
+# RFC 2326 12.39 Transport
+<transport_udp_unicast_mode> ::= <transport_name> '/' <transport_profile> '/' <lower_udp> <tp_unicast> <tp_client_port_pair> <tp_mode_play>
+# RFC 2326 12.39 Transport
+<transport_tcp_interleaved> ::= <transport_name> '/' <transport_profile> '/' <lower_tcp> <tp_unicast> <tp_interleaved_pair>
+# RFC 2326 12.39 Transport
+<transport_tcp_unicast_list> ::= <transport_tcp_interleaved> ',' <transport_udp_unicast>
+# A client that handles both unicast and multicast sends two full transport-specs (C13)
+<transport_both_cast> ::= <transport_udp_unicast> ',' <transport_multicast>
+# RFC 2326 12.39 Transport
+<transport_multicast> ::= <transport_name> '/' <transport_profile> <tp_multicast> <tp_destination_multicast> <tp_ttl_sent> <tp_port_pair>
+# TODO: RFC 2326 12.39 - transport-specs of a recording SETUP the narrowed request leaves out (nearest <transport_record>): destination, source, ssrc, ttl, layers, port, multicast and lists; <req_setup_full> sends the whole rule and the servers refuse those forms for RECORD with 461 or 400.
+<transport_record> ::= (<transport_name> '/' <transport_profile> '/' <lower_tcp> <tp_unicast> <tp_interleaved_pair> <tp_mode_record>
+    | <transport_name> '/' <transport_profile> <tp_unicast> <tp_client_port_pair> <tp_mode_record>
+    | <transport_name> '/' <transport_profile> '/' <lower_tcp> <tp_unicast> <tp_interleaved_pair> <tp_mode_record> <tp_append>)
+# RFC 2326 12.39 Transport
+<tp_client_port_pair> ::= ';client_port=' <port_even> '-' <port_odd>
+# RFC 2326 12.39 Transport
+<tp_port_pair> ::= ';port=' <port_even> '-' <port_odd>
+# RFC 2326 12.39 Transport
+<tp_interleaved_pair> ::= ';interleaved=' <channel_even> '-' <channel_odd>
+# RFC 2326 12.39 Transport
+<tp_mode_play> ::= ';mode=PLAY'
+# RFC 2326 12.39 Transport
+<tp_mode_record> ::= ';mode=RECORD'
+# RFC 2326 12.39 Transport
+<tp_destination_multicast> ::= ';destination=' <multicast_address>
+# RFC 2326
+<multicast_address> ::= <address> := multicast_address_pick()
+# RFC 2326
+<multicast_ipv4> ::= <address> := multicast_address_pick(False)
+# RFC 2326 12.39 Transport
+<tp_ttl_sent> ::= ';ttl=' <ttl_sent>
+# RFC 2326
+<ttl_sent> ::= <ttl_number> := str(random.randint(1, 255))
+# RFC 2326 12.39 Transport
+<port_even> ::= <port> := str(random.randrange(20000, 60000, 2))
+# RFC 2326 12.39 Transport
+<port_odd> ::= <port>
+# RFC 2326 12.39 Transport
+<channel_even> ::= <channel> := str(random.randrange(0, 100, 2))
+# RFC 2326 12.39 Transport
+<channel_odd> ::= <channel>
+where forall <p> in <tp_client_port_pair>: <p>.<port_odd> == str(int(<p>.<port_even>) + 1)
+where forall <p> in <tp_port_pair>: <p>.<port_odd> == str(int(<p>.<port_even>) + 1)
+where forall <p> in <tp_interleaved_pair>: <p>.<channel_odd> == str(int(<p>.<channel_even>) + 1)
+where forall <m> in <sdp_content>: <m>.<content_length_sent> == str(len(bytes(<m>.<sdp_sent>)))
+where forall <m> in <sdp_content_publish>: <m>.<content_length_sent> == str(len(bytes(<m>.<sdp_publish>)))
+where forall <m> in <sdp_content_gzip>: <m>.<content_length_sent> == str(len(bytes(<m>.<sdp_gzip>)))
+where forall <m> in <sdp_content_deflate>: <m>.<content_length_sent> == str(len(bytes(<m>.<sdp_deflate>)))
+where forall <m> in <parameter_assignment_content_gzip>: <m>.<content_length_sent> == str(len(bytes(<m>.<parameter_gzip>)))
+where forall <m> in <parameter_names_content>: <m>.<content_length_sent> == str(len(bytes(<m>.<parameter_names>)))
+where forall <m> in <parameter_assignment_content>: <m>.<content_length_sent> == str(len(bytes(<m>.<parameter_assignments>)))
 
-# 2326 12.10: Connection; 9110 7.6.1: Connection = #connection-option, connection-option = token
-# (case-insensitive). In a request of the server any options; in a reply either none of them is
-# "close" (<h_connection_keep_rcv>) or the field names it (<h_connection_close_rcv>: the options
-# before the first "close" are others, those after it any), see <rep_closing>
-<h_connection_rcv> ::= r'(?i:connection)' ':' <ows> <list_lead>* <token> (<list_sep> <token>)* <list_trail>* <ows> <crlf>
-<h_connection_keep_rcv> ::= r'(?i:connection)' ':' <ows> <list_lead>* <connection_option_rcv> (<list_sep> <connection_option_rcv>)* <list_trail>* <ows> <crlf>
-<h_connection_close_rcv> ::= r'(?i:connection)' ':' <ows> <list_lead>* (<connection_option_rcv> <list_sep>)* <connection_close_rcv> (<list_sep> <token>)* <list_trail>* <ows> <crlf>
-# a token other than "close": one that does not begin with it, or begins with it and goes on
-<connection_option_rcv> ::= r"(?:(?!(?i:close))[!#$%&'*+.^_`|~0-9A-Za-z-]+|(?i:close)[!#$%&'*+.^_`|~0-9A-Za-z-]+)"
-<connection_close_rcv> ::= r'(?i:close)'
+# Session description Fandango announces (Appendix C): every control form of C.1.1 (session-level aggregate, relative, absolute, "*", none for a single stream),
+# several payload types with their rtpmap/fmtp lines, c=/t=/b= variants, a=range in any unit and a=etag. The SETUP that follows names the streams by these controls
+# (<publish_setup_url>: its path is computed from the ANNOUNCE of the session).
+# TODO: RFC 2326 C.1.2-C.1.4 - media types and encodings beyond the six listed (nearest <sdp_codec_set>): the description content is the media format (RFC 4566 and the payload RFCs), another protocol;
+#   a sample of video and audio codecs with their rtpmap/fmtp lines is sent, the received side takes every line (<sdp_description>).
+<sdp_sent> ::= 'v=0' <crlf> <sdp_o_sent> 's=' <sdp_name_sent> <crlf> <sdp_c_sent> <sdp_b_sent>? <sdp_t_sent> <sdp_range_sent>? <sdp_etag_sent>? <sdp_aggregate_sent>? <sdp_media_set>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_c_sent> ::= 'c=IN IP4 0.0.0.0' <crlf> | 'c=IN IP4 ' <multicast_ipv4> '/' <ttl_value> <crlf>
+# RFC 2326
+<ttl_value> ::= r'(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_b_sent> ::= 'b=AS:' <digits> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_t_sent> ::= 't=0 0' <crlf> | 't=2873397496 2873404696' <crlf> | 't=2873397496 0' <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_range_sent> ::= 'a=range:' <range_play_item> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_etag_sent> ::= 'a=etag:' <etag_text> <crlf>
+# RFC 2326
+<etag_text> ::= r'[a-z0-9]{1,16}'
+# TODO: RFC 2326 C.1.1 - a session-level a=control that names another host or another scheme (nearest <sdp_aggregate_sent>): RECORD/PAUSE/TEARDOWN for it would go to another server, a second connection that the test setup does not hold (a session is one connection).
+<sdp_aggregate_sent> ::= 'a=control:' (<publish_url> | <publish_url> '/' | '*' | <aggregate_relative> | <publish_path> '/') <crlf>
+# RFC 2326
+<aggregate_relative> ::= 'aggregate' | 'presentation' | './' | 'live/' | '../' | '?' <control_query>
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<sdp_o_sent> ::= 'o=' <sdp_user> ' ' <digits> ' ' <digits> ' IN IP4 127.0.0.1' <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_user> ::= '-' | r'[a-z]{2,8}'
+# RFC 2326 10.3 ANNOUNCE, Appendix C (SDP)
+<sdp_name_sent> ::= r'[A-Za-z0-9 ]{1,16}'
+# One stream with or without its own a=control (C.3), or two streams that each have one (C.2)
+<sdp_media_set> ::= (<sdp_stream_0> | <sdp_codec_set> | <sdp_stream_0> <sdp_stream_1>)
+# a=range at media level when the streams differ in duration (C.1.5)
+<sdp_stream_0> ::= <sdp_codec_set> <sdp_range_sent>? <sdp_control_0>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_stream_1> ::= <sdp_codec_audio> <sdp_range_sent>? <sdp_control_1>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_control_0> ::= 'a=control:' <control_form_0> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_control_1> ::= 'a=control:' <control_form_1> <crlf>
+# TODO: RFC 2326 C.1.1 - a media-level a=control that names another host or another scheme (nearest <control_form_0>, <control_form_1>): the SETUP for it would go to another server, a second connection that the test setup does not hold (a session is one connection).
+#   Sent are the leaf names streamid=N / trackID=N, the absolute publish URL, absolute-path, dot-segment and query references and "*".
+<control_form_0> ::= 'streamid=0' | 'trackID=0' | <publish_url> '/streamid=0' | '*' | <publish_path> '/streamid=0' | '../streamid=0' | 'streamid=0?' <control_query>
+# RFC 2326 3.2 RTSP URL, 6.1 Request-URI
+<control_form_1> ::= 'streamid=1' | 'trackID=1' | <publish_url> '/streamid=1' | <publish_path> '/streamid=1' | '../streamid=1' | 'streamid=1?' <control_query>
+# RFC 2326 3.2 RTSP URL, 6.1 Request-URI
+<control_query> ::= r'[a-z]{1,6}=[0-9]{1,3}'
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_codec_set> ::= <sdp_codec_video> | <sdp_codec_audio>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_codec_video> ::= <sdp_video_h264> | <sdp_video_h264_b> | <sdp_video_mjpeg>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_codec_audio> ::= <sdp_audio_pcmu> | <sdp_audio_pcma> | <sdp_audio_l16> | <sdp_audio_opus>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_port_sent> ::= '0' | '5004' | '49170'
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_media_c> ::= 'c=IN IP4 0.0.0.0' <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_video_h264> ::= ('m=video ' <sdp_port_sent> ' RTP/AVP 96' <crlf> 'a=rtpmap:96 H264/90000' <crlf>
+    'a=fmtp:96 packetization-mode=1; sprop-parameter-sets=Z2QADKzZQUH7ARAAAAMAEAAAAwHg8UKZYA==,aOvjyyLA; profile-level-id=64000C' <crlf>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_video_h264_b> ::= ('m=video ' <sdp_port_sent> ' RTP/AVP 97' <crlf> <sdp_media_c>? 'a=rtpmap:97 H264/90000' <crlf>
+    'a=fmtp:97 packetization-mode=1; sprop-parameter-sets=Z2QADKzZQUH7ARAAAAMAEAAAAwHg8UKZYA==,aOvjyyLA; profile-level-id=64000C' <crlf>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_video_mjpeg> ::= 'm=video ' <sdp_port_sent> ' RTP/AVP 26' <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_audio_pcmu> ::= 'm=audio ' <sdp_port_sent> ' RTP/AVP 0' <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_audio_pcma> ::= 'm=audio ' <sdp_port_sent> ' RTP/AVP 8' <crlf> 'a=ptime:20' <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_audio_l16> ::= 'm=audio ' <sdp_port_sent> ' RTP/AVP 97' <crlf> 'a=rtpmap:97 L16/44100/2' <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_audio_opus> ::= 'm=audio ' <sdp_port_sent> ' RTP/AVP 98' <crlf> 'a=rtpmap:98 opus/48000/2' <crlf> 'a=fmtp:98 sprop-stereo=1' <crlf>
 
-# known fields the client only reads as text: Date, Server, Via, Retry-After, Vary,
-# Accept-Ranges (2326 12.18, 12.36, 12.43, 12.31, 12.42) and request fields (Host 12.21,
-# Proxy-Authorization Table 3, ...); longest names first
-<h_known_text> ::= r'(?i:proxy-authorization|if-modified-since|accept-encoding|accept-language|accept-ranges|authorization|proxy-require|retry-after|conference|user-agent|bandwidth|blocksize|if-match|key-mgmt|referer|require|accept|server|date|from|host|vary|via)' ':' <field_text> <crlf>
-# 2326 8.1: extension-header = message-header; any other field name, unconstrained
-<h_extension_rcv> ::= <extension_name_rcv> ':' <field_text> <crlf>
-<extension_name_rcv> ::= r"(?!(?i:cseq|content-length|content-type|content-base|content-location|content-encoding|content-language|session|transport|public|allow|range|rtp-info|www-authenticate|proxy-authenticate|unsupported|location|scale|speed|timestamp|connection|date|server|expires|last-modified|cache-control|via|retry-after|vary|accept-ranges|bandwidth|blocksize|user-agent|accept|accept-encoding|accept-language|require|proxy-require|conference|from|referer|if-modified-since|if-match|authorization|key-mgmt|proxy-authorization|host)\Z)[!#$%&'*+.^_`|~0-9A-Za-z-]+"
+# --------------------------------------------------------------------------------------------
+# Responses (7): Status-Line, headers, CRLF, body. The reply class selects the next state.
+# --------------------------------------------------------------------------------------------
+<resp_any> ::= <resp_2xx> | <resp_3xx> | <resp_err>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_non_redirect> ::= <resp_2xx> | <resp_err>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_err> ::= <resp_4xx> | <resp_5xx>
 
-# ======================================================================================
-# SDP descriptions of the server (2326 C): the lines RFC 2326 gives a meaning
-# ======================================================================================
+# A reply has no body, or a body of the type its Content-Type names (4.4, 12.14, 12.16): SDP (Appendix C) or any other
+<resp_2xx> ::= <resp_2xx_with_body> | <resp_204>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_3xx> ::= <resp_3xx_with_body> | <resp_304>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_2xx_with_body> ::= <status_line_2xx> <resp_rest>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_3xx_with_body> ::= <status_line_3xx> <resp_rest>
+# 204 and 304 end at the first empty line whatever entity headers they have (4.4); a 204 has no Content-Length (RFC 9110 8.6)
+<resp_204> ::= <rtsp_version> ' ' <code_204> ' ' <reason_phrase>? <crlf> <resp_header_no_length>* <crlf>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_304> ::= <rtsp_version> ' ' <code_304> ' ' <reason_phrase>? <crlf> <resp_headers_any_length> <crlf>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_headers_any_length> ::= (<resp_header_no_length> | <rh_content_length_zero> | <rh_content_length_positive>)*
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_4xx> ::= <status_line_4xx> <resp_rest>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_5xx> ::= <status_line_5xx> <resp_rest>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_1xx> ::= <status_line_1xx> <resp_header_no_length>* <crlf>
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<status_line_1xx> ::= <rtsp_version> ' ' (<code_100> | <code_extension_1xx>) ' ' <reason_phrase>? <crlf>
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_100> ::= '100'
+# TODO: RFC 2326 4.4 rule 3 (nearest <resp_rest>): a body whose end is the server closing the connection is left out. A reply without Content-Length is a reply without body (rule 2, which has precedence:
+#   length zero), and 9.2 makes the Content-Length a MUST of the sender whenever a payload is present (C3, C4), so a body without one breaks a mandatory requirement and is no message of any state:
+#   <split_stream> hands the bytes behind such a reply to the grammar, which rejects them (a violation of the server). Rule 1 (1xx, 204, 304 end at the empty line) is <resp_headers_nobody>.
+<resp_rest> ::= (<resp_headers_nobody> <crlf>
+    | <resp_headers_other_body> <crlf> <body_octet>{clen(<resp_headers_other_body>)}
+    | <resp_headers_sdp_body> <crlf> (<sdp_description> | <sdp_body_coded> | <body_coded>))
+# An SDP reply whose Content-Encoding is gzip or deflate (12.12, RFC 9110 8.4) carries coded octets, which never start with the "v=" of a description: a gzip stream starts with the octet 1F, a zlib
+# stream (deflate) with a CMF octet (compression method 8); the converter pair below decodes them, so that the description is parsed like a plain one (its a=control lines are recorded, C.1.1).
+# Any other coding is opaque octets. The decoded description is the source of the coded octets (Conversion in the Fandango documentation).
+<sdp_body_coded> ::= <coded_first_octet> <body_octet>{clen(<resp_headers_sdp_body>) - 1} := coded_encode(<sdp_body_decoded>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_body_decoded> ::= <sdp_description> := coded_decode(<sdp_body_coded>)
+# RFC 2326
+<coded_first_octet> ::= rb'[\x08\x18\x1f\x28\x38\x48\x58\x68\x78]'
+# RFC 2326
+<body_coded> ::= rb'[\x00-\x07\x09-\x17\x19-\x1e\x20-\x27\x29-\x37\x39-\x47\x49-\x57\x59-\x67\x69-\x75\x77\x79-\xff]' <body_octet>{clen(<resp_headers_sdp_body>) - 1}
+# 9.2: the server may answer after the client stopped waiting for the answer (its timer expired). The party hands such a reply over behind a marker as a message of its own (<mark_late> in the
+# party), accepted between two exchanges in every state and inside an exchange before its reply; the checks on the reply pair it with the request of its CSeq (<exchange_request>).
+<server_late_reply> ::= '\x00late\x00' <resp_any>
 
-# TODO: 2326 C / RFC 8866 (SDP, not in refs/spec): field values other than a=control, a=range, a=etag are read as text in <sdp_value>
-<sdp> ::= <sdp_v_rcv> <sdp_session_line>* <sdp_media>*
-<sdp_v_rcv> ::= 'v=' <sdp_value> <sdp_eol>
-<sdp_session_line> ::= <sdp_a_control_rcv> | <sdp_a_range_rcv> | <sdp_a_etag_rcv> | <sdp_a_other> | <sdp_other_line>
-# 2326 C.1.2: one media section per stream, from its m= line
-<sdp_media> ::= <sdp_m_rcv> <sdp_media_line>*
-<sdp_m_rcv> ::= 'm=' <sdp_value> <sdp_eol>
-<sdp_media_line> ::= <sdp_a_control_rcv> | <sdp_a_range_rcv> | <sdp_a_other> | <sdp_other_line>
-# 2326 C.1.1: a=control:url ("*" = the base URL)
-<sdp_a_control_rcv> ::= 'a=control:' <sdp_value> <sdp_eol>
-# 2326 C.1.5: a=range:<range>
-<sdp_a_range_rcv> ::= 'a=range:' <ranges_specifier_rcv> <sdp_eol>
-# 2326 C.1.8: a=etag:<entity tag>
-<sdp_a_etag_rcv> ::= 'a=etag:' <sdp_value> <sdp_eol>
-<sdp_a_other> ::= 'a=' <sdp_attribute_name> (':' <sdp_value>?)? <sdp_eol>
-<sdp_attribute_name> ::= r'(?!(?:control|range|etag)\Z)[!#-9;-~]+'
-# the other SDP lines: type letter, "=", value (v= and m= open the description and its sections)
-<sdp_other_line> ::= <sdp_other_type> '=' <sdp_value>? <sdp_eol>
-<sdp_other_type> ::= r'[b-ln-uw-z]'
-<sdp_value> ::= r'[^\r\n]+'
-<sdp_eol> ::= '\r\n' | '\n'
+# Status-Line = RTSP-Version SP Status-Code SP Reason-Phrase CRLF (7.1)
+<status_line_2xx> ::= <rtsp_version> ' ' <status_code_2xx> ' ' <reason_phrase>? <crlf>
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<status_line_3xx> ::= <rtsp_version> ' ' <status_code_3xx> ' ' <reason_phrase>? <crlf>
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<status_line_4xx> ::= <rtsp_version> ' ' <status_code_4xx> ' ' <reason_phrase>? <crlf>
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<status_line_5xx> ::= <rtsp_version> ' ' <status_code_5xx> ' ' <reason_phrase>? <crlf>
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<status_code_2xx> ::= <code_200> | <code_201> | <code_250> | <code_extension_2xx>
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<status_code_3xx> ::= <code_300> | <code_301> | <code_302> | <code_303> | <code_305> | <code_extension_3xx>
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<status_code_4xx> ::= (<code_400> | <code_401> | <code_402> | <code_403> | <code_404> | <code_405> | <code_406> | <code_407>
+    | <code_408> | <code_410> | <code_411> | <code_412> | <code_413> | <code_414> | <code_415> | <code_451> | <code_452>
+    | <code_453> | <code_454> | <code_455> | <code_456> | <code_457> | <code_458> | <code_459> | <code_460> | <code_461>
+    | <code_462> | <code_extension_4xx>)
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<status_code_5xx> ::= <code_500> | <code_501> | <code_502> | <code_503> | <code_504> | <code_505> | <code_551> | <code_extension_5xx>
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_200> ::= '200'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_201> ::= '201'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_204> ::= '204'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_250> ::= '250'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_300> ::= '300'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_301> ::= '301'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_302> ::= '302'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_303> ::= '303'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_304> ::= '304'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_305> ::= '305'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_400> ::= '400'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_401> ::= '401'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_402> ::= '402'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_403> ::= '403'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_404> ::= '404'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_405> ::= '405'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_406> ::= '406'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_407> ::= '407'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_408> ::= '408'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_410> ::= '410'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_411> ::= '411'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_412> ::= '412'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_413> ::= '413'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_414> ::= '414'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_415> ::= '415'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_451> ::= '451'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_452> ::= '452'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_453> ::= '453'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_454> ::= '454'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_455> ::= '455'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_456> ::= '456'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_457> ::= '457'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_458> ::= '458'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_459> ::= '459'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_460> ::= '460'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_461> ::= '461'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_462> ::= '462'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_500> ::= '500'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_501> ::= '501'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_502> ::= '502'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_503> ::= '503'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_504> ::= '504'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_505> ::= '505'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_551> ::= '551'
+# extension-code = 3DIGIT (7.1.1): an unrecognized code is treated as the x00 of its class
+<code_extension_1xx> ::= r'1(?:0[1-9]|1[0-9]|2[0-9]|3[0-9]|4[0-9]|5[0-9]|6[0-9]|7[0-9]|8[0-9]|9[0-9])'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_extension_2xx> ::= r'2(?:0[2356789]|1[0-9]|2[0-9]|3[0-9]|4[0-9]|5[1-9]|6[0-9]|7[0-9]|8[0-9]|9[0-9])'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_extension_3xx> ::= r'3(?:0[6-9]|1[0-9]|2[0-9]|3[0-9]|4[0-9]|5[0-9]|6[0-9]|7[0-9]|8[0-9]|9[0-9])'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_extension_4xx> ::= r'4(?:0[9-9]|1[6-9]|2[0-9]|3[0-9]|4[0-9]|5[0-0]|6[3-9]|7[0-9]|8[0-9]|9[0-9])'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<code_extension_5xx> ::= r'5(?:0[6-9]|1[0-9]|2[0-9]|3[0-9]|4[0-9]|5[023456789]|6[0-9]|7[0-9]|8[0-9]|9[0-9])'
+# RFC 2326 7.1 Status-Line, 7.1.1 Status Code and Reason Phrase, 11 Status Code Definitions
+<reason_phrase> ::= r'[^\r\n]+'
 
-# ======================================================================================
-# Requests of the server (2326 10, S->C) and interleaved data
-# ======================================================================================
+# Header fields of replies, in any order (6, 7.1.2, 8.1). A reply with a body has exactly one positive Content-Length (4.4, 12.14).
+<resp_headers_nobody> ::= (<resp_header_no_length>*
+    | <resp_header_no_length>* <rh_content_length_zero> <resp_header_no_length>*)
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_headers_other_body> ::= (<resp_header_no_type>* <rh_content_length_positive> <resp_header_no_type>*
+    | <resp_header_no_type>* <rh_content_type_other> <resp_header_no_type>* <rh_content_length_positive> <resp_header_no_type>*
+    | <resp_header_no_type>* <rh_content_length_positive> <resp_header_no_type>* <rh_content_type_other> <resp_header_no_type>*)
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_headers_sdp_body> ::= (<resp_header_no_type>* <rh_content_type_sdp> <resp_header_no_type>* <rh_content_length_positive> <resp_header_no_type>*
+    | <resp_header_no_type>* <rh_content_length_positive> <resp_header_no_type>* <rh_content_type_sdp> <resp_header_no_type>*)
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_header_no_length> ::= (<resp_header_no_type> | <rh_content_type_sdp> | <rh_content_type_other>)
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<resp_header_no_type> ::= (<rh_cseq> | <rh_session> | <rh_content_base> | <rh_content_location>
+    | <rh_transport> | <rh_range> | <rh_public> | <rh_allow> | <rh_rtp_info> | <rh_www_authenticate>
+    | <rh_proxy_authenticate> | <rh_unsupported> | <rh_date> | <rh_timestamp> | <rh_scale> | <rh_speed>
+    | <rh_location> | <rh_connection> | <rh_last_modified> | <rh_retry_after> | <rh_content_language>
+    | <rh_content_encoding> | <rh_cache_control> | <rh_vary> | <rh_expires> | <rh_generic>)
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<rh_cseq> ::= <name_cseq> ':' <ows> <cseq_reply> <ows> <crlf>
+# RFC 2326 12.17 CSeq
+<cseq_reply> ::= <cseq_value> := record_cseq(<cseq_src>)
+# RFC 2326 12.17 CSeq
+<cseq_src> ::= <cseq_value> := record_cseq(<cseq_reply>)
+# RFC 2326 12.37 Session, 3.4 Session Identifiers
+<rh_session> ::= <name_session> ':' <ows> <session_reply_value> <ows> <crlf>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<rh_content_length_zero> ::= <name_content_length> ':' <ows> r'0+' <ows> <crlf>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<rh_content_length_positive> ::= <name_content_length> ':' <ows> r'0*[1-9][0-9]{0,9}' <ows> <crlf>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<rh_generic> ::= <generic_name> ':' <ows> <field_value>? <crlf>
 
-<srv_request_line> ::= <sp> <uri_rcv> <sp> <rtsp_version_rcv> <crlf>
-<srv_request_tail> ::= <srv_request_line> <srv_rest>
-<srv_rest> ::= <srv_headers> <crlf> | <srv_headers_length> <crlf> <srv_entity_body>
-<srv_entity_body> ::= <block_256>{content_length(<srv_rest>) // 256} <block_16>{content_length(<srv_rest>) % 256 // 16} <octet>{content_length(<srv_rest>) % 16} := entity_to_octets(<srv_entity>)
-<srv_entity> ::= <entity_sdp> | <entity_parameters> | <entity_opaque> | <entity_empty> := octets_to_entity(<srv_entity_body>)
-<srv_headers> ::= <srv_header>* <h_cseq_rcv> <srv_header>*
-<srv_headers_length> ::= <srv_header>* <h_cseq_rcv> <srv_header>* <h_content_length> <srv_header>* \
-    | <srv_header>* <h_content_length> <srv_header>* <h_cseq_rcv> <srv_header>*
-# 2326 10.3: ANNOUNCE S->C updates the session description
-<srv_req_announce> ::= 'ANNOUNCE' <srv_request_tail>
-# 2326 10.8, 10.9: GET_PARAMETER and SET_PARAMETER S->C (bodies of names and of "name: value"
-# lines, <entity_parameters>)
-<srv_req_get_parameter> ::= 'GET_PARAMETER' <srv_request_tail>
-<srv_req_set_parameter> ::= 'SET_PARAMETER' <srv_request_tail>
-# 2326 10.1: OPTIONS S->C
-<srv_req_options> ::= 'OPTIONS' <srv_request_tail>
-# 2326 10.10: REDIRECT, with the mandatory Location (C26), without and with a Range that says
-# when it takes effect; it carries no body
-<srv_req_redirect> ::= 'REDIRECT' <srv_request_line> <redirect_headers> <crlf>
-<srv_req_redirect_ranged> ::= 'REDIRECT' <srv_request_line> <redirect_headers_ranged> <crlf>
-<redirect_headers> ::= <srv_header_no_range>* <h_cseq_rcv> <srv_header_no_range>*
-<redirect_headers_ranged> ::= <srv_header_no_range>* <h_cseq_rcv> <srv_header_no_range>* <h_range_rcv> <srv_header_no_range>* \
-    | <srv_header_no_range>* <h_range_rcv> <srv_header_no_range>* <h_cseq_rcv> <srv_header_no_range>*
-<srv_req_extension> ::= <srv_extension_method> <srv_request_tail>
-<srv_extension_method> ::= r'(?!(?:ANNOUNCE|GET_PARAMETER|SET_PARAMETER|OPTIONS|REDIRECT)\Z)[!#%&\'*+.^_`|~0-9A-Za-z-]+'
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<name_cseq> ::= r'(?i:cseq)'
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<name_session> ::= r'(?i:session)'
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<name_content_length> ::= r'(?i:content-length)'
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<generic_name> ::= r"(?:[Aa](?:[Ll](?:[Ll](?:[Oo](?:[Ww](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-VX-Z\^-vx-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-KM-Z\^-km-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-KM-Z\^-km-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Cc](?:[Aa](?:[Cc](?:[Hh](?:[Ee](?:[\-](?:[Cc](?:[Oo](?:[Nn](?:[Tt](?:[Rr](?:[Oo](?:[Ll](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-KM-Z\^-km-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-GI-Z\^-gi-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Oo](?:[Nn](?:[Nn](?:[Ee](?:[Cc](?:[Tt](?:[Ii](?:[Oo](?:[Nn](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Tt](?:[Ee](?:[Nn](?:[Tt](?:[\-](?:[Bb](?:[Aa](?:[Ss](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-RT-Z\^-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ee](?:[Nn](?:[Cc](?:[Oo](?:[Dd](?:[Ii](?:[Nn](?:[Gg](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-FH-Z\^-fh-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-CE-Z\^-ce-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ll](?:[Aa](?:[Nn](?:[Gg](?:[Uu](?:[Aa](?:[Gg](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-FH-Z\^-fh-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-TV-Z\^-tv-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-FH-Z\^-fh-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ee](?:[Nn](?:[Gg](?:[Tt](?:[Hh](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-GI-Z\^-gi-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-FH-Z\^-fh-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Oo](?:[Cc](?:[Aa](?:[Tt](?:[Ii](?:[Oo](?:[Nn](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-DF-NP-Z\^-`b-df-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Tt](?:[Yy](?:[Pp](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-OQ-Z\^-oq-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-XZ\^-xz|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ACDF-KM-SU-Z\^-acdf-km-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-SU-Z\^-mo-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ss](?:[Ee](?:[Qq](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-PR-Z\^-pr-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-NP-RT-Z\^-`b-np-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Dd](?:[Aa](?:[Tt](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ee](?:[Xx](?:[Pp](?:[Ii](?:[Rr](?:[Ee](?:[Ss](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-RT-Z\^-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-OQ-Z\^-oq-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-WYZ\^-wyz|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ll](?:[Aa](?:[Ss](?:[Tt](?:[\-](?:[Mm](?:[Oo](?:[Dd](?:[Ii](?:[Ff](?:[Ii](?:[Ee](?:[Dd](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-CE-Z\^-ce-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-EG-Z\^-eg-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-CE-Z\^-ce-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-LN-Z\^-ln-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-RT-Z\^-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Oo](?:[Cc](?:[Aa](?:[Tt](?:[Ii](?:[Oo](?:[Nn](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-NP-Z\^-`b-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Pp](?:[Rr](?:[Oo](?:[Xx](?:[Yy](?:[\-](?:[Aa](?:[Uu](?:[Tt](?:[Hh](?:[Ee](?:[Nn](?:[Tt](?:[Ii](?:[Cc](?:[Aa](?:[Tt](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-GI-Z\^-gi-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-TV-Z\^-tv-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-XZ\^-xz|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-WYZ\^-wyz|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Uu](?:[Bb](?:[Ll](?:[Ii](?:[Cc](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-KM-Z\^-km-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9AC-Z\^-ac-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QSTV-Z\^-qstv-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Rr](?:[Aa](?:[Nn](?:[Gg](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-FH-Z\^-fh-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ee](?:[Tt](?:[Rr](?:[Yy](?:[\-](?:[Aa](?:[Ff](?:[Tt](?:[Ee](?:[Rr](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-EG-Z\^-eg-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-XZ\^-xz|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Tt](?:[Pp](?:[\-](?:[Ii](?:[Nn](?:[Ff](?:[Oo](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-EG-Z\^-eg-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-OQ-Z\^-oq-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-DF-SU-Z\^-`b-df-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ss](?:[Cc](?:[Aa](?:[Ll](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-KM-Z\^-km-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ee](?:[Ss](?:[Ss](?:[Ii](?:[Oo](?:[Nn](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-RT-Z\^-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-RT-Z\^-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Pp](?:[Ee](?:[Ee](?:[Dd](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-CE-Z\^-ce-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABDF-OQ-Z\^-bdf-oq-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Tt](?:[Ii](?:[Mm](?:[Ee](?:[Ss](?:[Tt](?:[Aa](?:[Mm](?:[Pp](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-OQ-Z\^-oq-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-LN-Z\^-ln-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-RT-Z\^-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-LN-Z\^-ln-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Rr](?:[Aa](?:[Nn](?:[Ss](?:[Pp](?:[Oo](?:[Rr](?:[Tt](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-OQ-Z\^-oq-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-RT-Z\^-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-QS-Z\^-hj-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Uu](?:[Nn](?:[Ss](?:[Uu](?:[Pp](?:[Pp](?:[Oo](?:[Rr](?:[Tt](?:[Ee](?:[Dd](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-CE-Z\^-ce-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-OQ-Z\^-oq-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-OQ-Z\^-oq-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-TV-Z\^-tv-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-RT-Z\^-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Vv](?:[Aa](?:[Rr](?:[Yy](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-XZ\^-xz|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ww](?:[Ww](?:[Ww](?:[\-](?:[Aa](?:[Uu](?:[Tt](?:[Hh](?:[Ee](?:[Nn](?:[Tt](?:[Ii](?:[Cc](?:[Aa](?:[Tt](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-GI-Z\^-gi-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-TV-Z\^-tv-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-VX-Z\^-vx-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-VX-Z\^-vx-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9BF-KM-OQX-Z\^-`bf-km-oqx-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)"
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<field_value> ::= r'[^\r\n \t][^\r\n]*' <field_fold>*
+# RFC 2326
+<field_fold> ::= <crlf> r'[ \t]+[^\r\n]*'
 
-# 2326 10.12: "$", one-byte channel, two-byte length, the data (an RTP or RTCP packet;
-# its format is RFC 3550's)
-# TODO: 2326 10.12 / RFC 3550 (out of the manifest): RTP and RTCP packets inside <interleaved_frame> are another protocol
-<interleaved_frame> ::= b'$' <channel_byte> <frame_length_rcv> <block_256>{frame_length(<frame_length_rcv>) // 256} <block_16>{frame_length(<frame_length_rcv>) % 256 // 16} <octet>{frame_length(<frame_length_rcv>) % 16}
-<channel_byte> ::= <octet>
-<frame_length_rcv> ::= <octet> <octet>
+# Session = "Session" ":" session-id [ ";" "timeout" "=" delta-seconds ] (12.37); the timeout only in replies
+<session_reply_value> ::= <session_id_reply> (';' <ows> 'timeout' <ows> '=' <ows> <delta_seconds>)?
+# RFC 2326 12.37 Session, 3.4 Session Identifiers
+<session_id_reply> ::= <session_id> := record_session(<session_id_src>)
+# RFC 2326 12.37 Session, 3.4 Session Identifiers
+<session_id_src> ::= <session_id> := record_session(<session_id_reply>)
+# RFC 2326 12.37 Session, 3.4 Session Identifiers
+<session_id> ::= r'[A-Za-z0-9$_.+-]+'
+# RFC 2326 15.1 Base Syntax, RFC 9110 5.6, RFC 3986 3.2.2, RFC 5234 B.1
+<delta_seconds> ::= r'[0-9]{1,10}'
+# RFC 2326 12.17 CSeq
+<cseq_value> ::= r'[0-9]{1,10}'
 
-# ======================================================================================
-# Constraints
-# ======================================================================================
+# Interleaved binary data (10.12): '$', channel, two-byte length; the Client party hands over the frame header only
+# Interleaved data the client sends (10.12): '$', the channel, the two-byte length, one packet of the upper layer
+<interleaved_frame_sent> ::= (<frame_up_rtp> | <frame_up_rtp_long> | <frame_up_rtcp> | <frame_up_rtcp_sr> | <frame_up_empty>)
+# RFC 2326 10.12 Embedded (Interleaved) Binary Data
+<frame_up_rtp> ::= '$' <channel_up> rb'\x00\x0c' <rtp_header_sent>
+# RFC 2326 10.12 Embedded (Interleaved) Binary Data
+<frame_up_rtp_long> ::= '$' <channel_up> rb'\x00\x14' rb'\x80[\x00-\x7f][\x00-\xff]{18}'
+# RFC 2326 10.12 Embedded (Interleaved) Binary Data
+<frame_up_rtcp> ::= '$' <channel_up> rb'\x00\x08' <rtcp_header_sent>
+# RFC 2326 10.12 Embedded (Interleaved) Binary Data
+<frame_up_rtcp_sr> ::= '$' <channel_up> rb'\x00\x1c' rb'\x80\xc8\x00\x06[\x00-\xff]{24}'
+# RFC 2326 10.12 Embedded (Interleaved) Binary Data
+<frame_up_empty> ::= '$' <channel_up> rb'\x00\x00'
+# The channel of RTP is the first of the interleaved pair the SETUP negotiated, the one of RTCP the second (10.12)
+<channel_up> ::= <channel_id>
+where forall <f> in <frame_up_rtp>: <f>.<channel_up> == negotiated_channel_before(<f>, 0)
+where forall <f> in <frame_up_rtp_long>: <f>.<channel_up> == negotiated_channel_before(<f>, 0)
+where forall <f> in <frame_up_empty>: <f>.<channel_up> == negotiated_channel_before(<f>, 0)
+where forall <f> in <frame_up_rtcp>: <f>.<channel_up> == negotiated_channel_before(<f>, 1)
+where forall <f> in <frame_up_rtcp_sr>: <f>.<channel_up> == negotiated_channel_before(<f>, 1)
+# RFC 2326
+<rtp_header_sent> ::= rb'\x80[\x00-\x7f][\x00-\xff]{10}'
+# RFC 2326
+<rtcp_header_sent> ::= rb'\x80\xc9\x00\x01[\x00-\xff]{4}'
+# TODO: RFC 2326 10.12 - the RTP/RTCP packet inside a frame (nearest <interleaved_frame>): the packet is defined by RFC 3550, another protocol; the Client party drops the payload after cutting the stream
+#   by the two-byte length, and hands over at most RTSP_FRAME_LIMIT frame headers per session, so that Fandango does not parse the media flood.
+<interleaved_frame> ::= '$' <channel_id> <frame_length>
+# RFC 2326 10.12 Embedded (Interleaved) Binary Data
+<channel_id> ::= rb'[\x00-\xff]'
+# RFC 2326 10.12 Embedded (Interleaved) Binary Data
+<frame_length> ::= rb'[\x00-\xff]' rb'[\x00-\xff]'
 
-# 2326 12.17 (C1): every reply carries the CSeq of the request it answers
-where forall <h> in <rsp_headers>: cseq_echoed(<h>)
-where forall <h> in <rsp_headers_length>: cseq_echoed(<h>)
-where forall <h> in <rsp_headers_closing>: cseq_echoed(<h>)
-where forall <h> in <rsp_headers_length_closing>: cseq_echoed(<h>)
-# 2326 9.2 (C3): the CSeq of each request is one more than the client's previous request's
-where forall <h> in <h_cseq>: int(<h>.<cseq_value>) == expected_cseq(<h>)
-# 2326 9.2 (C2, F89): requests are resent over UDP only
-where forall <e> in <resend_due>: resend_allowed(<e>)
-# 2326 3.2, 9 (F88): the scheme of the session's transport
-where forall <s> in <rtsp_scheme>: str(<s>).lower() == URL_SCHEME
-where forall <h> in <rsp_headers>: record_answered_cseq(<h>)
-where forall <h> in <rsp_headers_length>: record_answered_cseq(<h>)
-where forall <h> in <rsp_headers_closing>: record_answered_cseq(<h>)
-where forall <h> in <rsp_headers_length_closing>: record_answered_cseq(<h>)
-where forall <h> in <rsp_headers>: record_reply_effects(<h>)
-where forall <h> in <rsp_headers_length>: record_reply_effects(<h>)
-where forall <h> in <rsp_headers_closing>: record_reply_effects(<h>)
-where forall <h> in <rsp_headers_length_closing>: record_reply_effects(<h>)
-# a session starts from a fresh record of received values
-where forall <t> in <reply_start>: session_begins(<t>)
-# the restarted reply timer before wrong credentials runs RTSP_AUTH_REPLY_WAIT seconds
-where forall <t> in <reply_start_auth>: str(<t>.<timer_timeout>) == RTSP_AUTH_REPLY_WAIT
-# 2326 C.1.1, C.3: the streams of a description, which SETUPs address (recorded, recalled by
-# <described_stream> and <setup_target>); C.1.8 its a=etag (recalled by <etag_chars>)
-where forall <s> in <sdp>: record_description(<s>)
-# 2326 12.37 (C9): requests of a session return the identifier its SETUP reply assigned;
-# recorded from the reply, recalled by the generator of <session_id_sent>
-where forall <r> in <rep_setup_2xx>: record_session(<r>)
-where forall <r> in <rep_play_2xx>: record_play_session(<r>)
-where forall <h> in <h_session>: str(<h>.<session_id_sent>) == session_for(<h>)
-# 2326 12.17: the client's reply echoes the CSeq of the server's request
-where forall <q> in <srv_headers>: record_server_cseq(<q>)
-where forall <q> in <srv_headers_length>: record_server_cseq(<q>)
-where forall <q> in <redirect_headers>: record_server_cseq(<q>)
-where forall <q> in <redirect_headers_ranged>: record_server_cseq(<q>)
-where forall <e> in <cseq_echo>: str(<e>) == request_cseq(<e>)
-# 2326 12.37, 12.32: the client's reply returns the Session of the server's request and lists in
-# Unsupported the option-tags of its Require
-where forall <s> in <session_id_echo>: str(<s>) == request_session(<s>)
-where forall <t> in <option_tag_echo>: str(<t>) == required_tag_at(<t>)
-# 2326 4.4 (C7, C8 via 9110 8.6): no Content-Length in 1xx replies
-where forall <r> in <rep_1xx>: no_content_length(<r>)
-# 2326 12.38 (C13): the reply echoes the request's Timestamp
-where forall <h> in <rsp_headers>: timestamp_echoed(<h>)
-where forall <h> in <rsp_headers_length>: timestamp_echoed(<h>)
-where forall <h> in <rsp_headers_closing>: timestamp_echoed(<h>)
-where forall <h> in <rsp_headers_length_closing>: timestamp_echoed(<h>)
-# Tolerance "timestamp-not-echoed" (tolerances.json): a reply header block without any Timestamp
-# field although the request carried one (<x> is passed so that Fandango reports the failing tree)
-where forall <x> in <timestamp_not_echoed>: tolerated("timestamp-not-echoed", <x>)
-# 2326 12.32 (C21): the reply to a request with Require lists in Unsupported the option-tags the
-# session shows the server does not support (an earlier Unsupported, a 551 to one option)
-where forall <h> in <rsp_headers>: unsupported_listed(<h>)
-where forall <h> in <rsp_headers_length>: unsupported_listed(<h>)
-where forall <h> in <rsp_headers_closing>: unsupported_listed(<h>)
-where forall <h> in <rsp_headers_length_closing>: unsupported_listed(<h>)
-# ... and a 2xx or 551 reply to such a request has an Unsupported field
-where forall <h> in <rsp_headers>: require_acknowledged(<h>)
-where forall <h> in <rsp_headers_length>: require_acknowledged(<h>)
-where forall <h> in <rsp_headers_closing>: require_acknowledged(<h>)
-where forall <h> in <rsp_headers_length_closing>: require_acknowledged(<h>)
-# 9110 5.3 (C14, C34): fields that are no lists appear at most once, in replies and in the
-# server's requests
-where forall <h> in <rsp_headers>: at_most_once(<h>)
-where forall <h> in <rsp_headers_length>: at_most_once(<h>)
-where forall <h> in <rsp_headers_closing>: at_most_once(<h>)
-where forall <h> in <rsp_headers_length_closing>: at_most_once(<h>)
-where forall <h> in <srv_headers>: at_most_once(<h>)
-where forall <h> in <srv_headers_length>: at_most_once(<h>)
-where forall <h> in <redirect_headers>: at_most_once(<h>)
-where forall <h> in <redirect_headers_ranged>: at_most_once(<h>)
-# 9110 15.5.2 (C32): a 401 reply carries a WWW-Authenticate challenge
-where forall <r> in <rep_err>: challenge_in_401(<r>)
-where forall <r> in <rep_err_closing>: challenge_in_401(<r>)
-# 2326 10, notes on Table 2 (C25, F52): a method the session shows the server lacks (an extension
-# method, or one Table 2 does not require) gets 501 (or a refusal a server gives before it looks
-# at the method); on every final reply but 3xx, whatever request it answers
-where forall <r> in <rep_2xx>: unimplemented_refused(<r>)
-where forall <r> in <rep_2xx_closing>: unimplemented_refused(<r>)
-where forall <r> in <rep_err>: unimplemented_refused(<r>)
-where forall <r> in <rep_err_closing>: unimplemented_refused(<r>)
-where forall <r> in <rep_304>: unimplemented_refused(<r>)
-where forall <r> in <rep_304_closing>: unimplemented_refused(<r>)
-# 9110 15.5.8 (C33): a 407 reply carries a Proxy-Authenticate challenge
-where forall <r> in <rep_err>: challenge_in_407(<r>)
-where forall <r> in <rep_err_closing>: challenge_in_407(<r>)
-# 2326 11.3.1 (C23): a 405 reply carries Allow
-where forall <r> in <rep_err>: allow_in_405(<r>)
-where forall <r> in <rep_err_closing>: allow_in_405(<r>)
-# 2326 12.34 (C17): a 2xx reply to PLAY or RECORD with Scale contains the chosen Scale
-where forall <h> in <rsp_headers>: scale_answered(<h>)
-where forall <h> in <rsp_headers_length>: scale_answered(<h>)
-where forall <h> in <rsp_headers_closing>: scale_answered(<h>)
-where forall <h> in <rsp_headers_length_closing>: scale_answered(<h>)
-# 2326 12.39 (C15): where the session shows the server does not record (Public without RECORD,
-# 501 to a RECORD without Range, Allow without RECORD for the SETUP's own or aggregate URL), hence
-# not append, no 2xx that chooses mode RECORD for a
-# transport-spec asking to append (or, without Transport, to a SETUP whose every spec asks); on
-# every 2xx, since a SETUP's 2xx also arrives as <rep_any> (e.g. after <req_setup_close>);
-# append_refused passes the replies to requests that offer no transport-spec asking to append
-where forall <r> in <rep_2xx>: append_refused(<r>)
-where forall <r> in <rep_2xx_closing>: append_refused(<r>)
-# 2326 10.10 (C26): REDIRECT carries Location
-where forall <r> in <srv_req_redirect>: location_in_redirect(<r>)
-where forall <r> in <srv_req_redirect_ranged>: location_in_redirect(<r>)
-# 2326 12.14 (C5, C6): the Content-Length of the client's bodies is their length
-where forall <a> in <announce_body>: int(<a>.<h_announce_length>.<announce_length>) == len(bytes(<a>.<sdp_sent>))
-where forall <g> in <parameter_names_body>: int(<g>.<h_parameters_length>.<parameters_length>) == len(bytes(<g>.<parameter_names>))
-where forall <s> in <parameter_settings_body>: int(<s>.<h_parameters_length>.<parameters_length>) == len(bytes(<s>.<parameter_settings>))
-# 9110 8.4, 2326 12.14 (C5, C6; F22): a coded body of the client: Content-Encoding names its
-# coding, Content-Length its length
-where forall <c> in <content_coding_sent>: str(<c>) == body_coding(<c>)
-where forall <l> in <coded_length>: int(<l>) == coded_length(<l>)
-# an RTP port pair: RTCP on the port above RTP
-where forall <p> in <client_port_pair>: int(<p>.<client_rtcp_port>) == int(<p>.<client_rtp_port>) + 1
-# 9110 8.6, 2326 4.4 (C7, C8): a 204 reply has neither Content-Length nor body
-where forall <r> in <rep_2xx>: no_content_length_in_204(<r>)
-where forall <r> in <rep_2xx_closing>: no_content_length_in_204(<r>)
-# 2326 C.2, C.3 (C35, C36): several media sections each carry a=control
-where forall <s> in <sdp>: media_controls_complete(<s>)
-# 2326 12.37 (C11): a new session gets an identifier of its own; on every 2xx, since a SETUP's
-# 2xx also arrives as <rep_any> (after <req_setup_close>); new_session_distinct passes the
-# replies to requests other than a new-session SETUP
-where forall <r> in <rep_2xx>: new_session_distinct(<r>)
-where forall <r> in <rep_2xx_closing>: new_session_distinct(<r>)
-# 2326 12.9 (C27): one conference-id per session
-where forall <h> in <h_conference>: conference_unchanged(<h>)
+# --------------------------------------------------------------------------------------------
+# Lexical rules (15.1)
+# --------------------------------------------------------------------------------------------
+<crlf> ::= '\r\n'
+# RFC 2326 15.1 Base Syntax, RFC 9110 5.6, RFC 3986 3.2.2, RFC 5234 B.1
+<ows> ::= <ws>? := ' '
+# RFC 2326 15.1 Base Syntax, RFC 9110 5.6, RFC 3986 3.2.2, RFC 5234 B.1
+<ws> ::= r'(?:\r\n)?[ \t]+'
+# RFC 2326 15.1 Base Syntax, RFC 9110 5.6, RFC 3986 3.2.2, RFC 5234 B.1
+<body_octet> ::= rb'[\x00-\xff]'
+
+
+# --------------------------------------------------------------------------------------------
+# Header fields with a structure the grammar knows (12): one rule for the value, shared by what is sent and received
+# --------------------------------------------------------------------------------------------
+<rh_content_type_sdp> ::= <name_content_type> ':' <ows> <media_type_sdp> <media_params> <ows> <crlf>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<rh_content_type_other> ::= <name_content_type> ':' <ows> <media_type_other> <media_params> <ows> <crlf>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<rh_content_base> ::= <name_content_base> ':' <ows> <content_base_uri> <ows> <crlf>
+# RFC 2326
+<content_base_uri> ::= <uri_reference> := record_base(<content_base_src>)
+# RFC 2326
+<content_base_src> ::= <uri_reference> := record_base(<content_base_uri>)
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<rh_content_location> ::= <name_content_location> ':' <ows> <content_location_uri> <ows> <crlf>
+# RFC 2326
+<content_location_uri> ::= <uri_reference> := record_location(<content_location_src>)
+# RFC 2326
+<content_location_src> ::= <uri_reference> := record_location(<content_location_uri>)
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_location> ::= <name_location> ':' <ows> <uri_reference> <ows> <crlf>
+# RFC 2326 12.39 Transport
+<rh_transport> ::= <name_transport> ':' <ows> <transport_list> <ows> <crlf>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<rh_range> ::= <name_range> ':' <ows> <range_value> <ows> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_public> ::= <name_public> ':' <token_list> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_allow> ::= <name_allow> ':' <token_list> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_rtp_info> ::= <name_rtp_info> ':' <ows> <rtp_info_value> <ows> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_www_authenticate> ::= <name_www_authenticate> ':' <challenge_list> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_proxy_authenticate> ::= <name_proxy_authenticate> ':' <challenge_list> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_unsupported> ::= <name_unsupported> ':' <token_list> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_date> ::= <name_date> ':' <ows> <http_date> <ows> <crlf>
+# RFC 2326 12.38 Timestamp
+<rh_timestamp> ::= <name_timestamp> ':' <ows> <timestamp_value> <ows> <crlf>
+# RFC 2326 12.34 Scale
+<rh_scale> ::= <name_scale> ':' <ows> <scale_value> <ows> <crlf>
+# RFC 2326 12.35 Speed
+<rh_speed> ::= <name_speed> ':' <ows> <speed_value> <ows> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_connection> ::= <name_connection> ':' <token_list> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_last_modified> ::= <name_last_modified> ':' <ows> <http_date> <ows> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_retry_after> ::= <name_retry_after> ':' <ows> (<http_date> | <delta_seconds>) <ows> <crlf>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<rh_content_language> ::= <name_content_language> ':' <token_list> <crlf>
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<rh_content_encoding> ::= <name_content_encoding> ':' <token_list> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_cache_control> ::= <name_cache_control> ':' <ows> <cache_directive_list> <ows> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<rh_vary> ::= <name_vary> ':' (<ows> <vary_any> <ows> | <token_list>) <crlf>
+# Expires = "Expires" ":" HTTP-date (12.19); a value in another format is treated as already past, so every field value is accepted
+<rh_expires> ::= <name_expires> ':' <ows> <field_value> <ows> <crlf>
+# RFC 2326 12 Header Field Definitions (received form)
+<name_expires> ::= r'(?i:expires)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_last_modified> ::= r'(?i:last-modified)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_retry_after> ::= r'(?i:retry-after)'
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<name_content_language> ::= r'(?i:content-language)'
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<name_content_encoding> ::= r'(?i:content-encoding)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_cache_control> ::= r'(?i:cache-control)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_vary> ::= r'(?i:vary)'
+# RFC 2326
+<vary_any> ::= '*'
+# Cache-Control = "Cache-Control" ":" 1#cache-directive (12.8)
+<cache_directive_list> ::= <cache_directive> (<ows> ',' <ows> <cache_directive>)*
+# 12.8: cache-directive = cache-request-directive | cache-response-directive; the fixed strings of both (no-cache is in both) are alternatives of their own,
+# and cache-extension = token [ "=" ( token | quoted-string ) ] is every other form (a fixed name with a value, a bare max-age, an unknown name)
+<cache_directive> ::= (<cache_directive_fixed> | <cache_max_age> | <cache_extension>)
+# RFC 2326 12.8 Cache-Control
+<cache_directive_fixed> ::= (<cache_no_cache> | <cache_max_stale> | <cache_min_fresh> | <cache_only_if_cached> | <cache_public> | <cache_private> | <cache_no_transform> | <cache_must_revalidate> | <cache_proxy_revalidate>)
+# RFC 2326 12.8 Cache-Control
+<cache_no_cache> ::= r'(?i:no-cache)'
+# RFC 2326 12.8 Cache-Control
+<cache_max_stale> ::= r'(?i:max-stale)'
+# RFC 2326 12.8 Cache-Control
+<cache_min_fresh> ::= r'(?i:min-fresh)'
+# RFC 2326 12.8 Cache-Control
+<cache_only_if_cached> ::= r'(?i:only-if-cached)'
+# RFC 2326 12.8 Cache-Control
+<cache_public> ::= r'(?i:public)'
+# RFC 2326 12.8 Cache-Control
+<cache_private> ::= r'(?i:private)'
+# RFC 2326 12.8 Cache-Control
+<cache_no_transform> ::= r'(?i:no-transform)'
+# RFC 2326 12.8 Cache-Control
+<cache_must_revalidate> ::= r'(?i:must-revalidate)'
+# RFC 2326 12.8 Cache-Control
+<cache_proxy_revalidate> ::= r'(?i:proxy-revalidate)'
+# RFC 2326 12.8 Cache-Control
+<cache_max_age> ::= r'(?i:max-age)' '=' <delta_seconds>
+# RFC 2326 12.8 Cache-Control
+<cache_extension> ::= (<cache_extension_name> ('=' <cache_extension_value>)?
+    | <cache_directive_fixed_name> '=' <cache_extension_value>
+    | r'(?i:max-age)' ('=' <cache_extension_value_non_delta>)?)
+# RFC 2326 12.8 Cache-Control
+<cache_extension_name> ::= r"(?:[Mm](?:[Aa](?:[Xx](?:[\-](?:[Aa](?:[Gg](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-FH-Z\^-fh-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ss](?:[Tt](?:[Aa](?:[Ll](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-KM-Z\^-km-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-RT-Z\^-`b-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-WYZ\^-wyz|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ii](?:[Nn](?:[\-](?:[Ff](?:[Rr](?:[Ee](?:[Ss](?:[Hh](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-GI-Z\^-gi-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-RT-Z\^-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-EG-Z\^-eg-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Uu](?:[Ss](?:[Tt](?:[\-](?:[Rr](?:[Ee](?:[Vv](?:[Aa](?:[Ll](?:[Ii](?:[Dd](?:[Aa](?:[Tt](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-CE-Z\^-ce-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-KM-Z\^-km-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-UW-Z\^-uw-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-RT-Z\^-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-HJ-TV-Z\^-`b-hj-tv-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Nn](?:[Oo](?:[\-](?:[Cc](?:[Aa](?:[Cc](?:[Hh](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-GI-Z\^-gi-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Tt](?:[Rr](?:[Aa](?:[Nn](?:[Ss](?:[Ff](?:[Oo](?:[Rr](?:[Mm](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-LN-Z\^-ln-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-EG-Z\^-eg-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-RT-Z\^-rt-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-SU-Z\^-bd-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Oo](?:[Nn](?:[Ll](?:[Yy](?:[\-](?:[Ii](?:[Ff](?:[\-](?:[Cc](?:[Aa](?:[Cc](?:[Hh](?:[Ee](?:[Dd](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-CE-Z\^-ce-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-GI-Z\^-gi-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-EG-Z\^-eg-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-XZ\^-xz|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-KM-Z\^-km-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Pp](?:[Rr](?:[Ii](?:[Vv](?:[Aa](?:[Tt](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-UW-Z\^-uw-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Oo](?:[Xx](?:[Yy](?:[\-](?:[Rr](?:[Ee](?:[Vv](?:[Aa](?:[Ll](?:[Ii](?:[Dd](?:[Aa](?:[Tt](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-CE-Z\^-ce-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-KM-Z\^-km-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-UW-Z\^-uw-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-XZ\^-xz|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-WYZ\^-wyz|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-NP-Z\^-hj-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Uu](?:[Bb](?:[Ll](?:[Ii](?:[Cc](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9ABD-Z\^-bd-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-HJ-Z\^-hj-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-KM-Z\^-km-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9AC-Z\^-ac-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QSTV-Z\^-qstv-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-LQ-Z\^-lq-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)"
+# RFC 2326 12.8 Cache-Control
+<cache_directive_fixed_name> ::= r'(?i:no-cache|max-stale|min-fresh|only-if-cached|public|private|no-transform|must-revalidate|proxy-revalidate)'
+# RFC 2326 12.8 Cache-Control
+<cache_extension_value> ::= (<token> | <quoted_string>)
+# RFC 2326 12.8 Cache-Control
+<cache_extension_value_non_delta> ::= (r"[0-9]*[!#$%&'*+.^_`|~A-Za-z-][!#$%&'*+.^_`|~0-9A-Za-z-]*" | <quoted_string>)
+
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<name_content_type> ::= r'(?i:content-type)'
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<name_content_base> ::= r'(?i:content-base)'
+# RFC 2326 7 Response, 4.4 Message Length, 8.1 Entity Header Fields, 12.14 Content-Length
+<name_content_location> ::= r'(?i:content-location)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_location> ::= r'(?i:location)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_transport> ::= r'(?i:transport)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_range> ::= r'(?i:range)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_public> ::= r'(?i:public)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_allow> ::= r'(?i:allow)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_rtp_info> ::= r'(?i:rtp-info)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_www_authenticate> ::= r'(?i:www-authenticate)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_proxy_authenticate> ::= r'(?i:proxy-authenticate)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_unsupported> ::= r'(?i:unsupported)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_date> ::= r'(?i:date)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_timestamp> ::= r'(?i:timestamp)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_scale> ::= r'(?i:scale)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_speed> ::= r'(?i:speed)'
+# RFC 2326 12 Header Field Definitions (received form)
+<name_connection> ::= r'(?i:connection)'
+
+# Transport = "Transport" ":" 1#transport-spec (12.39)
+<transport_list> ::= <transport_spec> (<ows> ',' <ows> <transport_spec>)*
+# RFC 2326 12.39 Transport
+<transport_spec> ::= <transport_name> '/' <transport_profile> ('/' <lower_transport>)? <transport_param>*
+# RFC 2326 12.39 Transport
+<transport_name> ::= 'RTP'
+# RFC 2326 12.39 Transport
+<transport_profile> ::= 'AVP'
+# RFC 2326 12.39 Transport
+<lower_transport> ::= <lower_tcp> | <lower_udp>
+# RFC 2326 12.39 Transport
+<lower_tcp> ::= 'TCP'
+# RFC 2326 12.39 Transport
+<lower_udp> ::= 'UDP'
+# RFC 2326 12.39 Transport
+<transport_param> ::= (<tp_unicast> | <tp_multicast> | <tp_destination> | <tp_source> | <tp_interleaved> | <tp_append>
+    | <tp_ttl> | <tp_layers> | <tp_port> | <tp_client_port> | <tp_server_port> | <tp_ssrc> | <tp_mode>)
+# RFC 2326 12.39 Transport
+<tp_unicast> ::= ';unicast'
+# RFC 2326 12.39 Transport
+<tp_multicast> ::= ';multicast'
+# RFC 2326 12.39 Transport
+<tp_destination> ::= ';destination' ('=' <address>)?
+# RFC 2326 12.39 Transport
+<tp_source> ::= ';source=' <address>
+# RFC 2326 12.39 Transport
+<tp_interleaved> ::= ';interleaved=' <channel> ('-' <channel>)?
+# RFC 2326 12.39 Transport
+<tp_append> ::= ';append'
+# RFC 2326 12.39 Transport
+<tp_ttl> ::= ';ttl=' <ttl_number>
+# RFC 2326
+<ttl_number> ::= r'[0-9]{1,3}'
+# RFC 2326 12.39 Transport
+<tp_layers> ::= ';layers=' r'[0-9]+'
+# RFC 2326 12.39 Transport
+<tp_port> ::= ';port=' <port> ('-' <port>)?
+# RFC 2326 12.39 Transport
+<tp_client_port> ::= ';client_port=' <port> ('-' <port>)?
+# RFC 2326 12.39 Transport
+<tp_server_port> ::= ';server_port=' <port> ('-' <port>)?
+# RFC 2326 12.39 Transport
+<tp_ssrc> ::= ';ssrc=' r'[0-9A-Fa-f]{8}'
+# RFC 2326 12.39 Transport
+<tp_mode> ::= ';mode=' (<dquote> <mode_list>? <dquote> | <mode>)
+# RFC 2326 12.39 Transport
+<mode_list> ::= <mode> (',' <mode>){0,2}
+# RFC 2326 12.39 Transport
+<mode> ::= <mode_play> | <mode_record> | <mode_other>
+# RFC 2326 12.39 Transport
+<mode_other> ::= r"(?:[P](?:[L](?:[A](?:[Y](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-XZ\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-KM-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[R](?:[E](?:[C](?:[O](?:[R](?:[D](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-CE-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABD-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-DF-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-OQS-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)"
+# RFC 2326 12.39 Transport
+<mode_play> ::= 'PLAY'
+# RFC 2326 12.39 Transport
+<mode_record> ::= 'RECORD'
+# RFC 2326 12.39 Transport
+<channel> ::= r'[0-9]{1,3}'
+# RFC 2326 12.39 Transport
+<port> ::= r'[0-9]{1,5}'
+# RFC 2326 12.39 Transport
+<address> ::= <host>
+# RFC 2326 12.39 Transport
+<dquote> ::= '"'
+
+# Range = "Range" ":" 1#ranges-specifier [ ";" "time" "=" utc-time ] (12.29, 3.5-3.7)
+<range_value> ::= <ranges_specifier> (<ows> ',' <ows> <ranges_specifier>)* (';' 'time' '=' <utc_datetime>)?
+# RFC 2326
+<ranges_specifier> ::= <npt_range> | <utc_range> | <smpte_range>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_range> ::= 'npt=' (<npt_time> '-' <npt_time>? | '-' <npt_time>)
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_time> ::= <npt_now> | <npt_sec> | <npt_hhmmss>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_now> ::= 'now'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_sec> ::= <npt_int> ('.' <npt_fraction_digits>?)?
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_int> ::= r'[0-9]+'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_fraction_digits> ::= r'[0-9]+'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_hhmmss> ::= <npt_hours> ':' <npt_minutes> ':' <npt_seconds> ('.' <npt_fraction_digits>?)?
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_hours> ::= r'[0-9]+'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_minutes> ::= r'[0-9]{1,2}'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<npt_seconds> ::= r'[0-9]{1,2}'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_range> ::= <smpte_type> '=' <smpte_time> '-' <smpte_time>?
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_type> ::= <smpte_30> | <smpte_30_drop> | <smpte_25>
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_30> ::= 'smpte'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_30_drop> ::= 'smpte-30-drop'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_25> ::= 'smpte-25'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_time> ::= <smpte_hours> ':' <smpte_minutes> ':' <smpte_seconds> (':' <smpte_frames>)? ('.' <smpte_subframes>)?
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_hours> ::= r'[0-9]{1,2}'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_minutes> ::= r'[0-9]{1,2}'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_seconds> ::= r'[0-9]{1,2}'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_frames> ::= r'[0-9]{1,2}'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<smpte_subframes> ::= r'[0-9]{1,2}'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_range> ::= 'clock=' <utc_datetime> '-' <utc_datetime>?
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_datetime> ::= <utc_date> 'T' <utc_clock> ('.' <utc_fraction>)? 'Z'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_date> ::= r'[0-9]{8}'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_clock> ::= r'[0-9]{6}'
+# RFC 2326 12.29 Range, 3.5-3.7 (SMPTE, NPT, absolute time)
+<utc_fraction> ::= r'[0-9]+'
+
+# Scale, Speed, Timestamp (12.34, 12.35, 12.38)
+<scale_value> ::= '-'? r'[0-9]+' ('.' r'[0-9]+'?)?
+# RFC 2326 12.35 Speed
+<speed_value> ::= r'[0-9]+' ('.' r'[0-9]+'?)?
+# RFC 2326 12.38 Timestamp
+<timestamp_value> ::= <timestamp_number> (r'[ \t]+' <timestamp_number>)?
+# RFC 2326 12.38 Timestamp
+<timestamp_number> ::= r'[0-9]+' ('.' r'[0-9]+'?)? | '.' r'[0-9]+'?
+
+# RTP-Info = "RTP-Info" ":" 1#stream-url 1*parameter (12.33)
+<rtp_info_value> ::= <rtp_info_entry> (<ows> ',' <ows> <rtp_info_entry>)*
+# RFC 2326
+<rtp_info_entry> ::= 'url' '=' <rtp_info_url> <rtp_info_param>+
+# RFC 2326
+<rtp_info_url> ::= r'[^;, \t\r\n]+'
+# RFC 2326
+<rtp_info_param> ::= ';seq=' r'[0-9]+' | ';rtptime=' r'[0-9]+'
+
+# Challenges (RFC 9110 11.3, 11.6.1, 11.7.1)
+# challenge-list = #challenge: empty list elements are accepted (RFC 9110 5.6.1.2)
+<challenge_list> ::= <challenge_elem> (',' <challenge_elem>)*
+# RFC 9110 11.3 Challenge and Response, 11.6.1, 11.7.1
+<challenge_elem> ::= <ws>? | <ws>? <challenge> <ws>?
+# RFC 9110 11.3 Challenge and Response, 11.6.1, 11.7.1
+<challenge> ::= <auth_scheme> (' '+ (<auth_params> | <token68>)?)?
+# RFC 9110 11.3 Challenge and Response, 11.6.1, 11.7.1
+<auth_scheme> ::= <token>
+# RFC 9110 11.3 Challenge and Response, 11.6.1, 11.7.1
+<auth_params> ::= <auth_param_elem> (',' <auth_param_elem>)*
+# RFC 9110 11.3 Challenge and Response, 11.6.1, 11.7.1
+<auth_param_elem> ::= <ws>? | <ws>? <auth_param> <ws>?
+# RFC 9110 11.3 Challenge and Response, 11.6.1, 11.7.1
+<auth_param> ::= <token> <ows> '=' <ows> (<token> | <quoted_string>)
+
+# HTTP-date (RFC 9110 5.6.7): the preferred IMF-fixdate and the two obsolete forms a recipient must accept
+<http_date> ::= <imf_fixdate> | <rfc850_date> | <asctime_date> | <date_month_first>
+# Tolerated deviation "date_month_first": the month before the day, "Sat, Nov 07 2026 17:33:56 GMT" (not a HTTP-date)
+<date_month_first> ::= <day_name> ',' ' ' <month> ' ' r'[0-9]{2}' ' ' r'[0-9]{4}' ' ' <time_of_day> ' ' 'GMT'
+where forall <x> in <date_month_first>: tolerated("date_month_first")
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<imf_fixdate> ::= <day_name> ',' ' ' <date1> ' ' <time_of_day> ' ' 'GMT'
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<rfc850_date> ::= <day_name_long> ',' ' ' <date2> ' ' <time_of_day> ' ' 'GMT'
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<asctime_date> ::= <day_name> ' ' <date3> ' ' <time_of_day> ' ' r'[0-9]{4}'
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<date1> ::= <day_of_month> ' ' <month> ' ' r'[0-9]{4}'
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<day_of_month> ::= r'(?:0[1-9]|[12][0-9]|3[01])'
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<date2> ::= <day_of_month> '-' <month> '-' r'[0-9]{2}'
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<date3> ::= <month> ' ' (<day_of_month> | ' ' r'[1-9]')
+# 00:00:00 - 23:59:60 (leap second)
+<time_of_day> ::= r'(?:[01][0-9]|2[0-3])' ':' r'[0-5][0-9]' ':' r'(?:[0-5][0-9]|60)'
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<day_name> ::= r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)'
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<day_name_long> ::= r'(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)'
+# RFC 9110 5.6.7 Date/Time Formats (RFC 2326 12.18 Date, 12.19 Expires)
+<month> ::= r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
+
+# Basic values (RFC 9110 5.6, RFC 3986)
+<media_type_sdp> ::= r'(?i:application/sdp)'
+# RFC 2326 12.16 Content-Type (RFC 9110 8.3.1)
+<media_type_other> ::= r"(?:[Aa](?:[Pp](?:[Pp](?:[Ll](?:[Ii](?:[Cc](?:[Aa](?:[Tt](?:[Ii](?:[Oo](?:[Nn](?:[/](?:[Ss](?:[Dd](?:[Pp](?:[!#-'*+\--9A-Z\^-z|~][!#-'*+\--9A-Z\^-z|~]*)|[!#-'*+\--9A-OQ-Z\^-oq-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9A-CE-Z\^-ce-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9A-RT-Z\^-rt-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9A-MO-Z\^-mo-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9A-NP-Z\^-np-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9A-HJ-Z\^-hj-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9A-SU-Z\^-su-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9B-Z\^-`b-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9ABD-Z\^-bd-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9A-HJ-Z\^-hj-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9A-KM-Z\^-km-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9A-OQ-Z\^-oq-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9A-OQ-Z\^-oq-z|~][!#-'*+\--9A-Z\^-z|~]*|)|[!#-'*+\--9B-Z\^-`b-z|~][!#-'*+\--9A-Z\^-z|~]*)"
+# RFC 2326 12.16 Content-Type (RFC 9110 8.3.1)
+<media_params> ::= (<ows> ';' <ows> <token> '=' (<token> | <quoted_string>))*
+# #element = [ element ] *( OWS "," OWS [ element ] ): a recipient parses and ignores empty list elements (RFC 9110 5.6.1.2)
+<token_list> ::= <token_elem> (',' <token_elem>)*
+# RFC 2326 15.1 Base Syntax, RFC 9110 5.6, RFC 3986 3.2.2, RFC 5234 B.1
+<token_elem> ::= <ws>? (<token> <ws>?)?
+# RFC 2326 15.1 Base Syntax, RFC 9110 5.6, RFC 3986 3.2.2, RFC 5234 B.1
+<token> ::= r"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
+# RFC 2326 15.1 Base Syntax, RFC 9110 5.6, RFC 3986 3.2.2, RFC 5234 B.1
+<quoted_string> ::= '"' (<qd_run> | <quoted_pair>)* '"'
+# RFC 2326
+<qd_run> ::= r'[^"\\\x00-\x08\x0a-\x1f\x7f]+'
+# RFC 2326
+<quoted_pair> ::= r'\\[\t \x21-\x7e\x80-\xff]'
+# RFC 2326 15.1 Base Syntax, RFC 9110 5.6, RFC 3986 3.2.2, RFC 5234 B.1
+<uri_reference> ::= r'[^\s]+'
+# RFC 2326 15.1 Base Syntax, RFC 9110 5.6, RFC 3986 3.2.2, RFC 5234 B.1
+<host> ::= <ip_literal> | <reg_name>
+# RFC 2326 15.1 Base Syntax, RFC 9110 5.6, RFC 3986 3.2.2, RFC 5234 B.1
+<ip_literal> ::= '[' r'[0-9A-Fa-f:.]+' ']'
+# RFC 2326 15.1 Base Syntax, RFC 9110 5.6, RFC 3986 3.2.2, RFC 5234 B.1
+<reg_name> ::= r"[A-Za-z0-9._-]+"
+
+
+# --------------------------------------------------------------------------------------------
+# Session descriptions (Appendix C): SDP (RFC 4566), received by a looser rule than the one Fandango sends with.
+# The control URLs the description names are recorded for the SETUP requests that follow (C.1.1).
+# --------------------------------------------------------------------------------------------
+<sdp_description> ::= (<sdp_v> <sdp_o> <sdp_s> <sdp_i>? <sdp_u>? <sdp_e>* <sdp_p>* <sdp_c>? <sdp_b>* <sdp_time>+ <sdp_z>? <sdp_k>?
+    <sdp_session_attr>* <sdp_media>*)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_v> ::= 'v=' <sdp_v_text> <crlf>
+# a new description replaces the controls, aggregate control and entity tag of the earlier one
+<sdp_v_text> ::= <sdp_text> := reset_description(<sdp_v_src>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_v_src> ::= <sdp_text> := reset_description(<sdp_v_text>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_o> ::= 'o=' <sdp_text> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_s> ::= 's=' <sdp_text>? <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_i> ::= 'i=' <sdp_text> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_u> ::= 'u=' <sdp_text> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_e> ::= 'e=' <sdp_text> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_p> ::= 'p=' <sdp_text> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_c> ::= 'c=' <sdp_text> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_b> ::= 'b=' <sdp_text> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_time> ::= <sdp_t> <sdp_r>*
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_t> ::= 't=' <sdp_text> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_r> ::= 'r=' <sdp_text> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_z> ::= 'z=' <sdp_text> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_k> ::= 'k=' <sdp_text> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_session_attr> ::= <sdp_attr_control_aggregate> | <sdp_attr_etag> | <sdp_attr_range> | <sdp_attr_other>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_media> ::= <sdp_m> <sdp_i>? <sdp_c>* <sdp_b>* <sdp_k>? <sdp_media_attr>*
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_m> ::= 'm=' <sdp_text> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_media_attr> ::= <sdp_attr_control> | <sdp_attr_range> | <sdp_attr_other>
+# C.1.1: a control attribute at session level is the URL for aggregate control, one in a media section the URL of that stream
+<sdp_attr_control_aggregate> ::= 'a=control:' <sdp_aggregate_url> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_aggregate_url> ::= <uri_reference> := record_aggregate(<sdp_aggregate_src>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_aggregate_src> ::= <uri_reference> := record_aggregate(<sdp_aggregate_url>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_attr_control> ::= 'a=control:' <sdp_control_url> <crlf>
+# C.1.8: the entity tag of the description, returned in If-Match of a SETUP
+<sdp_attr_etag> ::= 'a=etag:' <sdp_etag_value> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_etag_value> ::= <sdp_text> := record_etag(<sdp_etag_src>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_etag_src> ::= <sdp_text> := record_etag(<sdp_etag_value>)
+# C.1.5: the range of the presentation, in any unit of 3.5-3.7
+<sdp_attr_range> ::= 'a=range:' <ranges_specifier> <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_control_url> ::= <uri_reference> := record_control(<sdp_control_src>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_control_src> ::= <uri_reference> := record_control(<sdp_control_url>)
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_attr_other> ::= 'a=' <sdp_attr_name> (':' <sdp_text>)? <crlf>
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_attr_name> ::= r"(?:[Cc](?:[Oo](?:[Nn](?:[Tt](?:[Rr](?:[Oo](?:[Ll](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-KM-Z\^-km-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-QS-Z\^-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-NP-Z\^-np-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Ee](?:[Tt](?:[Aa](?:[Gg](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-FH-Z\^-fh-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-SU-Z\^-su-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[Rr](?:[Aa](?:[Nn](?:[Gg](?:[Ee](?:[!#-'*+\-.0-9A-Z\^-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)|[!#-'*+\-.0-9A-DF-Z\^-df-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-FH-Z\^-fh-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9A-MO-Z\^-mo-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9B-Z\^-`b-z|~][!#-'*+\-.0-9A-Z\^-z|~]*|)|[!#-'*+\-.0-9ABDF-QS-Z\^-bdf-qs-z|~][!#-'*+\-.0-9A-Z\^-z|~]*)"
+# RFC 2326 Appendix C (SDP), C.1.1 Control URL
+<sdp_text> ::= r'[^\r\n]+'
+# RFC 2326 15.1 Base Syntax, RFC 9110 5.6, RFC 3986 3.2.2, RFC 5234 B.1
+<digits> ::= r'[0-9]{1,10}'
+
+
+# --------------------------------------------------------------------------------------------
+# Requirements on replies that the grammar cannot express (every one is a MUST of the cited text)
+# --------------------------------------------------------------------------------------------
+HEADER_LINE = re.compile(r"^([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*(.*?)[ \t]*$")
+# Headers whose definition is a comma-separated list (#/1#) may repeat (RFC 9110 5.3); every other header occurs at most once
+LIST_HEADERS = ("allow", "public", "transport", "rtp-info", "via", "accept", "accept-encoding", "accept-language", "accept-charset",
+                "cache-control", "connection", "content-encoding", "content-language", "require", "proxy-require", "unsupported",
+                "vary", "www-authenticate", "proxy-authenticate", "warning", "pragma", "trailer", "upgrade", "te", "if-match", "if-none-match")
+
+
+def header_pairs(node):
+    head = re.sub(r"\r\n[ \t]+", " ", str(node).split("\r\n\r\n", 1)[0])
+    pairs = []
+    for line in head.split("\r\n"):
+        m = HEADER_LINE.match(line)
+        if m and not line.startswith("RTSP/"):
+            pairs.append((m.group(1).lower(), m.group(2)))
+    return pairs
+
+
+def header_values(node, name):
+    return [value for key, value in header_pairs(node) if key == name]
+
+
+def status_code(node):
+    m = re.match(r"RTSP/\d+\.\d+ (\d{3})", str(node))
+    return int(m.group(1)) if m else 0
+
+
+def exchange_request(node):
+    """The request a reply answers: the request of its exchange, or, when the reply echoes the CSeq of an earlier request that has had no final reply
+    (the server answered after the client's timer expired, 9.2: the reply may come late), that request."""
+    late = node
+    while late is not None and not (late.symbol.is_non_terminal and late.symbol.name() == "<server_late_reply>"):
+        late = late.parent
+    if late is not None:
+        got = header_values(node, "cseq")
+        return unanswered_request(node, got[0]) if len(got) == 1 else None
+    current = node
+    while current is not None and not (current.symbol.is_non_terminal and current.symbol.name().startswith("<x_")):
+        current = current.parent
+    own = None
+    if current is None:
+        for message in reversed(earlier_messages(node)):
+            if is_client(message) and re.match(r"[A-Z_-]+ \S+ RTSP/", str(message.msg)):
+                own = message.msg
+                break
+    else:
+        for child in current.children:
+            if child.symbol.is_non_terminal and child.symbol.name().startswith("<req_"):
+                own = child
+                break
+    if own is None or not str(node).startswith("RTSP/"):
+        return own
+    got = header_values(node, "cseq")
+    sent = header_values(own, "cseq")
+    if len(got) != 1 or not sent or got[0] == sent[0]:
+        return own
+    return unanswered_request(node, got[0]) or own
+
+
+def unanswered_request(reply, cseq):
+    """The last earlier request of the session with this CSeq that no earlier final reply has answered."""
+    found = None
+    for message in earlier_messages(reply):
+        text = str(message.msg)
+        if text.startswith("\x00late\x00"):
+            text = text[6:]
+        if is_client(message) and re.match(r"[A-Z_-]+ \S+ RTSP/", text):
+            if header_values(message.msg, "cseq") == [cseq]:
+                found = message.msg
+        elif is_server(message) and text.startswith("RTSP/"):
+            final = re.split(r"(?m)^(?=RTSP/\d)", text)[-1]
+            if status_code(final) >= 200 and header_values(final, "cseq") == [cseq]:
+                found = None
+    return found
+
+
+def is_client(message):
+    name = message.msg.symbol.name() if message.msg.symbol.is_non_terminal else ""
+    return name.startswith("<req_") or name.startswith("<cli_reply")
+
+
+def is_server(message):
+    name = message.msg.symbol.name() if message.msg.symbol.is_non_terminal else ""
+    return not is_client(message) and not name.startswith("<timer_")
+
+
+def earlier_messages(node):
+    """The messages of the session before the one that holds `node`."""
+    ancestors = set()
+    current = node
+    while current is not None:
+        ancestors.add(id(current))
+        current = current.parent
+    earlier = []
+    for message in node.get_root().protocol_msgs():
+        if id(message.msg) in ancestors:
+            break
+        earlier.append(message)
+    return earlier
+
+
+# C1: the CSeq of a reply is the one of the request (12.17)
+def cseq_echoed(reply):
+    request = exchange_request(reply)
+    if request is None:
+        return True
+    sent = header_values(request, "cseq")
+    got = header_values(reply, "cseq")
+    return len(got) == 1 and (not sent or got[0] == sent[0])
+
+
+# C17
+def method_unsupported_gets_501(reply):
+    """C17: a method the server's Public header (an earlier reply of the session) does not list gets 501 (Notes on Table 2, 10); a method that Public lists may get a 405
+    (11.3.1: not allowed for the resource or, after SETUP, for the mode); an interim reply and the authentication challenges (401, 407), which come first, are not the final answer."""
+    status = status_code(reply)
+    if status < 200 or status in (401, 407):
+        return True
+    request = exchange_request(reply)
+    if request is None:
+        return True
+    method = str(request).split(" ", 1)[0]
+    if method == "OPTIONS":
+        return True
+    public = None
+    for message in earlier_messages(reply):
+        if is_server(message) and str(message.msg).startswith("RTSP/"):
+            for value in header_values(message.msg, "public"):
+                public = (public or set()) | {name.strip() for name in value.split(",")}
+    if public is None or method in public:
+        return True
+    # a request with a Session header may be refused for its session (454, 12.37) or as a bad request: the RFC puts no order on the checks
+    if header_values(request, "session") and 400 <= status < 500:
+        return True
+    return status == 501
+
+
+def request_uri(request):
+    parts = str(request).split(" ", 2)
+    return parts[1] if len(parts) > 2 else ""
+
+
+def cseq_present(message):
+    return len(header_values(message, "cseq")) == 1
+
+
+def server_cseq_before(header):
+    """The CSeq of the last request of the server before `header` (12.17)."""
+    found = None
+    for message in earlier_messages(header):
+        if is_server(message) and not str(message.msg).startswith(("RTSP/", "\x00")):
+            values = header_values(message.msg, "cseq")
+            if values:
+                found = values[0]
+    return found if found else str(header.children[1])
+
+
+def next_client_cseq(header):
+    """One more than the CSeq of the last request Fandango sent (12.17)."""
+    last = 0
+    for message in earlier_messages(header):
+        if is_client(message) and re.match(r"[A-Z_-]+ \S+ RTSP/", str(message.msg)):
+            values = header_values(message.msg, "cseq")
+            if values and values[0].isdigit():
+                last = int(values[0])
+    return str(last + 1)
+
+
+# C20 (header)
+def allow_on_405(reply):
+    return status_code(reply) != 405 or bool(header_values(reply, "allow"))
+
+
+# C29, C30: 401 and 407 replies carry a challenge (RFC 9110 15.5.2, 15.5.8)
+def challenge_on_401(reply):
+    return status_code(reply) != 401 or bool(header_values(reply, "www-authenticate"))
+
+
+def challenge_on_407(reply):
+    return status_code(reply) != 407 or bool(header_values(reply, "proxy-authenticate"))
+
+
+# C18: a 551 reply names the options it does not support, and only options of the request (12.32, 12.40)
+def unsupported_named(reply):
+    if status_code(reply) == 551 and not header_values(reply, "unsupported"):
+        return False
+    request = exchange_request(reply)
+    named = [tag.strip().lower() for value in header_values(reply, "unsupported") for tag in value.split(",")]
+    if request is None or not named:
+        return True
+    required = [tag.strip().lower() for key in ("require", "proxy-require")
+                for value in header_values(request, key) for tag in value.split(",")]
+    return all(tag in required for tag in named)
+
+
+# C20: a reply to a request with a Timestamp echoes its value (12.38)
+def timestamp_echoed(reply):
+    request = exchange_request(reply)
+    if request is None or not header_values(request, "timestamp"):
+        return True
+    got = header_values(reply, "timestamp")
+    return bool(got) and got[0].split()[0] == header_values(request, "timestamp")[0].split()[0]
+
+
+# C21: the reply to a request with a Scale carries the scale the server chose (12.34)
+def scale_given(reply):
+    request = exchange_request(reply)
+    if request is None or not header_values(request, "scale") or not (200 <= status_code(reply) < 300):
+        return True
+    return bool(header_values(reply, "scale"))
+
+
+# C31: an origin server with a clock sends Date in every 2xx, 3xx and 4xx reply; the clock is shown by an earlier Date (RFC 9110 6.6.1)
+def date_given(reply):
+    if not (200 <= status_code(reply) < 500):
+        return True
+    if header_values(reply, "date"):
+        return True
+    return not any(is_server(message) and header_values(message.msg, "date") for message in earlier_messages(reply))
+
+
+# C33: a header that is not a list occurs once (RFC 9110 5.3)
+def headers_once(reply):
+    keys = [key for key, _ in header_pairs(reply) if key not in LIST_HEADERS]
+    return len(keys) == len(set(keys))
+
+
+# C12: the reply to a SETUP names the one transport the server chose (12.39)
+def one_transport(reply):
+    """C12: the successful reply to a SETUP names the one transport the server chose (12.39), however many Transport headers carry it."""
+    return len(list(reply.find_subtrees("<transport_spec>"))) <= 1
+
+
+# C4: the SDP body is as long as the Content-Length says (4.4, 12.14)
+def sdp_length_ok(reply):
+    bodies = list(reply.find_subtrees("<sdp_description>"))
+    # a coded body is counted octet by octet (<sdp_body_coded>); the description inside it is the decoded source, whose length the Content-Length does not give
+    return not bodies or next(iter(reply.find_subtrees("<sdp_body_coded>")), None) is not None or len(bytes(bodies[0])) == clen(reply)
+
+
+# C7: a request returns the session identifier of the last reply that gave one (12.37)
+def sdp_media_controls(sdp):
+    """C35, C36: with more than one media section, every one has its own a=control (Appendix C.2, C.3)."""
+    medias = list(sdp.find_subtrees("<sdp_media>"))
+    return len(medias) <= 1 or all("a=control:" in str(media) for media in medias)
+
+
+# C32: Last-Modified is not later than Date (RFC 9110 8.8.2.1)
+def last_modified_ok(reply):
+    from email.utils import parsedate_to_datetime
+    modified, date = header_values(reply, "last-modified"), header_values(reply, "date")
+    if not modified or not date:
+        return True
+    try:
+        return parsedate_to_datetime(modified[0]) <= parsedate_to_datetime(date[0])
+    except (TypeError, ValueError):
+        return True
+
+
+# C9: the timeout parameter of Session is for replies only (12.37)
+def session_without_timeout(request):
+    return not any("timeout" in value.lower() for value in header_values(request, "session"))
+
+
+def gzip_encode(plain):
+    import gzip
+    return gzip.compress(bytes(plain), mtime=0)
+
+
+def gzip_decode(coded):
+    import gzip
+    return gzip.decompress(bytes(coded))
+
+
+UNDECODABLE_DESCRIPTION = b"v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
+
+
+def coded_encode(plain):
+    return gzip_encode(plain)
+
+
+def coded_decode(coded):
+    """The description inside a gzip or a deflate (zlib) stream. A body that starts like one but is no such stream (another coding, a cut stream) has no description
+    to read controls from: a description without any stands for it."""
+    for decode in (gzip_decode, deflate_decode):
+        try:
+            return decode(coded)
+        except Exception:
+            pass
+    return UNDECODABLE_DESCRIPTION
+
+
+def deflate_encode(plain):
+    import zlib
+    return zlib.compress(bytes(plain))
+
+
+def deflate_decode(coded):
+    import zlib
+    return zlib.decompress(bytes(coded))
+
+
+def time_plus(value, seconds):
+    """hh:mm:ss (with a SMPTE frame field after it, if any) `seconds` later."""
+    parts = str(value).split(":")
+    total = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2].split(".")[0]) + seconds
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts[0], parts[1], parts[2] = "%02d" % hours, "%02d" % minutes, "%02d" % secs
+    return ":".join(parts)
+
+
+def sec_plus(value, seconds):
+    """npt-sec with a fraction, `seconds` later, with the same number of decimals."""
+    text = str(value)
+    decimals = len(text.split(".")[1]) if "." in text else 0
+    return "%.*f" % (decimals, float(text) + seconds)
+
+
+def utc_plus(value, seconds):
+    from datetime import datetime, timedelta
+    value = str(value)
+    m = re.match(r"^(\d{8}T\d{6})(\.\d+)?Z$", value)
+    if not m:
+        return value
+    moment = datetime.strptime(m.group(1), "%Y%m%dT%H%M%S") + timedelta(seconds=seconds)
+    return moment.strftime("%Y%m%dT%H%M%S") + (m.group(2) or "") + "Z"
+
+
+def multicast_address_pick(ipv6=True):
+    choices = ["224.2.0.1", "232.%d.%d.%d" % (random.randint(0, 255), random.randint(0, 255), random.randint(1, 254)),
+               "239.255.%d.%d" % (random.randint(0, 255), random.randint(1, 254))]
+    if ipv6:
+        choices += ["[ff02::1]", "[ff15::%x]" % random.randint(1, 65535)]
+    return random.choice(choices)
+
+
+def other_rtsp_version():
+    while True:
+        major, minor = random.choice(["0", "1", "2", "3", "10", "99", "01"]), random.choice(["0", "1", "2", "9", "10", "00", "5"])
+        if (int(major), int(minor)) != (1, 0):
+            return "RTSP/%s.%s" % (major, minor)
+
+
+def past_weekday(date, form):
+    """The weekday name (short, or long for the RFC 850 form) of the date a Last-Modified value names."""
+    import datetime
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    text = str(date)
+    if form == "imf":
+        m = re.search(r"(\d\d) ([A-Z][a-z]{2}) (\d{4})", text)
+        day, month, year = m.group(1), m.group(2), m.group(3)
+    elif form == "rfc850":
+        m = re.search(r"(\d\d)-([A-Z][a-z]{2})-(\d\d)", text)
+        day, month, year = m.group(1), m.group(2), (1900 if int(m.group(3)) >= 90 else 2000) + int(m.group(3))
+    else:
+        m = re.search(r"^[A-Za-z]{3} ([A-Z][a-z]{2}) (\d\d) \d\d:\d\d:\d\d (\d{4})", text)
+        month, day, year = m.group(1), m.group(2), m.group(3)
+    names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    name = names[datetime.date(int(year), months.index(month) + 1, int(day)).weekday()]
+    return name if form == "rfc850" else name[:3]
+
+
+def conference_before(header):
+    """12.9, 3.3: the identifier of an earlier Conference header of the session; the header's own when the session has none yet."""
+    for message in earlier_messages(header):
+        if is_client(message):
+            found = header_values(str(message.msg), "conference")
+            if found:
+                return found[0]
+    return str(header.children[1])
+
+
+TRANSPORT_NAMES = ("transport", "unicast", "multicast", "destination", "source", "interleaved", "append", "ttl", "layers", "port",
+                   "client_port", "server_port", "ssrc", "mode")
+
+
+def no_transport_parameters(request):
+    """C23: a SET_PARAMETER sets no transport parameter: not in a header, not as a name in the text/parameters body."""
+    if header_values(request, "transport"):
+        return False
+    body = str(request).split("\r\n\r\n", 1)[1] if "\r\n\r\n" in str(request) else ""
+    for line in body.split("\r\n"):
+        name = re.split(r"[:=;\s]", line.strip(), 1)[0].lower()
+        if name in TRANSPORT_NAMES:
+            return False
+    return True
+
+
+def new_session_differs(reply):
+    """C8: the session a second SETUP opens has an identifier no earlier SETUP reply of the connection gave (12.37)."""
+    finals = list(reply.find_subtrees("<resp_2xx>"))
+    new = [value.split(";")[0].strip() for value in header_values(finals[0] if finals else reply, "session")]
+    if not new:
+        return True
+    earlier = set()
+    method = ""
+    for message in earlier_messages(reply):
+        text = str(message.msg)
+        if text.startswith("\x00late\x00"):
+            text = text[6:]
+        if is_client(message):
+            m = re.match(r"([A-Z_-]+) \S+ RTSP/", text)
+            method = m.group(1) if m else method
+        elif is_server(message) and method == "SETUP" and text.startswith("RTSP/"):
+            # only a SETUP opens a session (10.4): a Session header in another reply (DESCRIBE, OPTIONS) names none
+            earlier.update(value.split(";")[0].strip() for value in header_values(text, "session"))
+    return not any(identifier in earlier for identifier in new)
+
+
+def negotiated_channel_before(frame, which):
+    """The channel of an interleaved pair the 2xx reply to a SETUP chose (one pair per stream set up, 10.4 and 10.12); `which` 0 is RTP, 1 is RTCP.
+    The frames the client has sent so far walk through the pairs, so that every stream gets its frames."""
+    pairs, frames = [], 0
+    for message in earlier_messages(frame):
+        name = message.msg.symbol.name() if message.msg.symbol.is_non_terminal else ""
+        if "interleaved_frame_sent" in name or name.startswith("<frame_up"):
+            frames += 1
+            continue
+        text = str(message.msg)
+        if is_client(message) or not text.startswith("RTSP/1.0 2"):
+            continue
+        m = re.search(r"(?im)^transport:.*?interleaved=(\d+)(?:-(\d+))?", text)
+        if m:
+            first = int(m.group(1))
+            pair = (first, int(m.group(2)) if m.group(2) else first + 1)
+            if pair not in pairs:
+                pairs.append(pair)
+    pair = pairs[(frames // 2) % len(pairs)] if pairs else (0, 1)
+    return bytes([pair[which] & 0xFF])
+
+
+def last_etag_before(node):
+    """The opaque value of the last a=etag line of a description the server sent (C.1.8)."""
+    found = None
+    for message in earlier_messages(node):
+        if is_server(message):
+            for m in re.finditer(r"(?m)^a=etag:(.*?)\r?$", str(message.msg)):
+                found = m.group(1)
+    return found if found else str(node.children[1])
+
+
+def announce_parts(message):
+    """The header block and the description of an ANNOUNCE Fandango sent: a body with Content-Encoding gzip or deflate (12.12) is decoded first, so that the media
+    sections and a=control lines of a coded description are found like those of a plain one."""
+    head, _, body = bytes(message).partition(b"\r\n\r\n")
+    head = head.decode("latin-1")
+    for coding in header_values(head, "content-encoding"):
+        try:
+            if coding.strip().lower() == "gzip":
+                body = gzip_decode(body)
+            elif coding.strip().lower() == "deflate":
+                body = deflate_decode(body)
+        except (OSError, ValueError, EOFError):
+            pass
+    return head, body.decode("latin-1")
+
+
+def announce_base(head):
+    """C.1.1: the Content-Base, else the Content-Location (a relative reference is resolved against the request URL), else the request URL of an ANNOUNCE Fandango sent."""
+    from urllib.parse import urljoin
+    request = head.split(" ", 2)[1]
+    given = header_values(head, "content-base") or header_values(head, "content-location")
+    return urljoin(request, given[0]) if given else request
+
+
+def announced_stream_path_before(url):
+    """C.1.1: the path of the stream the next SETUP names: the a=control of the media section the session announced, resolved as RFC 1808 does against the
+    Content-Base, else the Content-Location, else the request URL of the ANNOUNCE ("*" is the entire base, a section without control is the presentation URL)."""
+    from urllib.parse import urljoin
+    announce, setups = None, 0
+    for message in earlier_messages(url):
+        if not is_client(message):
+            continue
+        text = str(message.msg)
+        if text.startswith("ANNOUNCE "):
+            announce, setups = announce_parts(message.msg), 0
+        elif announce and text.startswith("SETUP "):
+            setups += 1
+    own = str(url.children[-1])
+    if announce is None:
+        return own
+    head, body = announce
+    request = head.split(" ", 2)[1]
+    base = announce_base(head)
+    sections = []
+    for line in body.split("\r\n"):
+        if line.startswith("m="):
+            sections.append(None)
+        elif line.startswith("a=control:") and sections:
+            sections[-1] = line[len("a=control:"):]
+    if not sections or sections[setups % len(sections)] is None:
+        return url_path(request) or "/"
+    control = sections[setups % len(sections)]
+    return url_path(base if control == "*" else urljoin(base, control)) or own
+
+
+def presentation_path_before(url):
+    """The presentation of a session that announced a description and set a stream up for recording is the aggregate control URL of that description, else the
+    announced URL (10.7, 10.11, C.1.1: the aggregate control is resolved as RFC 1808 does against the Content-Base, else the Content-Location, else the request URL)."""
+    from urllib.parse import urljoin
+    announce, recording = None, False
+    for message in earlier_messages(url):
+        if not is_client(message):
+            continue
+        text = str(message.msg)
+        if text.startswith("ANNOUNCE "):
+            announce, recording = announce_parts(message.msg), False
+        elif announce and text.startswith("SETUP ") and "mode=RECORD" in text:
+            recording = True
+    if announce and recording:
+        head, body = announce
+        request = head.split(" ", 2)[1]
+        base = announce_base(head)
+        for line in body.split("\r\n"):
+            if line.startswith("m="):
+                break
+            if line.startswith("a=control:"):
+                control = line[len("a=control:"):]
+                return url_path(base if control == "*" else urljoin(base, control)) or str(url.children[-1])
+        return url_path(request) or str(url.children[-1])
+    return str(url.children[-1])
+
+
+def last_setup_path_before(url):
+    """The path of the stream the last SETUP of the session named."""
+    found = None
+    for message in earlier_messages(url):
+        m = re.match(r"SETUP rtsp://[^/ ]*(/\S*) RTSP/", str(message.msg))
+        if is_client(message) and m:
+            found = m.group(1)
+    return found if found else str(url.children[-1])
+
+
+def last_session_before(header):
+    found = None
+    for message in earlier_messages(header):
+        if is_server(message):
+            values = header_values(message.msg, "session")
+            if values:
+                found = values[-1].split(";")[0].strip()
+    return found if found else str(header.children[1])
+
+
+where forall <r> in <resp_1xx>: cseq_echoed(<r>)
+where forall <r> in <resp_2xx>: cseq_echoed(<r>)
+where forall <r> in <resp_3xx>: cseq_echoed(<r>)
+where forall <r> in <resp_4xx>: cseq_echoed(<r>)
+where forall <r> in <resp_5xx>: cseq_echoed(<r>)
+where forall <r> in <resp_1xx>: method_unsupported_gets_501(<r>)
+where forall <r> in <resp_2xx>: method_unsupported_gets_501(<r>)
+where forall <r> in <resp_3xx>: method_unsupported_gets_501(<r>)
+where forall <r> in <resp_4xx>: method_unsupported_gets_501(<r>)
+where forall <r> in <resp_5xx>: method_unsupported_gets_501(<r>)
+where forall <q> in <srv_options>: cseq_present(<q>)
+where forall <q> in <srv_get_parameter>: cseq_present(<q>)
+where forall <q> in <srv_set_parameter>: cseq_present(<q>)
+where forall <q> in <srv_announce>: cseq_present(<q>)
+where forall <q> in <srv_extension>: cseq_present(<q>)
+where forall <q> in <srv_redirect>: cseq_present(<q>)
+where forall <h> in <h_cseq_echo>: <h>.<cseq_echoed> == server_cseq_before(<h>)
+where forall <h> in <h_cseq_sent>: <h>.<cseq_next> == next_client_cseq(<h>)
+where forall <r> in <resp_1xx>: headers_once(<r>)
+where forall <r> in <resp_2xx>: headers_once(<r>)
+where forall <r> in <resp_3xx>: headers_once(<r>)
+where forall <r> in <resp_4xx>: headers_once(<r>)
+where forall <r> in <resp_5xx>: headers_once(<r>)
+where forall <r> in <resp_1xx>: unsupported_named(<r>)
+where forall <r> in <resp_2xx>: unsupported_named(<r>)
+where forall <r> in <resp_3xx>: unsupported_named(<r>)
+where forall <r> in <resp_4xx>: unsupported_named(<r>)
+where forall <r> in <resp_5xx>: unsupported_named(<r>)
+where forall <r> in <resp_1xx>: timestamp_echoed(<r>)
+where forall <r> in <resp_2xx>: timestamp_echoed(<r>)
+where forall <r> in <resp_3xx>: timestamp_echoed(<r>)
+where forall <r> in <resp_4xx>: timestamp_echoed(<r>)
+where forall <r> in <resp_5xx>: timestamp_echoed(<r>)
+where forall <r> in <resp_1xx>: date_given(<r>)
+where forall <r> in <resp_2xx>: date_given(<r>)
+where forall <r> in <resp_3xx>: date_given(<r>)
+where forall <r> in <resp_4xx>: date_given(<r>)
+where forall <r> in <resp_5xx>: date_given(<r>)
+where forall <r> in <resp_4xx>: allow_on_405(<r>)
+where forall <r> in <resp_4xx>: challenge_on_401(<r>)
+where forall <r> in <resp_4xx>: challenge_on_407(<r>)
+where forall <r> in <resp_2xx>: scale_given(<r>)
+where forall <r> in <resp_2xx_with_body>: sdp_length_ok(<r>)
+where forall <r> in <resp_3xx_with_body>: sdp_length_ok(<r>)
+where forall <r> in <resp_4xx>: sdp_length_ok(<r>)
+where forall <r> in <resp_5xx>: sdp_length_ok(<r>)
+where forall <r> in <resp_2xx>: one_transport(<r>)
+# C24: a REDIRECT names the new location (10.10)
+where forall <q> in <srv_redirect>: bool(header_values(<q>, 'location'))
+where forall <h> in <session_line>: <h>.<session_recalled> == last_session_before(<h>)
+where forall <r> in <resp_1xx>: last_modified_ok(<r>)
+where forall <r> in <resp_2xx>: last_modified_ok(<r>)
+where forall <r> in <resp_3xx>: last_modified_ok(<r>)
+where forall <r> in <resp_4xx>: last_modified_ok(<r>)
+where forall <r> in <resp_5xx>: last_modified_ok(<r>)
+where forall <q> in <srv_options>: last_modified_ok(<q>)
+where forall <q> in <srv_get_parameter>: last_modified_ok(<q>)
+where forall <q> in <srv_set_parameter>: last_modified_ok(<q>)
+where forall <q> in <srv_announce>: last_modified_ok(<q>)
+where forall <q> in <srv_extension>: last_modified_ok(<q>)
+where forall <q> in <srv_redirect>: last_modified_ok(<q>)
+where forall <q> in <srv_options>: headers_once(<q>)
+where forall <q> in <srv_get_parameter>: headers_once(<q>)
+where forall <q> in <srv_set_parameter>: headers_once(<q>)
+where forall <q> in <srv_announce>: headers_once(<q>)
+where forall <q> in <srv_extension>: headers_once(<q>)
+where forall <q> in <srv_redirect>: headers_once(<q>)
+# C23: transport parameters are set by SETUP only (10.9): neither a header nor a parameter of the body of a SET_PARAMETER names them
+where forall <q> in <srv_set_parameter>: no_transport_parameters(<q>)
+# C26: the request URI "*" is for methods that need no resource (6.2)
+where forall <d> in <sdp_description>: sdp_media_controls(<d>)
+where forall <q> in <srv_options>: session_without_timeout(<q>)
+where forall <q> in <srv_get_parameter>: session_without_timeout(<q>)
+where forall <q> in <srv_set_parameter>: session_without_timeout(<q>)
+where forall <q> in <srv_announce>: session_without_timeout(<q>)
+where forall <q> in <srv_extension>: session_without_timeout(<q>)
+where forall <q> in <srv_redirect>: session_without_timeout(<q>)
