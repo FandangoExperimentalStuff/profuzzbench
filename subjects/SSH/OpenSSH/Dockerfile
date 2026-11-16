@@ -125,6 +125,8 @@ RUN cd ${WORKDIR} && \
     make $MAKE_OPT && \
     make install
 
+RUN cp ${WORKDIR}/openssh/install/etc/ssh_host_*_key ${WORKDIR}/openssh/install/etc/ssh_host_*_key.pub ${WORKDIR}/openssh-gcov/install/etc/
+
 COPY --chown=ubuntu:ubuntu in-ssh ${WORKDIR}/in-ssh
 COPY --chown=ubuntu:ubuntu ssh.dict ${WORKDIR}/ssh.dict
 COPY --chown=ubuntu:ubuntu cov_script.sh ${WORKDIR}/cov_script
