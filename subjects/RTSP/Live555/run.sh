@@ -39,7 +39,7 @@ if $(strstr $FUZZER "afl"); then
   if [ $FUZZER == "aflnwe" ]; then
     cov_script ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/ 8554 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time.csv 0
   else
-    cov_script ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/ 8554 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time.csv 1
+    measure-queue-coverage ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/replayable-queue ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
   fi
 
   cd $WORKDIR/live555-cov

@@ -113,3 +113,13 @@ COPY --chown=ubuntu:ubuntu smtp.dict ${WORKDIR}/smtp.dict
 COPY --chown=ubuntu:ubuntu cov_script.sh ${WORKDIR}/cov_script
 COPY --chown=ubuntu:ubuntu run.sh ${WORKDIR}/run
 COPY --chown=ubuntu:ubuntu clean.sh ${WORKDIR}/clean
+
+USER root
+COPY --from=ghcr.io/astral-sh/uv:0.13.0 /uv /uvx /bin/
+COPY --from=fandango-workspace fandango-driver /opt/driver-source
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN uv venv --python 3.11 /home/ubuntu/driver && \
+    uv pip install --python /home/ubuntu/driver/bin/python --no-deps /opt/driver-source
+COPY --from=fandango-workspace --chown=ubuntu:ubuntu profuzzbench/scripts/analysis/coverage/measure-queue-coverage.sh ${WORKDIR}/measure-queue-coverage
+COPY --chown=ubuntu:ubuntu coverage-replay.env ${WORKDIR}/coverage-replay.env
+USER root

@@ -58,7 +58,7 @@ if $(strstr $FUZZER "afl"); then
   if [ $FUZZER = "aflnwe" ]; then
     cov_script ${WORKDIR}/${OUTDIR}/ 3689 ${SKIPCOUNT} ${WORKDIR}/${OUTDIR}/cov_over_time.csv 0
   else
-    cov_script ${WORKDIR}/${OUTDIR}/ 3689 ${SKIPCOUNT} ${WORKDIR}/${OUTDIR}/cov_over_time.csv 1
+    measure-queue-coverage ${WORKDIR}/${OUTDIR}/replayable-queue ${WORKDIR}/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
   fi
 
   cd $WORKDIR/forked-daapd-gcov

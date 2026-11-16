@@ -45,7 +45,7 @@ if $(strstr $FUZZER "afl"); then
   if [ $FUZZER = "aflnwe" ]; then
     cov_script ${WORKDIR}/${TARGET_DIR}/${OUTDIR}/ 25 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/${OUTDIR}/cov_over_time.csv 0
   else
-    cov_script ${WORKDIR}/${TARGET_DIR}/${OUTDIR}/ 25 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/${OUTDIR}/cov_over_time.csv 1
+    measure-queue-coverage ${WORKDIR}/${TARGET_DIR}/${OUTDIR}/replayable-queue ${WORKDIR}/${TARGET_DIR}/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
   fi
 
   gcovr -r . --html --html-details -o index.html

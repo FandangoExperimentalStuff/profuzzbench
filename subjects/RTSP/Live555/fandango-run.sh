@@ -36,7 +36,7 @@ if [ $FUZZER = "fandango" ]; then
   #The last argument passed to cov_script should be 0 if the fuzzer is afl/nwe and it should be 1 if the fuzzer is based on aflnet
   #0: the test case is a concatenated message sequence -- there is no message boundary
   #1: the test case is a structured file keeping several request messages
-  cov_script ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/ 8554 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time.csv 1
+  measure-queue-coverage ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/replayable-queue ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
 
   cd $WORKDIR/live555-cov
   #copy .hh files since gcovr could not detect them
@@ -57,7 +57,7 @@ if [ $FUZZER = "fandango" ]; then
   cp ${WORKDIR}/in-rtsp-replay/*.raw ${SEEDED}/replayable-queue/
   touch -d @$(sed -n 's/^start_time *: *//p' ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/fuzzer_stats) ${SEEDED}/replayable-queue/*.raw
   cp -p ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/replayable-queue/id* ${SEEDED}/replayable-queue/ 2>/dev/null
-  cov_script ${SEEDED}/ 8554 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time_with_seeds.csv 1
+  measure-queue-coverage ${SEEDED}/replayable-queue ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time_with_seeds.csv ${SKIPCOUNT}
   rm -rf ${SEEDED}
 
   #Step-3. Save the result to the ${WORKDIR} folder

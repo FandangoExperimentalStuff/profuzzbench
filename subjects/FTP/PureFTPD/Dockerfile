@@ -105,3 +105,13 @@ RUN useradd -rm -d /home/fuzzing -s /bin/bash -g ubuntu -G sudo -u 1001 fuzzing 
 
 # For debugging purposes
 RUN apt-get -y install ftp
+
+USER root
+COPY --from=ghcr.io/astral-sh/uv:0.13.0 /uv /uvx /bin/
+COPY --from=fandango-workspace fandango-driver /opt/driver-source
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN uv venv --python 3.11 /home/ubuntu/driver && \
+    uv pip install --python /home/ubuntu/driver/bin/python --no-deps /opt/driver-source
+COPY --from=fandango-workspace --chown=ubuntu:ubuntu profuzzbench/scripts/analysis/coverage/measure-queue-coverage.sh ${WORKDIR}/measure-queue-coverage
+COPY --chown=ubuntu:ubuntu coverage-replay.env ${WORKDIR}/coverage-replay.env
+USER root
