@@ -15,6 +15,9 @@ RUN cd /home/ubuntu/fandango-workspace && \
 COPY --from=fandango-workspace --exclude=**/__pycache__ --exclude=.pytest_cache --chown=ubuntu:ubuntu fandango-driver /home/ubuntu/fandango-workspace/fandango-driver
 RUN cd /home/ubuntu/fandango-workspace && \
     uv sync --frozen --no-dev --python 3.11 --package fandango-driver --no-editable
+
+# Python cryptography for the transport the spec's party implements
+RUN uv pip install --python /home/ubuntu/fandango/bin/python cryptography==50.0.2
 USER root
 
 # Replace the run and coverage scripts of the base image with their Fandango versions

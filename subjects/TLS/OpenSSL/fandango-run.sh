@@ -24,7 +24,10 @@ if [ $FUZZER = "fandango" ]; then
   #Step-1. Do Fuzzing
   #Move to fuzzing folder
   cd $WORKDIR/${TARGET_DIR}
-  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/4433 --budget $TIMEOUT $OPTIONS -- ./apps/openssl s_server -key key.pem -cert cert.pem -4 -naccept 1 -no_anti_replay
+  #s_server ends a connection at the end of its stdin; the driver starts it without one, so it reads a FIFO that stays open
+  SERVER_STDIN=$(mktemp -u)
+  mkfifo $SERVER_STDIN
+  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/4433 --budget $TIMEOUT $OPTIONS -- sh -c "exec ./apps/openssl s_server -key key.pem -cert cert.pem -4 -naccept 1 -no_anti_replay 0<>$SERVER_STDIN"
 
   STATUS=$?
 
