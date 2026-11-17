@@ -4,7 +4,7 @@ Fandango generates protocol sessions from a `.fan` specification of the protocol
 
 # Running Fandango with ProFuzzBench
 
-Every target includes a `Dockerfile-fandango` that builds on top of the default Dockerfile for the target. It installs Fandango and the driver with the versions locked in `uv.lock` of the workspace, and replaces the run and coverage scripts of the image with `fandango-run.sh` and `fandango-cov_script.sh`. The server under test is the AFL-instrumented build of the default image, and coverage is measured with the same gcov build and `aflnet-replay` as for the other fuzzers.
+Every target includes a `Dockerfile-fandango` that builds on top of the default Dockerfile for the target. It installs Fandango and the driver with the versions locked in `uv.lock` of the workspace, and replaces the run script of the image with `fandango-run.sh`. The server under test is the AFL-instrumented build of the default image, and coverage is measured as for AFLNet and StateAFL: `measure-queue-coverage` replays the `replayable-queue` with the driver against the gcov build of the default image, configured by `coverage-replay.env` of the target.
 
 To build a target for Fandango:
 ```bash

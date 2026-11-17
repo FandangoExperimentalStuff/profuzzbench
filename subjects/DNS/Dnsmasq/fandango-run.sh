@@ -33,9 +33,6 @@ if [ $FUZZER = "fandango" ]; then
   #Move to gcov folder
   cd $WORKDIR/dnsmasq-gcov/src
 
-  #The last argument passed to cov_script should be 0 if the fuzzer is afl/nwe and it should be 1 if the fuzzer is based on aflnet
-  #0: the test case is a concatenated message sequence -- there is no message boundary
-  #1: the test case is a structured file keeping several request messages
   measure-queue-coverage ${WORKDIR}/${TARGET_DIR}/src/${OUTDIR}/replayable-queue ${WORKDIR}/${TARGET_DIR}/src/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
 
   gcovr -r . --html --html-details -o index.html
