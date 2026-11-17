@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: measure-queue-coverage <queue-dir> <coverage-csv> <sessions-per-sample>
 # Replays every framed session file of <queue-dir> once, in the order the fuzzer saved them, against the gcov build
-# described by coverage-replay.env and writes the coverage over time to <coverage-csv>, in the cov_over_time.csv format of ProFuzzBench.
+# described by coverage-replay.env and writes the coverage over time to <coverage-csv>, in the format of cov_script.
 set -eu
 
 QUEUE=$1
