@@ -35,10 +35,6 @@ if [ $FUZZER = "fandango" ]; then
 
   measure-queue-coverage ${WORKDIR}/${TARGET_DIR}/${OUTDIR}/replayable-queue ${WORKDIR}/${TARGET_DIR}/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
 
-  gcovr -r . --html --html-details -o index.html
-  mkdir ${WORKDIR}/${TARGET_DIR}/${OUTDIR}/cov_html/
-  cp *.html ${WORKDIR}/${TARGET_DIR}/${OUTDIR}/cov_html/
-
   #Coverage of the seeds of the seed-based fuzzers followed by the Fandango sessions, to compare with them
   cd $WORKDIR/pure-ftpd-gcov
   SEEDED=$(mktemp -d)

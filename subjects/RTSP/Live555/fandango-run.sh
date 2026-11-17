@@ -43,10 +43,6 @@ if [ $FUZZER = "fandango" ]; then
   done
   cd testProgs
 
-  gcovr -r .. --html --html-details -o index.html
-  mkdir ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_html/
-  cp *.html ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_html/
-
   #Coverage of the seeds of the seed-based fuzzers followed by the Fandango sessions, to compare with them
   cd $WORKDIR/live555-cov/testProgs
   SEEDED=$(mktemp -d)

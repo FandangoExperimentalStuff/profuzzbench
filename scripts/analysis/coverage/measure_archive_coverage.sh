@@ -4,7 +4,9 @@
 #   image: an image of the subject with the gcov build, e.g. proftpd
 #   archive: a result archive of AFLNet, StateAFL or Fandango with a replayable-queue
 #   with-seeds: replay the seed files of the subject first, stamped with the start time of the fuzzer
-# Writes <output-dir>/cov_over_time.csv (or cov_over_time_with_seeds.csv) with measure-queue-coverage of the working tree.
+#   COVERAGE_CPUSET (environment, optional): the CPUs the replay container runs on, e.g. 6,7,14,15
+# Writes <output-dir>/cov_over_time.csv (or cov_over_time_with_seeds.csv) with measure-queue-coverage of the working tree,
+# with the line coverage next to it as _lines.json and _html/.
 set -eu
 
 SUBJECT=$1
@@ -29,7 +31,7 @@ if [ -n "$SEED_MODE" ] && [ "$SEED_MODE" != "with-seeds" ]; then
 fi
 mkdir -p "$OUTPUT"
 
-docker run --rm \
+docker run --rm ${COVERAGE_CPUSET:+--cpuset-cpus=$COVERAGE_CPUSET} \
   -v "$REPLAY_ENV:/opt/coverage-replay.env:ro" \
   -v "$REPLAY_SCRIPT:/opt/measure-queue-coverage:ro" \
   -v "$(realpath "$ARCHIVE"):/opt/archive.tar.gz:ro" \

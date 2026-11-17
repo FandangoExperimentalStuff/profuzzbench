@@ -55,9 +55,6 @@ if [ $FUZZER = "fandango" ]; then
   measure-queue-coverage ${WORKDIR}/${OUTDIR}/replayable-queue ${WORKDIR}/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
 
   cd $WORKDIR/forked-daapd-gcov
-  gcovr -r . --html --html-details -o index.html
-  mkdir ${WORKDIR}/${OUTDIR}/cov_html/
-  cp *.html ${WORKDIR}/${OUTDIR}/cov_html/
 
   #Coverage of the seeds of the seed-based fuzzers followed by the Fandango sessions, to compare with them
   cd $WORKDIR

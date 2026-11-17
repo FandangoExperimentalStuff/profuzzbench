@@ -35,10 +35,6 @@ if [ $FUZZER = "fandango" ]; then
 
   measure-queue-coverage ${WORKDIR}/${TARGET_DIR}/build/bin/${OUTDIR}/replayable-queue ${WORKDIR}/${TARGET_DIR}/build/bin/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
 
-  gcovr -r $WORKDIR/dcmtk-gcov --html --html-details -o index.html
-  mkdir ${WORKDIR}/${TARGET_DIR}/build/bin/${OUTDIR}/cov_html/
-  cp *.html ${WORKDIR}/${TARGET_DIR}/build/bin/${OUTDIR}/cov_html/
-
   #Coverage of the seeds of the seed-based fuzzers followed by the Fandango sessions, to compare with them
   cd $WORKDIR/dcmtk-gcov/build/bin
   SEEDED=$(mktemp -d)

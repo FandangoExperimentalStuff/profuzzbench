@@ -43,10 +43,6 @@ if $(strstr $FUZZER "afl"); then
   done
   cd testProgs
 
-  gcovr -r .. --html --html-details -o index.html
-  mkdir ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_html/
-  cp *.html ${WORKDIR}/live555/testProgs/${OUTDIR}/cov_html/
-
   #Step-3. Save the result to the ${WORKDIR} folder
   #Tar all results to a file
   cd ${WORKDIR}/${TARGET_DIR}/testProgs

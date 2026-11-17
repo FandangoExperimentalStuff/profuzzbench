@@ -35,10 +35,6 @@ if $(strstr $FUZZER "afl"); then
 
   measure-queue-coverage ${WORKDIR}/${TARGET_DIR}/build/bin/${OUTDIR}/replayable-queue ${WORKDIR}/${TARGET_DIR}/build/bin/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
 
-  gcovr -r $WORKDIR/dcmtk-gcov --html --html-details -o index.html
-  mkdir ${WORKDIR}/${TARGET_DIR}/build/bin/${OUTDIR}/cov_html/
-  cp *.html ${WORKDIR}/${TARGET_DIR}/build/bin/${OUTDIR}/cov_html/
-
   #Step-3. Save the result to the ${WORKDIR} folder
   #Tar all results to a file
   cd ${WORKDIR}/${TARGET_DIR}/build/bin

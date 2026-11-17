@@ -22,7 +22,4 @@ COPY --chown=ubuntu:ubuntu fandango-run.sh ${WORKDIR}/run
 
 # Copy the Fandango specification of the protocol
 COPY --chown=ubuntu:ubuntu fan-specs ${WORKDIR}/fan-specs
-# Credentials of the server for the specification
-ENV FTP_USER=fuzzing FTP_PASS=fuzzing
-
 COPY --chown=ubuntu:ubuntu in-ftp-replay ${WORKDIR}/in-ftp-replay
