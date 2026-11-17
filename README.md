@@ -24,7 +24,7 @@ protocol-fuzzing-benchmark
 │   │   └── LightFTP
 │   │       └── Dockerfile: subject-specific Dockerfile
 │   │       └── run.sh: (subject-specific) main script to run experiment inside a container
-│   │       └── cov_script.sh: (subject-specific) script to do code coverage analysis
+│   │       └── coverage-replay.env: (subject-specific) settings for replaying the queue against the gcov build
 │   │       └── other files (e.g., patches, other subject-specific scripts)
 │   └── ...
 └── scripts: this folder contains all scripts to run experiments, collect & analyze results
@@ -40,12 +40,12 @@ protocol-fuzzing-benchmark
 
 # Fuzzers
 
-ProFuzzBench provides automation scripts for fuzzing the targets with three fuzzers: [AFLnwe](https://github.com/aflnet/aflnwe) (a network-enabled version of AFL, which sends inputs over a TCP/IP sockets instead of files), [AFLNet](https://github.com/aflnet/aflnet) (a fuzzer tailored for stateful network servers), and [StateAFL](https://github.com/stateafl/stateafl) (another fuzzer for stateful network servers).
+ProFuzzBench provides automation scripts for fuzzing the targets with two fuzzers: [AFLNet](https://github.com/aflnet/aflnet) (a fuzzer tailored for stateful network servers) and [StateAFL](https://github.com/stateafl/stateafl) (another fuzzer for stateful network servers).
 
-In the following tutorial, you can find instructions to run AFLnwe and AFLnet (the first two fuzzers supported by ProFuzzBench). For more information about StateAFL, please check out [README-StateAFL.md](README-StateAFL.md).
+In the following tutorial, you can find instructions to run AFLNet. For more information about StateAFL, please check out [README-StateAFL.md](README-StateAFL.md).
 
 
-# Tutorial - Fuzzing LightFTP server with [AFLNet](https://github.com/aflnet/aflnet) and [AFLnwe](https://github.com/aflnet/aflnwe), a network-enabled version of AFL
+# Tutorial - Fuzzing LightFTP server with [AFLNet](https://github.com/aflnet/aflnet)
 Follow the steps below to run and collect experimental results for LightFTP, which is a lightweight File Transfer Protocol (FTP) server. The similar steps should be followed to run experiments on other subjects. Each subject program comes with a README.md file showing subject-specific commands to run experiments.
 
 ## Step-0. Set up environmental variables
@@ -77,14 +77,13 @@ Run [profuzzbench_exec_common.sh script](scripts/execution/profuzzbench_exec_com
 - ***7th argument (TIMEOUT)***  : time for fuzzing in seconds
 - ***8th argument (SKIPCOUNT)***: used for calculating coverage over time. e.g., SKIPCOUNT=5 means we run gcovr after every 5 test cases because gcovr takes time and we do not want to run it after every single test case
 
-The following commands run 4 instances of AFLNet and 4 instances of AFLnwe to simultaenously fuzz LightFTP in 60 minutes.
+The following commands run 4 instances of AFLNet to fuzz LightFTP in 60 minutes.
 
 ```bash
 cd $PFBENCH
 mkdir results-lightftp
 
-profuzzbench_exec_common.sh lightftp 4 results-lightftp aflnet out-lightftp-aflnet "-P FTP -D 10000 -q 3 -s 3 -E -K" 3600 5 &
-profuzzbench_exec_common.sh lightftp 4 results-lightftp aflnwe out-lightftp-aflnwe "-D 10000 -K" 3600 5
+profuzzbench_exec_common.sh lightftp 4 results-lightftp aflnet out-lightftp-aflnet "-P FTP -D 10000 -q 3 -s 3 -E -K" 3600 5
 ```
 
 If the script runs successfully, its output should look similar to the text below.
@@ -101,7 +100,7 @@ AFLNET: I am done!
 ```
 
 ## Step-3. Collect the results
-All results (in tar files) should be stored in the folder created in Step-2 (results-lightftp). Specifically, these tar files are the compressed version of output folders produced by all fuzzing instances. If the fuzzer is afl based (e.g., AFLNet, AFLnwe) each folder should contain sub-folders like crashes, hangs, queue and so on. Use [profuzzbench_generate_csv.sh script](scripts/analysis/profuzzbench_generate_csv.sh) to collect results in terms of code coverage over time. The script takes 5 arguments as listed below.
+All results (in tar files) should be stored in the folder created in Step-2 (results-lightftp). Specifically, these tar files are the compressed version of output folders produced by all fuzzing instances. If the fuzzer is afl based (e.g., AFLNet, StateAFL) each folder should contain sub-folders like crashes, hangs, queue and so on. Use [profuzzbench_generate_csv.sh script](scripts/analysis/profuzzbench_generate_csv.sh) to collect results in terms of code coverage over time. The script takes 5 arguments as listed below.
 
 - ***1st argument (PROG)***   : name of the subject program (e.g., lightftp)
 - ***2nd argument (RUNS)***   : number of runs
@@ -109,25 +108,24 @@ All results (in tar files) should be stored in the folder created in Step-2 (res
 - ***4th argument (COVFILE)***: CSV-formatted output file keeping the results
 - ***5th argument (APPEND)*** : append mode; set this to 0 for the first fuzzer and 1 for the subsequent fuzzer(s).
 
-The following commands collect the  code coverage results produced by AFLNet and AFLnwe and save them to results.csv.
+The following commands collect the  code coverage results produced by AFLNet and save them to results.csv.
 
 ```bash
 cd $PFBENCH/results-lightftp
 
 profuzzbench_generate_csv.sh lightftp 4 aflnet results.csv 0
-profuzzbench_generate_csv.sh lightftp 4 aflnwe results.csv 1
 ```
 
 The results.csv file should look similar to text below. The file has six columns showing the timestamp, subject program, fuzzer name, run index, coverage type and its value. The file contains both line coverage and branch coverage over time information. Each coverage type comes with two values, in percentage (*_per) and in absolute number (*_abs).
 
 ```
 time,subject,fuzzer,run,cov_type,cov
-1600905795,lightftp,aflnwe,1,l_per,25.9
-1600905795,lightftp,aflnwe,1,l_abs,292
-1600905795,lightftp,aflnwe,1,b_per,13.3
-1600905795,lightftp,aflnwe,1,b_abs,108
-1600905795,lightftp,aflnwe,1,l_per,25.9
-1600905795,lightftp,aflnwe,1,l_abs,292
+1600905795,lightftp,aflnet,1,l_per,25.9
+1600905795,lightftp,aflnet,1,l_abs,292
+1600905795,lightftp,aflnet,1,b_per,13.3
+1600905795,lightftp,aflnet,1,b_abs,108
+1600905795,lightftp,aflnet,1,l_per,25.9
+1600905795,lightftp,aflnet,1,l_abs,292
 ```
 
 ## Step-4. Analyze the results
@@ -173,7 +171,7 @@ The following folder structure shows all files we have prepared for fuzzing Ligh
 subjects/FTP/LightFTP
 ├── Dockerfile (required): based on this, a target-specific Docker image is built (See Step-1 in the tutorial)
 ├── run.sh (required): main script to run experiment inside a container
-├── cov_script.sh (required): script to do code coverage analysis
+├── coverage-replay.env (required): settings for replaying the queue against the gcov build to measure code coverage
 ├── clean.sh (optional): script to clean server states before fuzzing to improve the stability
 ├── fuzzing.patch (optional): code changes needed to improve fuzzing results (e.g., remove randomness)
 ├── gcov.patch (required): code changes needed to support code coverage analysis (e.g., enable gcov, add a signal handler)
@@ -186,7 +184,7 @@ subjects/FTP/LightFTP
 │   └── ftp_requests_full_normal.raw
 └── README.md (optional): a target-specific README containing commands to run experiments
 ```
-All the required files (i.e., Dockerfile, run.sh, cov_script.sh, gcov.patch, and the seed corpus) follow some templates so that one can easily follow them to prepare files for a new target.
+All the required files (i.e., Dockerfile, run.sh, coverage-replay.env, gcov.patch, and the seed corpus) follow some templates so that one can easily follow them to prepare files for a new target.
 
 ### Step-3. Test your new target server
 

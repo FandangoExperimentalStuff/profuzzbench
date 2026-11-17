@@ -1,6 +1,6 @@
 Please carefully read the [main README.md](../../../README.md), which is stored in the benchmark's root folder, before following this subject-specific guideline.
 
-# Fuzzing Dnsmasq server with AFLNet and AFLnwe
+# Fuzzing Dnsmasq server with AFLNet
 Please follow the steps below to run and collect experimental results for Dnsmasq, which is a lightweight DNS server.
 
 ## Step-1. Build a docker image
@@ -13,24 +13,22 @@ docker build . -t dnsmasq
 ```
 
 ## Step-2. Run fuzzing
-The following commands run 4 instances of AFLNet and 4 instances of AFLnwe to simultaenously fuzz Dnsmasq in 60 minutes.
+The following commands run 4 instances of AFLNet to fuzz Dnsmasq in 60 minutes.
 
 ```bash
 cd $PFBENCH
 mkdir results-dnsmasq
 
-profuzzbench_exec_common.sh dnsmasq 4 results-dnsmasq aflnet out-dnsmasq-aflnet "-P DNS -D 10000 -K" 3600 5 &
-profuzzbench_exec_common.sh dnsmasq 4 results-dnsmasq aflnwe out-dnsmasq-aflnwe "-D 10000 -K" 3600 5
+profuzzbench_exec_common.sh dnsmasq 4 results-dnsmasq aflnet out-dnsmasq-aflnet "-P DNS -D 10000 -K" 3600 5
 ```
 
 ## Step-3. Collect the results
-The following commands collect the  code coverage results produced by AFLNet and AFLnwe and save them to results.csv.
+The following commands collect the  code coverage results produced by AFLNet and save them to results.csv.
 
 ```bash
 cd $PFBENCH/results-dnsmasq
 
 profuzzbench_generate_csv.sh dnsmasq 4 aflnet results.csv 0
-profuzzbench_generate_csv.sh dnsmasq 4 aflnwe results.csv 1
 ```
 
 ## Step-4. Analyze the results

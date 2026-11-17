@@ -1,6 +1,6 @@
 Please carefully read the [main README.md](../../../README.md), which is stored in the benchmark's root folder, before following this subject-specific guideline.
 
-# Fuzzing Kamailio server with AFLNet and AFLnwe
+# Fuzzing Kamailio server with AFLNet
 Please follow the steps below to run and collect experimental results for Kamailio, which is a SIP server.
 
 ## Step-1. Build a docker image
@@ -13,24 +13,22 @@ docker build . -t kamailio
 ```
 
 ## Step-2. Run fuzzing
-The following commands run 4 instances of AFLNet and 4 instances of AFLnwe to simultaenously fuzz Kamailio in 60 minutes.
+The following commands run 4 instances of AFLNet to fuzz Kamailio in 60 minutes.
 
 ```bash
 cd $PFBENCH
 mkdir results-kamailio
 
-profuzzbench_exec_common.sh kamailio 4 results-kamailio aflnet out-kamailio-aflnet "-m 200 -t 3000+ -P SIP -l 5061 -D 50000 -q 3 -s 3 -E -K" 3600 5 &
-profuzzbench_exec_common.sh kamailio 4 results-kamailio aflnwe out-kamailio-aflnwe "-m 200 -t 3000+ -D 50000 -K" 3600 5
+profuzzbench_exec_common.sh kamailio 4 results-kamailio aflnet out-kamailio-aflnet "-m 200 -t 3000+ -P SIP -l 5061 -D 50000 -q 3 -s 3 -E -K" 3600 5
 ```
 
 ## Step-3. Collect the results
-The following commands collect the  code coverage results produced by AFLNet and AFLnwe and save them to results.csv.
+The following commands collect the  code coverage results produced by AFLNet and save them to results.csv.
 
 ```bash
 cd $PFBENCH/results-kamailio
 
 profuzzbench_generate_csv.sh kamailio 4 aflnet results.csv 0
-profuzzbench_generate_csv.sh kamailio 4 aflnwe results.csv 1
 ```
 
 ## Step-4. Analyze the results

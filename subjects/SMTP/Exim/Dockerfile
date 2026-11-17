@@ -44,11 +44,6 @@ RUN git clone https://github.com/profuzzbench/aflnet.git && \
     make clean all $MAKE_OPT && \
     cd llvm_mode && make $MAKE_OPT
 
-RUN git clone https://github.com/profuzzbench/aflnwe.git && \
-    cd aflnwe && \
-    make clean all $MAKE_OPT && \
-    cd llvm_mode && make $MAKE_OPT
-
 # Set up environment variables for AFLNet
 ENV WORKDIR="/home/ubuntu/experiments"
 ENV AFLNET="/home/ubuntu/aflnet"
@@ -110,7 +105,6 @@ ENV PATH="/usr/exim/bin:${PATH}"
 
 COPY --chown=ubuntu:ubuntu in-smtp ${WORKDIR}/in-smtp
 COPY --chown=ubuntu:ubuntu smtp.dict ${WORKDIR}/smtp.dict
-COPY --chown=ubuntu:ubuntu cov_script.sh ${WORKDIR}/cov_script
 COPY --chown=ubuntu:ubuntu run.sh ${WORKDIR}/run
 COPY --chown=ubuntu:ubuntu clean.sh ${WORKDIR}/clean
 

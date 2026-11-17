@@ -11,7 +11,7 @@ strstr() {
   return 0
 }
 
-#Commands for afl-based fuzzers (e.g., aflnet, aflnwe)
+#Commands for afl-based fuzzers (e.g., aflnet, stateafl)
 if $(strstr $FUZZER "afl"); then
 
   TARGET_DIR=${TARGET_DIR:-"live555"}
@@ -33,14 +33,7 @@ if $(strstr $FUZZER "afl"); then
   #Move to gcov folder
   cd $WORKDIR/live555-cov/testProgs
 
-  #The last argument passed to cov_script should be 0 if the fuzzer is afl/nwe and it should be 1 if the fuzzer is based on aflnet
-  #0: the test case is a concatenated message sequence -- there is no message boundary
-  #1: the test case is a structured file keeping several request messages
-  if [ $FUZZER == "aflnwe" ]; then
-    cov_script ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/ 8554 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time.csv 0
-  else
-    measure-queue-coverage ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/replayable-queue ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
-  fi
+  measure-queue-coverage ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/replayable-queue ${WORKDIR}/${TARGET_DIR}/testProgs/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
 
   cd $WORKDIR/live555-cov
   #copy .hh files since gcovr could not detect them

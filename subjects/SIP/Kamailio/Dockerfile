@@ -44,11 +44,6 @@ RUN git clone https://github.com/profuzzbench/aflnet.git && \
     make clean all $MAKE_OPT && \
     cd llvm_mode && make $MAKE_OPT
 
-RUN git clone https://github.com/profuzzbench/aflnwe.git && \
-    cd aflnwe && \
-    make clean all $MAKE_OPT && \
-    cd llvm_mode && make $MAKE_OPT
-
 # Set up environment variables for AFLNet
 ENV WORKDIR="/home/ubuntu/experiments"
 ENV AFLNET="/home/ubuntu/aflnet"
@@ -101,7 +96,6 @@ RUN cd $WORKDIR && \
     make CC_EXTRA_OPTS="-fprofile-arcs -ftest-coverage" LD_EXTRA_OPTS="-fprofile-arcs -ftest-coverage" all $MAKE_OPT
 
 COPY --chown=ubuntu:ubuntu in-sip ${WORKDIR}/in-sip
-COPY --chown=ubuntu:ubuntu cov_script.sh ${WORKDIR}/cov_script
 COPY --chown=ubuntu:ubuntu run.sh ${WORKDIR}/run
 COPY --chown=ubuntu:ubuntu run_pjsip.sh ${WORKDIR}/run_pjsip
 COPY --chown=ubuntu:ubuntu kamailio-basic.cfg ${WORKDIR}/kamailio-basic.cfg

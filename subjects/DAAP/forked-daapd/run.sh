@@ -29,7 +29,7 @@ then
   exit 1
 fi
 
-#Commands for afl-based fuzzers (e.g., aflnet, aflnwe)
+#Commands for afl-based fuzzers (e.g., aflnet, stateafl)
 if $(strstr $FUZZER "afl"); then
 
   # Run fuzzer-specific commands (if any)
@@ -52,14 +52,7 @@ if $(strstr $FUZZER "afl"); then
   #Move to gcov folder
   cd $WORKDIR
 
-  #The last argument passed to cov_script should be 0 if the fuzzer is afl/nwe and it should be 1 if the fuzzer is based on aflnet
-  #0: the test case is a concatenated message sequence -- there is no message boundary
-  #1: the test case is a structured file keeping several request messages
-  if [ $FUZZER = "aflnwe" ]; then
-    cov_script ${WORKDIR}/${OUTDIR}/ 3689 ${SKIPCOUNT} ${WORKDIR}/${OUTDIR}/cov_over_time.csv 0
-  else
-    measure-queue-coverage ${WORKDIR}/${OUTDIR}/replayable-queue ${WORKDIR}/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
-  fi
+  measure-queue-coverage ${WORKDIR}/${OUTDIR}/replayable-queue ${WORKDIR}/${OUTDIR}/cov_over_time.csv ${SKIPCOUNT}
 
   cd $WORKDIR/forked-daapd-gcov
   gcovr -r . --html --html-details -o index.html
