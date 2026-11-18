@@ -8,12 +8,14 @@ TARGETS=${TARGETS:-"lightftp bftpd proftpd pure-ftpd exim dnsmasq live555 kamail
 FUZZERS=${FUZZERS:-"aflnet stateafl"}      # add fandango if needed
 RUNS=${RUNS:-10}
 # CPUs to use, as a list of ranges (like taskset -c). One run per CPU; SLOTS = number of CPUs.
-# On this Threadripper, CPU n and n+24 are SMT siblings of the same physical core.
-CPUS=${CPUS:-"0-11,24-35"}   # physical cores 0-11 incl. SMT siblings; cores 12-23 reserved for a colleague
+# CPUs joined with + form one slot, e.g. "0+8,1+9" runs two jobs, each on a whole core with its SMT sibling.
+CPUS=${CPUS:-"0-11,24-35"}
 
 CPU_LIST=()
 for part in ${CPUS//,/ }; do
-  if [[ $part == *-* ]]; then
+  if [[ $part == *+* ]]; then
+    CPU_LIST+=("${part//+/,}")
+  elif [[ $part == *-* ]]; then
     for ((c=${part%-*}; c<=${part#*-}; c++)); do CPU_LIST+=("$c"); done
   else
     CPU_LIST+=("$part")
@@ -33,14 +35,14 @@ mkdir -p "$RESULTS"
 LOG=$RESULTS/runs.log
 
 # Host settings required by StateAFL/AFL (containers share the host kernel)
-if [ "$(cat /proc/sys/kernel/randomize_va_space)" != "0" ]; then
-  echo "Aborting: ASLR is enabled. Run: echo 0 | sudo tee /proc/sys/kernel/randomize_va_space"; exit 1
+if [[ " $FUZZERS " == *" stateafl "* ]] && [ "$(cat /proc/sys/kernel/randomize_va_space)" != "0" ]; then
+  echo "Aborting: ASLR is enabled, which StateAFL does not take. Run: echo 0 | sudo tee /proc/sys/kernel/randomize_va_space"; exit 1
 fi
 if grep -q '^|' /proc/sys/kernel/core_pattern; then
   echo "Aborting: core_pattern pipes to an external tool. Run: echo core | sudo tee /proc/sys/kernel/core_pattern"; exit 1
 fi
 
-# Report missing images up front instead of hours into the campaign
+# Report missing images up front
 source "$CONF"
 missing=0
 for t in $TARGETS; do for f in $FUZZERS; do
