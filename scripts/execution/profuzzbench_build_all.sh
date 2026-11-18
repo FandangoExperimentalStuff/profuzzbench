@@ -1,83 +1,44 @@
 #!/bin/bash
+# Builds the images of every subject: the base image first, then its StateAFL and Fandango images side by side,
+# BUILD_JOBS subjects at a time (default 4). MAKE_OPT goes to make in the builds (default -j4),
+# NO_CACHE="--no-cache" rebuilds every layer. Each build logs to build-logs/<image>.log.
 
-#export NO_CACHE="--no-cache"
-#export MAKE_OPT="-j4"
+export PFBENCH=${PFBENCH:-$(cd "$(dirname "$0")/../.." && pwd)}
+export MAKE_OPT=${MAKE_OPT:--j4}
+export NO_CACHE=${NO_CACHE:-}
+export BUILD_LOGS=$PFBENCH/build-logs
+BUILD_JOBS=${BUILD_JOBS:-4}
 
-cd $PFBENCH
-cd subjects/FTP/LightFTP
-docker build . -t lightftp --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t lightftp-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t lightftp-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
+SUBJECTS="FTP/LightFTP:lightftp FTP/BFTPD:bftpd FTP/ProFTPD:proftpd FTP/PureFTPD:pure-ftpd SMTP/Exim:exim
+DNS/Dnsmasq:dnsmasq RTSP/Live555:live555 SIP/Kamailio:kamailio SSH/OpenSSH:openssh TLS/OpenSSL:openssl
+DTLS/TinyDTLS:tinydtls DICOM/Dcmtk:dcmtk DAAP/forked-daapd:forked-daapd"
 
-cd $PFBENCH
-cd subjects/FTP/BFTPD
-docker build . -t bftpd --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t bftpd-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t bftpd-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
+build_image() {
+  local image=$1
+  shift
+  if docker build . -t "$image" --build-arg MAKE_OPT $NO_CACHE "$@" > "$BUILD_LOGS/$image.log" 2>&1; then
+    echo "OK    $image"
+  else
+    echo "FAIL  $image (see $BUILD_LOGS/$image.log)"
+    return 1
+  fi
+}
 
-cd $PFBENCH
-cd subjects/FTP/ProFTPD
-docker build . -t proftpd --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t proftpd-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t proftpd-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
+build_subject() {
+  local directory=${1%%:*}
+  local name=${1#*:}
+  cd "$PFBENCH/subjects/$directory" || return 1
+  build_image "$name" --build-context fandango-workspace="$PFBENCH/.." || return 1
+  build_image "$name-stateafl" -f Dockerfile-stateafl &
+  local stateafl=$!
+  build_image "$name-fandango" -f Dockerfile-fandango --build-context fandango-workspace="$PFBENCH/.." &
+  local fandango=$!
+  wait "$stateafl"
+  local stateafl_status=$?
+  wait "$fandango" || return 1
+  return $stateafl_status
+}
 
-cd $PFBENCH
-cd subjects/FTP/PureFTPD
-docker build . -t pure-ftpd --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t pure-ftpd-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t pure-ftpd-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-
-cd $PFBENCH
-cd subjects/SMTP/Exim
-docker build . -t exim --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t exim-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t exim-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-
-cd $PFBENCH
-cd subjects/DNS/Dnsmasq
-docker build . -t dnsmasq --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t dnsmasq-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t dnsmasq-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-
-cd $PFBENCH
-cd subjects/RTSP/Live555
-docker build . -t live555 --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t live555-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t live555-fandango -f Dockerfile-fandango --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-
-cd $PFBENCH
-cd subjects/SIP/Kamailio
-docker build . -t kamailio --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t kamailio-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t kamailio-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-
-cd $PFBENCH
-cd subjects/SSH/OpenSSH
-docker build . -t openssh --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t openssh-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t openssh-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-
-cd $PFBENCH
-cd subjects/TLS/OpenSSL
-docker build . -t openssl --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t openssl-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t openssl-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-
-cd $PFBENCH
-cd subjects/DTLS/TinyDTLS
-docker build . -t tinydtls --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t tinydtls-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t tinydtls-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-
-cd $PFBENCH
-cd subjects/DICOM/Dcmtk
-docker build . -t dcmtk --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t dcmtk-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t dcmtk-fandango -f Dockerfile-fandango $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-
-cd $PFBENCH
-cd subjects/DAAP/forked-daapd
-docker build . -t forked-daapd --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-docker build . -t forked-daapd-stateafl -f Dockerfile-stateafl --build-arg MAKE_OPT $NO_CACHE
-docker build . -t forked-daapd-fandango -f Dockerfile-fandango --build-arg MAKE_OPT $NO_CACHE --build-context fandango-workspace=$PFBENCH/..
-
+export -f build_image build_subject
+mkdir -p "$BUILD_LOGS"
+printf '%s\n' $SUBJECTS | xargs -P "$BUILD_JOBS" -I{} bash -c 'build_subject "$1"' _ {}

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-rm -rf /home/fuzzing/*
+find /home/fuzzing -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 rm -rf /home/fuzzing/test /home/fuzzing/test.txt
 mkdir /home/fuzzing/test
 echo test > /home/fuzzing/test.txt

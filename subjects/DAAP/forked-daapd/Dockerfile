@@ -126,6 +126,7 @@ COPY --chown=ubuntu:ubuntu in-daap ${WORKDIR}/in-daap
 COPY --chown=ubuntu:ubuntu run.sh ${WORKDIR}/run
 COPY --chown=ubuntu:ubuntu MP3 ${WORKDIR}/MP3
 COPY --chown=ubuntu:ubuntu forked-daapd.conf ${WORKDIR}/forked-daapd.conf
+COPY --chown=ubuntu:ubuntu clean.sh ${WORKDIR}/clean
 
 USER root
 COPY --from=ghcr.io/astral-sh/uv:0.13.0 /uv /uvx /bin/

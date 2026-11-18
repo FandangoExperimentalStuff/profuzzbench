@@ -44,7 +44,7 @@ if [ $FUZZER = "fandango" ]; then
   #Move to fuzzing folder
   cd $WORKDIR
 
-  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/3689 --budget $TIMEOUT $OPTIONS -- ${WORKDIR}/${TARGET_DIR}/src/forked-daapd -d 0 -c ${WORKDIR}/forked-daapd.conf -f
+  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/fandango/bin/fandango-driver talk --out $OUTDIR --endpoint tcp://127.0.0.1/3689 --budget $TIMEOUT $OPTIONS -c ${WORKDIR}/clean -- ${WORKDIR}/${TARGET_DIR}/src/forked-daapd -d 0 -c ${WORKDIR}/forked-daapd.conf -f
 
   STATUS=$?
 
