@@ -5,6 +5,8 @@
 #   archive: a result archive of AFLNet, StateAFL or Fandango with a replayable-queue
 #   with-seeds: replay the seed files of the subject first, stamped with the start time of the fuzzer
 #   COVERAGE_CPUSET (environment, optional): the CPUs the replay container runs on, e.g. 6,7,14,15
+#   side messages of a Fandango archive (see measure-queue-coverage.sh) are played with the .fan
+#     file in subjects/<subject>/fan-specs of the working tree
 # Writes <output-dir>/cov_over_time.csv (or cov_over_time_with_seeds.csv) with measure-queue-coverage of the working tree,
 # with the line coverage next to it as _lines.json and _html/.
 set -eu
@@ -20,6 +22,7 @@ PFBENCH=$(cd "$(dirname "$0")/../../.." && pwd)
 DRIVER_SOURCE=$PFBENCH/../fandango-driver/src
 REPLAY_ENV=$PFBENCH/subjects/$SUBJECT/coverage-replay.env
 REPLAY_SCRIPT=$PFBENCH/scripts/analysis/coverage/measure-queue-coverage.sh
+SPEC_DIR=$PFBENCH/subjects/$SUBJECT/fan-specs
 
 if [ ! -f "$REPLAY_ENV" ]; then
   echo "no coverage-replay.env for $SUBJECT" >&2
@@ -36,6 +39,7 @@ docker run --rm ${COVERAGE_CPUSET:+--cpuset-cpus=$COVERAGE_CPUSET} \
   -v "$REPLAY_SCRIPT:/opt/measure-queue-coverage:ro" \
   -v "$(realpath "$ARCHIVE"):/opt/archive.tar.gz:ro" \
   -v "$DRIVER_SOURCE:/opt/driver:ro" \
+  -v "$SPEC_DIR:/opt/fan-specs:ro" \
   -v "$(realpath "$OUTPUT"):/opt/output" \
   -e PYTHONPATH=/opt/driver \
   -e COVERAGE_REPLAY_ENV=/opt/coverage-replay.env \
@@ -50,7 +54,11 @@ done
 export DRIVER_PYTHON
 EXTRACTED=$(mktemp -d)
 tar -xzf /opt/archive.tar.gz -C "$EXTRACTED" --wildcards "*/replayable-queue/*" "*/fuzzer_stats"
+tar -xzf /opt/archive.tar.gz -C "$EXTRACTED" --wildcards "*/replayable-queue-side-messages/*" 2>/dev/null || true
 QUEUE=$(find "$EXTRACTED" -type d -name replayable-queue | head -1)
+if [ -d "$QUEUE-side-messages" ]; then
+  export SIDE_PARTY_SPEC=$(ls /opt/fan-specs/*.fan | head -1)
+fi
 COVERAGE_FILE=cov_over_time.csv
 if [ "$SEED_MODE" = "with-seeds" ]; then
   FUZZER_STATS=$(find "$EXTRACTED" -name fuzzer_stats | head -1)
@@ -62,5 +70,6 @@ if [ "$SEED_MODE" = "with-seeds" ]; then
   COVERAGE_FILE=cov_over_time_with_seeds.csv
 fi
 /opt/measure-queue-coverage "$QUEUE" "/opt/output/$COVERAGE_FILE" "$SESSIONS_PER_SAMPLE" > /tmp/replay.log 2>&1 || { tail -n 20 /tmp/replay.log; exit 1; }
+grep -h "side messages:" /tmp/replay.log || true
 tail -n 1 /tmp/replay.log
 '

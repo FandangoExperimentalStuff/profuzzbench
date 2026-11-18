@@ -63,6 +63,7 @@ if [ $FUZZER = "fandango" ]; then
   cp ${WORKDIR}/in-daap-replay/*.raw ${SEEDED}/replayable-queue/
   touch -d @$(sed -n 's/^start_time *: *//p' ${WORKDIR}/${OUTDIR}/fuzzer_stats) ${SEEDED}/replayable-queue/*.raw
   cp -p ${WORKDIR}/${OUTDIR}/replayable-queue/id* ${SEEDED}/replayable-queue/ 2>/dev/null
+  cp -pr ${WORKDIR}/${OUTDIR}/replayable-queue-side-messages ${SEEDED}/ 2>/dev/null
   measure-queue-coverage ${SEEDED}/replayable-queue ${WORKDIR}/${OUTDIR}/cov_over_time_with_seeds.csv ${SKIPCOUNT}
   rm -rf ${SEEDED}
 

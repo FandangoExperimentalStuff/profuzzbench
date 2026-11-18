@@ -59,6 +59,7 @@ RUN mkdir $WORKDIR
 COPY --chown=ubuntu:ubuntu key.pem ${WORKDIR}/key.pem
 COPY --chown=ubuntu:ubuntu cert.pem ${WORKDIR}/cert.pem
 COPY --chown=ubuntu:ubuntu rand.patch ${WORKDIR}/rand.patch
+COPY --chown=ubuntu:ubuntu gcov.patch ${WORKDIR}/gcov.patch
 
 # Set up environment variables for ASAN
 env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_after_return=1:detect_container_overflow=0:poison_array_cookie=0:malloc_fill_byte=0:max_malloc_fill_size=16777216'
@@ -82,6 +83,7 @@ RUN cd ${WORKDIR} && \
     cp ${WORKDIR}/*.pem ./ && \
     git checkout 0437435a && \
     patch -p1 < ${WORKDIR}/rand.patch && \
+    patch -p1 < ${WORKDIR}/gcov.patch && \
     CFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" ./config no-shared --with-rand-seed=none && \
     CFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" make include/openssl/configuration.h include/openssl/opensslv.h include/crypto/bn_conf.h include/crypto/dso_conf.h && \
     CFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" make apps/openssl $MAKE_OPT

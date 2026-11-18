@@ -42,6 +42,7 @@ if [ $FUZZER = "fandango" ]; then
   cp ${WORKDIR}/in-dicom-replay/*.raw ${SEEDED}/replayable-queue/
   touch -d @$(sed -n 's/^start_time *: *//p' ${WORKDIR}/${TARGET_DIR}/build/bin/${OUTDIR}/fuzzer_stats) ${SEEDED}/replayable-queue/*.raw
   cp -p ${WORKDIR}/${TARGET_DIR}/build/bin/${OUTDIR}/replayable-queue/id* ${SEEDED}/replayable-queue/ 2>/dev/null
+  cp -pr ${WORKDIR}/${TARGET_DIR}/build/bin/${OUTDIR}/replayable-queue-side-messages ${SEEDED}/ 2>/dev/null
   measure-queue-coverage ${SEEDED}/replayable-queue ${WORKDIR}/${TARGET_DIR}/build/bin/${OUTDIR}/cov_over_time_with_seeds.csv ${SKIPCOUNT}
   rm -rf ${SEEDED}
 

@@ -75,7 +75,7 @@ RUN cd ${WORKDIR} && \
     git clone https://github.com/proftpd/proftpd.git proftpd-gcov && \
     cd proftpd-gcov && \
     git checkout 4017eff8 && \
-    CFLAGS="-fprofile-arcs -ftest-coverage" CPPFLAGS="-fprofile-arcs -ftest-coverage" CXXFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" ./configure --enable-devel=nodaemon:nofork && \
+    CFLAGS="-fprofile-arcs -ftest-coverage" CPPFLAGS="-fprofile-arcs -ftest-coverage -DPR_DEVEL_PROFILE" CXXFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" ./configure --enable-devel=nodaemon:nofork && \
     make $MAKE_OPT
 
 
