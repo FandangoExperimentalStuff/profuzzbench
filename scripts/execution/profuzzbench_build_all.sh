@@ -1,7 +1,7 @@
 #!/bin/bash
 # Builds the images of every subject: the base image first, then its StateAFL and Fandango images side by side,
 # BUILD_JOBS subjects at a time (default 4). MAKE_OPT goes to make in the builds (default -j4),
-# NO_CACHE="--no-cache" rebuilds every layer. Each build logs to build-logs/<image>.log.
+# NO_CACHE="--no-cache" rebuilds every layer, SUBJECTS="SMTP/Exim:exim ..." builds only those. Each build logs to build-logs/<image>.log.
 
 export PFBENCH=${PFBENCH:-$(cd "$(dirname "$0")/../.." && pwd)}
 export MAKE_OPT=${MAKE_OPT:--j4}
@@ -9,9 +9,9 @@ export NO_CACHE=${NO_CACHE:-}
 export BUILD_LOGS=$PFBENCH/build-logs
 BUILD_JOBS=${BUILD_JOBS:-4}
 
-SUBJECTS="FTP/LightFTP:lightftp FTP/BFTPD:bftpd FTP/ProFTPD:proftpd FTP/PureFTPD:pure-ftpd SMTP/Exim:exim
+SUBJECTS=${SUBJECTS:-"FTP/LightFTP:lightftp FTP/BFTPD:bftpd FTP/ProFTPD:proftpd FTP/PureFTPD:pure-ftpd SMTP/Exim:exim
 DNS/Dnsmasq:dnsmasq RTSP/Live555:live555 SIP/Kamailio:kamailio SSH/OpenSSH:openssh TLS/OpenSSL:openssl
-DTLS/TinyDTLS:tinydtls DICOM/Dcmtk:dcmtk DAAP/forked-daapd:forked-daapd"
+DTLS/TinyDTLS:tinydtls DICOM/Dcmtk:dcmtk DAAP/forked-daapd:forked-daapd"}
 
 build_image() {
   local image=$1

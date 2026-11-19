@@ -69,7 +69,23 @@ for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
   exit 1
 done
 
+COVERAGE_FILES="${OUTDIR}/cov_over_time.csv"
+if [ "$FUZZER" = "fandango" ]; then
+  COVERAGE_FILES="$COVERAGE_FILES ${OUTDIR}/cov_over_time_with_seeds.csv"
+fi
+
 if docker cp "$id:${WORKDIR}/${OUTDIR}.tar.gz" "$DEST" >/dev/null 2>&1; then
+  MISSING=""
+  for COVERAGE_FILE in $COVERAGE_FILES; do
+    tar -tzf "$DEST" "$COVERAGE_FILE" >/dev/null 2>&1 || MISSING="$MISSING $(basename "$COVERAGE_FILE")"
+  done
+  if [ -n "$MISSING" ]; then
+    LOGFILE=${SAVETO}/${OUTDIR}_${IDX}.log
+    docker logs "$id" > "$LOGFILE" 2>&1
+    docker rm "$id" >/dev/null
+    echo "[$(date +%FT%T)] FAIL  $TARGET $FUZZER #$IDX (${ELAPSED}s, attempt $attempt; fuzzing done, coverage measurement failed, missing:${MISSING}; log: $LOGFILE)" >&2
+    exit 1
+  fi
   docker rm "$id" >/dev/null
   echo "[$(date +%FT%T)] DONE  $TARGET $FUZZER #$IDX (${ELAPSED}s, attempt $attempt)"
 else

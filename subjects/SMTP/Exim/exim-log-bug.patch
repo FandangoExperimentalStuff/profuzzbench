@@ -1,5 +1,5 @@
 diff --git a/src/src/log.c b/src/src/log.c
-index ddd7137..fd214e1 100644
+index ddd71377e..d6c8380ca 100644
 --- a/src/src/log.c
 +++ b/src/src/log.c
 @@ -1003,7 +1003,8 @@ if (  flags & LOG_MAIN
@@ -12,3 +12,13 @@ index ddd7137..fd214e1 100644
          {
          (void)close(mainlogfd);       /* Close the file */
          mainlogfd = -1;               /* Clear the file descriptor */
+@@ -1121,7 +1122,8 @@ if ((flags & LOG_REJECT) != 0)
+     if (rejectlog_datestamp != NULL)
+       {
+       uschar *nowstamp = tod_stamp(string_datestamp_type);
+-      if (Ustrncmp (rejectlog_datestamp, nowstamp, Ustrlen(nowstamp)) != 0)
++
++      if (string_datestamp_type > 0 && Ustrncmp (rejectlog_datestamp, nowstamp, Ustrlen(nowstamp)) != 0)
+         {
+         (void)close(rejectlogfd);       /* Close the file */
+         rejectlogfd = -1;               /* Clear the file descriptor */
