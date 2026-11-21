@@ -34,7 +34,7 @@ group run on the L3 domain of its finished runs, and a new group runs on the L3
 domain its target ran on least, so RUNS=10 after RUNS=1 ends with every target
 and fuzzer 5 times on each of the two L3 domains.
 
-  --plan   print the waves and exit without starting anything
+  --plan   print the waves and what keeps the host from starting, start nothing
   --help   print this text
 
 Variables (current value):
@@ -51,6 +51,10 @@ Variables (current value):
 One 24 h run per target and fuzzer:
   RUNS=1 RESULTS=\$PWD/results/campaign-1 ./launch.sh --plan
   RUNS=1 RESULTS=\$PWD/results/campaign-1 ./launch.sh
+
+Before starting it checks the host: ASLR off (for StateAFL), core_pattern
+writing core files, the performance governor on every CPU used, all images built.
+These settings are reset by a reboot.
 
 Progress: RESULTS/runs.log has one line per finished run, RESULTS/plan-<time>.txt
 the plan of each start, and docker ps --filter label=pfb-campaign=1 the running runs.
@@ -272,20 +276,36 @@ for target in $TARGETS; do
   done
 done
 
+HOST_PROBLEMS=()
+if [[ " $FUZZERS " == *" stateafl "* ]] && [ "$(cat /proc/sys/kernel/randomize_va_space)" != "0" ]; then
+  HOST_PROBLEMS+=("ASLR is enabled, which StateAFL does not take. Run: echo 0 | sudo tee /proc/sys/kernel/randomize_va_space")
+fi
+if grep -q '^|' /proc/sys/kernel/core_pattern; then
+  HOST_PROBLEMS+=("core_pattern pipes to an external tool. Run: echo core | sudo tee /proc/sys/kernel/core_pattern")
+fi
+SLOW_GOVERNOR_CPUS=()
+for core in $SELECTED_CORES; do
+  for cpu in $(expand_numbers "${CORE_CPUSET[$core]}"); do
+    governor_path=/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_governor
+    [ -r "$governor_path" ] && [ "$(<"$governor_path")" != performance ] && SLOW_GOVERNOR_CPUS+=("$cpu")
+  done
+done
+if [ ${#SLOW_GOVERNOR_CPUS[@]} -gt 0 ]; then
+  HOST_PROBLEMS+=("the CPU frequency governor of CPUs $(printf '%s\n' "${SLOW_GOVERNOR_CPUS[@]}" | sort -n | tr '\n' ' ')is not performance, so their clock follows the load of the runs. Run: sudo cpupower frequency-set -g performance")
+fi
+if [ ${#MISSING_IMAGES[@]} -gt 0 ]; then
+  HOST_PROBLEMS+=("missing images: ${MISSING_IMAGES[*]}")
+fi
+
 if [ "$MODE" = plan ]; then
   print_plan
-  [ ${#MISSING_IMAGES[@]} -eq 0 ] || echo "Missing images: ${MISSING_IMAGES[*]}"
+  for problem in "${HOST_PROBLEMS[@]}"; do echo "Not ready to start: $problem"; done
   exit 0
 fi
 
-if [[ " $FUZZERS " == *" stateafl "* ]] && [ "$(cat /proc/sys/kernel/randomize_va_space)" != "0" ]; then
-  echo "Aborting: ASLR is enabled, which StateAFL does not take. Run: echo 0 | sudo tee /proc/sys/kernel/randomize_va_space"; exit 1
-fi
-if grep -q '^|' /proc/sys/kernel/core_pattern; then
-  echo "Aborting: core_pattern pipes to an external tool. Run: echo core | sudo tee /proc/sys/kernel/core_pattern"; exit 1
-fi
-if [ ${#MISSING_IMAGES[@]} -gt 0 ]; then
-  echo "Aborting: missing images: ${MISSING_IMAGES[*]}"; exit 1
+if [ ${#HOST_PROBLEMS[@]} -gt 0 ]; then
+  for problem in "${HOST_PROBLEMS[@]}"; do echo "Aborting: $problem"; done
+  exit 1
 fi
 
 chmod +x run_one.sh
