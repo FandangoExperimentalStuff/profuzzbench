@@ -25,12 +25,13 @@ Usage: [VARIABLE=value ...] ./launch.sh [--plan | --help]
 Without an option, runs every target with every fuzzer RUNS times.
 
 Placement:
-  A run gets one core: all CPUs of one topology/thread_siblings_list.
+  A run gets one core: all logical CPUs of one topology/thread_siblings_list.
   Cores form a core group if they have the same L3 (cache/index3/shared_cpu_list)
   and the same cpu_capacity, rounded to 10 %.
   All fuzzers of one repetition of a target run in the same core group.
-  The repetitions of a target are spread over the core groups in proportion to
-  their number of cores.
+  Every core group uses as many cores as the smallest one. The other cores
+  stay unused.
+  The repetitions of a target alternate between the core groups.
   A run starts as soon as a core of its core group is free.
 
 Resuming:
@@ -125,7 +126,7 @@ else
 fi
 for core in $(printf '%s\n' $SELECTED_CORES | sort -n); do
   if [ -z "${CORE_CPUSET[$core]}" ]; then
-    echo "Aborting: CPU $core is not the first CPU of a core (cores: $(printf '%s\n' "${!CORE_CPUSET[@]}" | sort -n | tr '\n' ' '))"
+    echo "Aborting: CPU $core is not the lowest CPU of a core (cores: $(printf '%s\n' "${!CORE_CPUSET[@]}" | sort -n | tr '\n' ' '))"
     exit 1
   fi
   DOMAIN_CORES[${CORE_DOMAIN[$core]}]+="$core "
@@ -133,12 +134,18 @@ done
 
 read -ra FUZZER_LIST <<< "$FUZZERS"
 USED_DOMAINS=()
-USED_CORE_COUNT=0
+CORES_PER_DOMAIN=""
 for domain in "${DOMAINS[@]}"; do
   read -ra cores <<< "${DOMAIN_CORES[$domain]}"
   [ "${#cores[@]}" -gt 0 ] || continue
   USED_DOMAINS+=("$domain")
-  USED_CORE_COUNT=$((USED_CORE_COUNT + ${#cores[@]}))
+  [ -n "$CORES_PER_DOMAIN" ] && [ "$CORES_PER_DOMAIN" -le "${#cores[@]}" ] || CORES_PER_DOMAIN=${#cores[@]}
+done
+USED_CORE_COUNT=0
+for domain in "${USED_DOMAINS[@]}"; do
+  read -ra cores <<< "${DOMAIN_CORES[$domain]}"
+  DOMAIN_CORES[$domain]="${cores[*]:0:CORES_PER_DOMAIN}"
+  USED_CORE_COUNT=$((USED_CORE_COUNT + CORES_PER_DOMAIN))
 done
 
 declare -A TARGET_INDEX FREE_CORES JOB_CORE
