@@ -12,26 +12,25 @@ FUZZERS=${FUZZERS:-"aflnet stateafl fandango"}
 RUNS=${RUNS:-10}
 CORES=${CORES:-}
 RESERVED_CORES=${RESERVED_CORES:-0}
-CALIBRATION=${CALIBRATION:-1}
 
 usage() {
   cat <<EOF
 Usage: [VARIABLE=value ...] ./launch.sh [--plan | --help]
 
-  --plan   Print the plan and what blocks a start. Start nothing.
+  --plan   Print an estimated plan and what blocks a start. Start nothing.
   --help   Print this text.
 
-Runs every target with every fuzzer RUNS times, in waves.
+Runs every target with every fuzzer RUNS times.
 
 Placement:
   A run gets one core: all CPUs of one topology/thread_siblings_list.
   Cores form a core group if they have the same L3 (cache/index3/shared_cpu_list)
   and the same cpu_capacity, rounded to 10 %.
-  All fuzzers of one target and repetition run in the same wave and core group.
+  All fuzzers of one target and repetition form a group. A group starts as soon
+  as its core group has a free core for each of its runs.
   Repetitions of a target alternate between the core groups.
   The order of the fuzzers on the cores rotates with target and repetition.
-  With CALIBRATION=1, cores left over in a wave repeat a run of the same wave
-  from another core group, into RESULTS/calibration.
+  The estimate of --plan assumes that every run takes TIMEOUT.
 
 Resuming:
   Start again with the same RESULTS, also with a larger RUNS.
@@ -45,7 +44,6 @@ Variables (default):
   RESULTS         directory of launch.sh
   CORES           empty (cores to use, by first CPU, e.g. 1-7,9)
   RESERVED_CORES  0 (cores left unused when CORES is empty)
-  CALIBRATION     1 (0 leaves left-over cores idle)
   TEST_TIMEOUT and the fuzzer options are set in jobs.conf.
 
 A start requires:
@@ -152,9 +150,7 @@ for run in $(seq 1 "$RUNS"); do
   done
 done
 
-PLAN_WAVE=() PLAN_CORE=() PLAN_DOMAIN=() PLAN_TARGET=() PLAN_FUZZER=() PLAN_RUN=() PLAN_KIND=() PLAN_PARTNER=()
-declare -A TARGET_DOMAIN_COUNT GROUP_DOMAIN CALIBRATED_FUZZER CALIBRATED_TARGET IS_CALIBRATED FREE_CORES IS_PLACED
-
+declare -A TARGET_DOMAIN_COUNT GROUP_DOMAIN IS_PLACED TARGET_INDEX FREE_CORES JOB_CORE
 if [ -f "$RESULTS/runs.log" ]; then
   while IFS=$'\t' read -r _ target _ run cpuset _ kind status; do
     [ "$kind" = run ] && [ "$status" = exit=0 ] || continue
@@ -165,127 +161,133 @@ if [ -f "$RESULTS/runs.log" ]; then
     TARGET_DOMAIN_COUNT[$target,$domain]=$(( ${TARGET_DOMAIN_COUNT[$target,$domain]:-0} + 1 ))
   done < "$RESULTS/runs.log"
 fi
-
-add_to_plan() {
-  PLAN_WAVE+=("$1") PLAN_CORE+=("$2") PLAN_DOMAIN+=("${CORE_DOMAIN[$2]}") PLAN_TARGET+=("$3")
-  PLAN_FUZZER+=("$4") PLAN_RUN+=("$5") PLAN_KIND+=("$6") PLAN_PARTNER+=("$7")
-}
-
-choose_domain() {
-  local target=$1 run=$2 domain cores free count fewest_runs="" best="" best_free=0
-  if [ -n "${GROUP_DOMAIN[$target,$run]}" ]; then
-    read -ra cores <<< "${FREE_CORES[${GROUP_DOMAIN[$target,$run]}]}"
-    [ "${#cores[@]}" -ge "$GROUP_SIZE" ] && echo "${GROUP_DOMAIN[$target,$run]}"
-    return
-  fi
-  for domain in "${DOMAINS[@]}"; do
-    read -ra cores <<< "${DOMAIN_CORES[$domain]}"
-    [ "${#cores[@]}" -ge "$GROUP_SIZE" ] || continue
-    count=${TARGET_DOMAIN_COUNT[$target,$domain]:-0}
-    [ -n "$fewest_runs" ] && [ "$fewest_runs" -le "$count" ] || fewest_runs=$count
-  done
-  for domain in "${DOMAINS[@]}"; do
-    [ "${TARGET_DOMAIN_COUNT[$target,$domain]:-0}" -eq "$fewest_runs" ] || continue
-    read -ra cores <<< "${FREE_CORES[$domain]}"
-    free=${#cores[@]}
-    if [ "$free" -ge "$GROUP_SIZE" ] && [ "$free" -gt "$best_free" ]; then
-      best=$domain best_free=$free
-    fi
-  done
-  echo "$best"
-}
-
-choose_calibration_partner() {
-  local domain=$1 first_entry=$2 entry score best="" best_score=0
-  for ((entry=first_entry; entry<${#PLAN_CORE[@]}; entry++)); do
-    [ "${PLAN_KIND[$entry]}" = run ] || continue
-    [ "${PLAN_DOMAIN[$entry]}" != "$domain" ] || continue
-    [ -z "${IS_CALIBRATED[$entry]}" ] || continue
-    [ -f "$(result_path "$RESULTS" "${PLAN_TARGET[$entry]}" "${PLAN_FUZZER[$entry]}" "${PLAN_RUN[$entry]}")" ] && continue
-    [ -f "$(result_path "$RESULTS/calibration" "${PLAN_TARGET[$entry]}" "${PLAN_FUZZER[$entry]}" "${PLAN_RUN[$entry]}")" ] && continue
-    score=$(( ${CALIBRATED_FUZZER[${PLAN_FUZZER[$entry]}]:-0} * 1000 + ${CALIBRATED_TARGET[${PLAN_TARGET[$entry]}]:-0} ))
-    if [ -z "$best" ] || [ "$score" -lt "$best_score" ]; then
-      best=$entry best_score=$score
-    fi
-  done
-  echo "$best"
-}
-
-declare -A TARGET_INDEX
 for target in $TARGETS_ALL $TARGETS; do
   [ -n "${TARGET_INDEX[$target]}" ] || TARGET_INDEX[$target]=${#TARGET_INDEX[@]}
 done
-
+UNPLACED_GROUPS=${#PENDING_GROUPS[@]}
+PLAN_WAVE=() PLAN_CORE=() PLAN_DESCRIPTION=()
 WAVES=0
-unplaced_groups=${#PENDING_GROUPS[@]}
-while [ "$unplaced_groups" -gt 0 ]; do
-  WAVES=$((WAVES + 1))
-  first_entry=${#PLAN_CORE[@]}
-  for domain in "${DOMAINS[@]}"; do FREE_CORES[$domain]=${DOMAIN_CORES[$domain]}; done
+RUNNING_JOBS=0
+
+missing_fuzzers() {
+  local target=$1 run=$2 rotation k fuzzer
+  rotation=$(( (TARGET_INDEX[$target] + run) % GROUP_SIZE ))
+  for ((k=0; k<GROUP_SIZE; k++)); do
+    fuzzer=${FUZZER_LIST[$(( (k + rotation) % GROUP_SIZE ))]}
+    [ -f "$(result_path "$RESULTS" "$target" "$fuzzer" "$run")" ] || echo "$fuzzer"
+  done
+}
+
+is_group_domain() {
+  local cores
+  read -ra cores <<< "${DOMAIN_CORES[$1]}"
+  [ "${#cores[@]}" -ge "$GROUP_SIZE" ]
+}
+
+choose_domain() {
+  local target=$1 run=$2 needed=$3 domain cores count fewest_groups="" best="" best_free=0
+  if [ -n "${GROUP_DOMAIN[$target,$run]}" ]; then
+    read -ra cores <<< "${FREE_CORES[${GROUP_DOMAIN[$target,$run]}]}"
+    [ "${#cores[@]}" -ge "$needed" ] && echo "${GROUP_DOMAIN[$target,$run]}"
+    return
+  fi
+  for domain in "${DOMAINS[@]}"; do
+    is_group_domain "$domain" || continue
+    count=${TARGET_DOMAIN_COUNT[$target,$domain]:-0}
+    [ -n "$fewest_groups" ] && [ "$fewest_groups" -le "$count" ] || fewest_groups=$count
+  done
+  for domain in "${DOMAINS[@]}"; do
+    is_group_domain "$domain" || continue
+    [ "${TARGET_DOMAIN_COUNT[$target,$domain]:-0}" -eq "$fewest_groups" ] || continue
+    read -ra cores <<< "${FREE_CORES[$domain]}"
+    if [ "${#cores[@]}" -ge "$needed" ] && [ "${#cores[@]}" -gt "$best_free" ]; then
+      best=$domain best_free=${#cores[@]}
+    fi
+  done
+  echo "$best"
+}
+
+start_run() {
+  local core=$1 target=$2 fuzzer=$3 run=$4
+  if [ "$MODE" = estimate ]; then
+    PLAN_WAVE+=("$WAVES") PLAN_CORE+=("$core") PLAN_DESCRIPTION+=("$target $fuzzer #$run")
+    return
+  fi
+  (
+    JOBCPU=${CORE_CPUSET[$core]} ./run_one.sh "$target" "$fuzzer" "$run"
+    rc=$?
+    printf '%s\t%s\t%s\t%s\tcpu=%s\tl3=%s\trun\texit=%s\n' "$(date +%FT%T)" "$target" "$fuzzer" "$run" \
+      "${CORE_CPUSET[$core]}" "${DOMAIN_L3[${CORE_DOMAIN[$core]}]}" "$rc" >> "$LOG"
+  ) &
+  JOB_CORE[$!]=$core
+  RUNNING_JOBS=$((RUNNING_JOBS + 1))
+}
+
+start_ready_groups() {
+  local group target run domain fuzzers cores k
   for ((group=0; group<${#PENDING_GROUPS[@]}; group++)); do
     [ -z "${IS_PLACED[$group]}" ] || continue
     read -r target run <<< "${PENDING_GROUPS[$group]}"
-    domain=$(choose_domain "$target" "$run")
+    mapfile -t fuzzers < <(missing_fuzzers "$target" "$run")
+    domain=$(choose_domain "$target" "$run" "${#fuzzers[@]}")
     [ -n "$domain" ] || continue
     read -ra cores <<< "${FREE_CORES[$domain]}"
-    rotation=$(( (TARGET_INDEX[$target] + run) % GROUP_SIZE ))
-    for ((k=0; k<GROUP_SIZE; k++)); do
-      fuzzer=${FUZZER_LIST[$(( (k + rotation) % GROUP_SIZE ))]}
-      kind=run
-      [ -f "$(result_path "$RESULTS" "$target" "$fuzzer" "$run")" ] && kind=done
-      add_to_plan "$WAVES" "${cores[$k]}" "$target" "$fuzzer" "$run" "$kind" ""
+    for ((k=0; k<${#fuzzers[@]}; k++)); do
+      start_run "${cores[$k]}" "$target" "${fuzzers[$k]}" "$run"
     done
-    FREE_CORES[$domain]="${cores[*]:GROUP_SIZE}"
+    FREE_CORES[$domain]="${cores[*]:${#fuzzers[@]}}"
     if [ -z "${GROUP_DOMAIN[$target,$run]}" ]; then
       GROUP_DOMAIN[$target,$run]=$domain
       TARGET_DOMAIN_COUNT[$target,$domain]=$(( ${TARGET_DOMAIN_COUNT[$target,$domain]:-0} + 1 ))
     fi
     IS_PLACED[$group]=1
-    unplaced_groups=$((unplaced_groups - 1))
+    UNPLACED_GROUPS=$((UNPLACED_GROUPS - 1))
   done
-  if [ "$first_entry" -eq "${#PLAN_CORE[@]}" ]; then
-    echo "Aborting: the remaining groups have to run on the core group of their finished runs, which has fewer than $GROUP_SIZE of the selected cores"
-    exit 1
-  fi
-  for domain in "${DOMAINS[@]}"; do
-    for core in ${FREE_CORES[$domain]}; do
-      partner=""
-      [ "$CALIBRATION" = 1 ] && partner=$(choose_calibration_partner "$domain" "$first_entry")
-      if [ -z "$partner" ]; then
-        add_to_plan "$WAVES" "$core" - - - idle ""
-        continue
-      fi
-      IS_CALIBRATED[$partner]=1
-      CALIBRATED_FUZZER[${PLAN_FUZZER[$partner]}]=$(( ${CALIBRATED_FUZZER[${PLAN_FUZZER[$partner]}]:-0} + 1 ))
-      CALIBRATED_TARGET[${PLAN_TARGET[$partner]}]=$(( ${CALIBRATED_TARGET[${PLAN_TARGET[$partner]}]:-0} + 1 ))
-      add_to_plan "$WAVES" "$core" "${PLAN_TARGET[$partner]}" "${PLAN_FUZZER[$partner]}" "${PLAN_RUN[$partner]}" \
-        calibration "${PLAN_CORE[$partner]}"
+}
+
+free_all_cores() {
+  local domain
+  for domain in "${DOMAINS[@]}"; do FREE_CORES[$domain]=${DOMAIN_CORES[$domain]}; done
+}
+
+estimate_waves() {
+  local first_entry domain core
+  while [ "$UNPLACED_GROUPS" -gt 0 ]; do
+    WAVES=$((WAVES + 1))
+    free_all_cores
+    first_entry=${#PLAN_CORE[@]}
+    start_ready_groups
+    if [ "$first_entry" -eq "${#PLAN_CORE[@]}" ]; then
+      echo "Aborting: the remaining groups have to run in the core group of their finished runs, which has too few of the selected cores"
+      return 1
+    fi
+    for domain in "${DOMAINS[@]}"; do
+      for core in ${FREE_CORES[$domain]}; do
+        PLAN_WAVE+=("$WAVES") PLAN_CORE+=("$core") PLAN_DESCRIPTION+=(idle)
+      done
     done
   done
-done
+}
 
-print_plan() {
-  local domain entry count_runs=0 count_calibrations=0 wave=0 description
+print_estimate() {
+  local domain entry wave=0 count_runs=0
   for domain in "${DOMAINS[@]}"; do
     echo "Core group CPUs ${domain%% *}, L3 ${DOMAIN_L3[$domain]}${DOMAIN_CLASS[$domain]:+, ${DOMAIN_CLASS[$domain]}}, cores used: ${DOMAIN_CORES[$domain]:-none}"
   done
+  echo "Estimate, assuming every run takes TIMEOUT:"
   for ((entry=0; entry<${#PLAN_CORE[@]}; entry++)); do
     if [ "${PLAN_WAVE[$entry]}" != "$wave" ]; then
       wave=${PLAN_WAVE[$entry]}
-      echo "wave $wave"
+      echo "start after $(( (wave - 1) * TIMEOUT / 3600 )) h"
     fi
-    case ${PLAN_KIND[$entry]} in
-      run) description="${PLAN_TARGET[$entry]} ${PLAN_FUZZER[$entry]} #${PLAN_RUN[$entry]}"; count_runs=$((count_runs + 1)) ;;
-      calibration) description="${PLAN_TARGET[$entry]} ${PLAN_FUZZER[$entry]} #${PLAN_RUN[$entry]} calibration of core ${PLAN_PARTNER[$entry]}"
-        count_calibrations=$((count_calibrations + 1)) ;;
-      done) description="${PLAN_TARGET[$entry]} ${PLAN_FUZZER[$entry]} #${PLAN_RUN[$entry]} done, idle" ;;
-      idle) description="idle" ;;
-    esac
+    [ "${PLAN_DESCRIPTION[$entry]}" = idle ] || count_runs=$((count_runs + 1))
     printf '  core %-3s CPUs %-7s L3 %-6s %s\n' "${PLAN_CORE[$entry]}" "${CORE_CPUSET[${PLAN_CORE[$entry]}]}" \
-      "${DOMAIN_L3[${PLAN_DOMAIN[$entry]}]}" "$description"
+      "${DOMAIN_L3[${CORE_DOMAIN[${PLAN_CORE[$entry]}]}]}" "${PLAN_DESCRIPTION[$entry]}"
   done
-  echo "$WAVES waves, $count_runs runs, $count_calibrations calibration runs, about $(( WAVES * TIMEOUT / 3600 )) h"
+  echo "$count_runs runs, about $(( WAVES * TIMEOUT / 3600 )) h plus the coverage measurements"
 }
+
+ESTIMATE=$(MODE=estimate; estimate_waves && print_estimate) || { echo "$ESTIMATE"; exit 1; }
 
 MISSING_IMAGES=()
 for target in $TARGETS; do
@@ -317,7 +319,7 @@ if [ ${#MISSING_IMAGES[@]} -gt 0 ]; then
 fi
 
 if [ "$MODE" = plan ]; then
-  print_plan
+  echo "$ESTIMATE"
   for problem in "${HOST_PROBLEMS[@]}"; do echo "Not ready to start: $problem"; done
   exit 0
 fi
@@ -330,23 +332,18 @@ fi
 chmod +x run_one.sh
 mkdir -p "$RESULTS"
 LOG=$RESULTS/runs.log
-print_plan | tee "$RESULTS/plan-$(date +%Y%m%d-%H%M%S).txt"
+echo "$ESTIMATE" | tee "$RESULTS/plan-$(date +%Y%m%d-%H%M%S).txt"
 
-for ((wave=1; wave<=WAVES; wave++)); do
-  echo "[$(date +%FT%T)] wave $wave of $WAVES"
-  for ((entry=0; entry<${#PLAN_CORE[@]}; entry++)); do
-    [ "${PLAN_WAVE[$entry]}" = "$wave" ] && [[ ${PLAN_KIND[$entry]} == run || ${PLAN_KIND[$entry]} == calibration ]] || continue
-    job_results=$RESULTS
-    [ "${PLAN_KIND[$entry]}" = calibration ] && job_results=$RESULTS/calibration
-    (
-      cpuset=${CORE_CPUSET[${PLAN_CORE[$entry]}]}
-      JOBCPU=$cpuset RESULTS=$job_results ./run_one.sh "${PLAN_TARGET[$entry]}" "${PLAN_FUZZER[$entry]}" "${PLAN_RUN[$entry]}"
-      rc=$?
-      printf '%s\t%s\t%s\t%s\tcpu=%s\tl3=%s\t%s\texit=%s\n' "$(date +%FT%T)" "${PLAN_TARGET[$entry]}" \
-        "${PLAN_FUZZER[$entry]}" "${PLAN_RUN[$entry]}" "$cpuset" "${DOMAIN_L3[${PLAN_DOMAIN[$entry]}]}" \
-        "${PLAN_KIND[$entry]}" "$rc" >> "$LOG"
-    ) &
-  done
-  wait
+free_all_cores
+while true; do
+  start_ready_groups
+  [ "$RUNNING_JOBS" -gt 0 ] || break
+  wait -n -p finished_job
+  finished_core=${JOB_CORE[$finished_job]}
+  finished_domain=${CORE_DOMAIN[$finished_core]}
+  FREE_CORES[$finished_domain]=$(printf '%s\n' ${FREE_CORES[$finished_domain]} "$finished_core" | sort -n | tr '\n' ' ')
+  unset "JOB_CORE[$finished_job]"
+  RUNNING_JOBS=$((RUNNING_JOBS - 1))
 done
+[ "$UNPLACED_GROUPS" -eq 0 ] || echo "[$(date +%FT%T)] $UNPLACED_GROUPS groups could not be placed"
 echo "[$(date +%FT%T)] All jobs finished. Failed: $(grep -vc 'exit=0$' "$LOG" 2>/dev/null; true) (see $LOG)"
