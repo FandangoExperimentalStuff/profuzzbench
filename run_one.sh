@@ -11,7 +11,6 @@ IDX=$3
 CONF=${CONF:-./jobs.conf}
 TIMEOUT=${TIMEOUT:-86400}
 SKIPCOUNT=${SKIPCOUNT:-5}
-export TEST_TIMEOUT=${TEST_TIMEOUT:-5000}
 RESULTS=${RESULTS:-.}
 WORKDIR=/home/ubuntu/experiments
 

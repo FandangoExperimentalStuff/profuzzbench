@@ -5,7 +5,6 @@ export CONF=$PWD/jobs.conf
 export RESULTS=${RESULTS:-$PWD}
 export TIMEOUT=${TIMEOUT:-86400}
 export SKIPCOUNT=${SKIPCOUNT:-5}
-export TEST_TIMEOUT=${TEST_TIMEOUT:-5000}
 source "$CONF"
 
 TARGETS=${TARGETS:-$TARGETS_ALL}
@@ -19,48 +18,49 @@ usage() {
   cat <<EOF
 Usage: [VARIABLE=value ...] ./launch.sh [--plan | --help]
 
-Runs every target x fuzzer x repetition, in waves. Each run gets one physical core
-with both of its SMT threads. All fuzzers of one target and repetition run in the
-same wave on cores that share one L3 cache, so they are compared on the same
-hardware; repetitions of a target alternate between the L3 domains. Cores a wave
-cannot fill with a whole group run calibration copies of runs of the same wave on
-another L3 domain. They go to RESULTS/calibration and show how much the L3 domain
-changes a result.
+  --plan   Print the plan and what blocks a start. Start nothing.
+  --help   Print this text.
 
-Start it inside tmux. Starting it again with the same RESULTS resumes the
-campaign, also with a larger RUNS: runs whose archive exists are skipped, and the
-placement of the finished runs in RESULTS/runs.log is kept. The missing runs of a
-group run on the L3 domain of its finished runs, and a new group runs on the L3
-domain its target ran on least, so RUNS=10 after RUNS=1 ends with every target
-and fuzzer 5 times on each of the two L3 domains.
+Runs every target with every fuzzer RUNS times, in waves.
 
-  --plan   print the waves and what keeps the host from starting, start nothing
-  --help   print this text
+Placement:
+  A run gets one core: all CPUs of one topology/thread_siblings_list.
+  Cores form a core group if they have the same L3 (cache/index3/shared_cpu_list)
+  and the same cpu_capacity, rounded to 10 %.
+  All fuzzers of one target and repetition run in the same wave and core group.
+  Repetitions of a target alternate between the core groups.
+  The order of the fuzzers on the cores rotates with target and repetition.
+  With CALIBRATION=1, cores left over in a wave repeat a run of the same wave
+  from another core group, into RESULTS/calibration.
 
-Variables (current value):
-  TARGETS         $TARGETS
-  FUZZERS         $FUZZERS
-  RUNS            $RUNS (repetitions per target and fuzzer)
-  TIMEOUT         $TIMEOUT (seconds per run)
-  RESULTS         $RESULTS
-  CORES           ${CORES:-all but RESERVED_CORES} (cores by their first CPU, e.g. 1-7,9)
-  RESERVED_CORES  $RESERVED_CORES (left to the system when CORES is unset)
-  CALIBRATION     $CALIBRATION (1: spare cores run calibration copies, 0: they stay idle)
-  SKIPCOUNT, TEST_TIMEOUT, MAX_ATTEMPTS and STARTUP_GRACE go to run_one.sh.
+Resuming:
+  Start again with the same RESULTS, also with a larger RUNS.
+  Runs with an archive are skipped. Earlier core groups come from RESULTS/runs.log.
 
-One 24 h run per target and fuzzer:
-  RUNS=1 RESULTS=\$PWD/results/campaign-1 ./launch.sh --plan
-  RUNS=1 RESULTS=\$PWD/results/campaign-1 ./launch.sh
+Variables (default):
+  TARGETS         TARGETS_ALL of jobs.conf
+  FUZZERS         aflnet stateafl fandango
+  RUNS            10
+  TIMEOUT         86400 (seconds per run)
+  RESULTS         directory of launch.sh
+  CORES           empty (cores to use, by first CPU, e.g. 1-7,9)
+  RESERVED_CORES  0 (cores left unused when CORES is empty)
+  CALIBRATION     1 (0 leaves left-over cores idle)
+  TEST_TIMEOUT and the fuzzer options are set in jobs.conf.
 
-Before starting it checks the host: ASLR off (for StateAFL), core_pattern
-writing core files, the performance governor on every CPU used, all images built.
-These settings are reset by a reboot.
+A start requires:
+  - /proc/sys/kernel/randomize_va_space is 0 (with stateafl)
+  - /proc/sys/kernel/core_pattern does not start with |
+  - governor performance on all CPUs of the used cores
+  - all images built
 
-Progress: RESULTS/runs.log has one line per finished run, RESULTS/plan-<time>.txt
-the plan of each start, and docker ps --filter label=pfb-campaign=1 the running runs.
-Stopping: Ctrl-C ends only the launcher, the containers keep running. Stop them with
-  docker ps -q --filter label=pfb-campaign=1 | xargs -r docker stop
-before starting again, or their runs are started a second time.
+Stopping:
+  Ctrl-C stops only launch.sh. Running runs continue. To stop them too:
+    pkill -f run_one.sh
+    docker ps -q --filter label=pfb-campaign=1 | xargs -r docker stop
+
+Example:
+  RUNS=1 RESULTS=results/campaign-1 ./launch.sh --plan
 EOF
 }
 
@@ -88,17 +88,29 @@ result_path() {
   echo "$1/results-$2/out-$2-$3_$4.tar.gz"
 }
 
-declare -A CORE_CPUSET CORE_DOMAIN DOMAIN_L3 DOMAIN_CORES
+performance_class() {
+  local cpu_directory=$1 capacity
+  if [ -r "$cpu_directory/cpu_capacity" ]; then
+    capacity=$(<"$cpu_directory/cpu_capacity")
+    echo "capacity $(( (capacity * 10 + 512) / 1024 * 10 ))%"
+  elif [ -r /sys/devices/cpu_atom/cpus ]; then
+    [[ " $(expand_numbers "$(</sys/devices/cpu_atom/cpus)") " == *" ${cpu_directory##*/cpu} "* ]] && echo E-core || echo P-core
+  fi
+}
+
+declare -A CORE_CPUSET CORE_DOMAIN DOMAIN_L3 DOMAIN_CLASS DOMAIN_CORES
 for topology in /sys/devices/system/cpu/cpu[0-9]*/topology; do
   cpu_directory=${topology%/topology}
   cpu=${cpu_directory##*/cpu}
   siblings=$(<"$topology/thread_siblings_list")
   [ "${siblings%%[,-]*}" = "$cpu" ] || continue
-  domain=$(<"$cpu_directory/cache/index3/shared_cpu_list")
+  class=$(performance_class "$cpu_directory")
+  domain="$(<"$cpu_directory/cache/index3/shared_cpu_list")${class:+ $class}"
   CORE_CPUSET[$cpu]=$siblings
   CORE_DOMAIN[$cpu]=$domain
   l3_size=$(<"$cpu_directory/cache/index3/size")
   DOMAIN_L3[$domain]=$(( ${l3_size%K} / 1024 ))M
+  DOMAIN_CLASS[$domain]=$class
 done
 mapfile -t DOMAINS < <(printf '%s\n' "${!DOMAIN_L3[@]}" | sort -n)
 
@@ -124,7 +136,7 @@ for domain in "${DOMAINS[@]}"; do
   [ "${#cores[@]}" -ge "$GROUP_SIZE" ] && is_group_placeable=1
 done
 if [ "$is_group_placeable" -eq 0 ]; then
-  echo "Aborting: no L3 domain has $GROUP_SIZE of the selected cores, one per fuzzer"
+  echo "Aborting: no core group has $GROUP_SIZE of the selected cores, one per fuzzer"
   exit 1
 fi
 
@@ -199,6 +211,11 @@ choose_calibration_partner() {
   echo "$best"
 }
 
+declare -A TARGET_INDEX
+for target in $TARGETS_ALL $TARGETS; do
+  [ -n "${TARGET_INDEX[$target]}" ] || TARGET_INDEX[$target]=${#TARGET_INDEX[@]}
+done
+
 WAVES=0
 unplaced_groups=${#PENDING_GROUPS[@]}
 while [ "$unplaced_groups" -gt 0 ]; do
@@ -211,10 +228,12 @@ while [ "$unplaced_groups" -gt 0 ]; do
     domain=$(choose_domain "$target" "$run")
     [ -n "$domain" ] || continue
     read -ra cores <<< "${FREE_CORES[$domain]}"
+    rotation=$(( (TARGET_INDEX[$target] + run) % GROUP_SIZE ))
     for ((k=0; k<GROUP_SIZE; k++)); do
+      fuzzer=${FUZZER_LIST[$(( (k + rotation) % GROUP_SIZE ))]}
       kind=run
-      [ -f "$(result_path "$RESULTS" "$target" "${FUZZER_LIST[$k]}" "$run")" ] && kind=done
-      add_to_plan "$WAVES" "${cores[$k]}" "$target" "${FUZZER_LIST[$k]}" "$run" "$kind" ""
+      [ -f "$(result_path "$RESULTS" "$target" "$fuzzer" "$run")" ] && kind=done
+      add_to_plan "$WAVES" "${cores[$k]}" "$target" "$fuzzer" "$run" "$kind" ""
     done
     FREE_CORES[$domain]="${cores[*]:GROUP_SIZE}"
     if [ -z "${GROUP_DOMAIN[$target,$run]}" ]; then
@@ -225,7 +244,7 @@ while [ "$unplaced_groups" -gt 0 ]; do
     unplaced_groups=$((unplaced_groups - 1))
   done
   if [ "$first_entry" -eq "${#PLAN_CORE[@]}" ]; then
-    echo "Aborting: the remaining groups have to run on the L3 domain of their finished runs, which has fewer than $GROUP_SIZE of the selected cores"
+    echo "Aborting: the remaining groups have to run on the core group of their finished runs, which has fewer than $GROUP_SIZE of the selected cores"
     exit 1
   fi
   for domain in "${DOMAINS[@]}"; do
@@ -248,7 +267,7 @@ done
 print_plan() {
   local domain entry count_runs=0 count_calibrations=0 wave=0 description
   for domain in "${DOMAINS[@]}"; do
-    echo "L3 domain CPUs $domain, L3 ${DOMAIN_L3[$domain]}, cores used: ${DOMAIN_CORES[$domain]:-none}"
+    echo "Core group CPUs ${domain%% *}, L3 ${DOMAIN_L3[$domain]}${DOMAIN_CLASS[$domain]:+, ${DOMAIN_CLASS[$domain]}}, cores used: ${DOMAIN_CORES[$domain]:-none}"
   done
   for ((entry=0; entry<${#PLAN_CORE[@]}; entry++)); do
     if [ "${PLAN_WAVE[$entry]}" != "$wave" ]; then
