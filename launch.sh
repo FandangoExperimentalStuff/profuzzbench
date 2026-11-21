@@ -1,18 +1,19 @@
 #!/bin/bash
 cd "$(dirname "$0")" || exit 1
 
-TARGETS=${TARGETS:-"lightftp bftpd proftpd pure-ftpd exim dnsmasq live555 openssh openssl dcmtk forked-daapd"}
-FUZZERS=${FUZZERS:-"aflnet stateafl fandango"}
-RUNS=${RUNS:-10}
-CORES=${CORES:-}
-RESERVED_CORES=${RESERVED_CORES:-0}
-CALIBRATION=${CALIBRATION:-1}
-
 export CONF=$PWD/jobs.conf
 export RESULTS=${RESULTS:-$PWD}
 export TIMEOUT=${TIMEOUT:-86400}
 export SKIPCOUNT=${SKIPCOUNT:-5}
 export TEST_TIMEOUT=${TEST_TIMEOUT:-5000}
+source "$CONF"
+
+TARGETS=${TARGETS:-$TARGETS_ALL}
+FUZZERS=${FUZZERS:-"aflnet stateafl fandango"}
+RUNS=${RUNS:-10}
+CORES=${CORES:-}
+RESERVED_CORES=${RESERVED_CORES:-0}
+CALIBRATION=${CALIBRATION:-1}
 
 usage() {
   cat <<EOF
@@ -263,7 +264,6 @@ print_plan() {
   echo "$WAVES waves, $count_runs runs, $count_calibrations calibration runs, about $(( WAVES * TIMEOUT / 3600 )) h"
 }
 
-source "$CONF"
 MISSING_IMAGES=()
 for target in $TARGETS; do
   for fuzzer in "${FUZZER_LIST[@]}"; do
