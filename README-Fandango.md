@@ -18,10 +18,11 @@ The script [profuzzbench_build_all.sh](scripts/execution/profuzzbench_build_all.
 
 The Fandango specification of a target is stored with the target, like its seeds, in `subjects/<protocol>/<target>/fan-specs/` (e.g., `subjects/FTP/LightFTP/fan-specs/ftp.fan`). `Dockerfile-fandango` copies it into the image at `/home/ubuntu/experiments/fan-specs/`, and sets the values the specification reads from the environment for this server (e.g., the FTP credentials). `OPTS[<target>,fandango]` in [jobs.conf](jobs.conf) passes it to the driver with `--spec`.
 
-To run a campaign:
+To run a campaign (`./launch.sh --help` lists its settings), first print the waves it would start, then start it inside tmux:
 ```bash
 cd $PFBENCH
-FUZZERS=fandango TARGETS="lightftp proftpd" ./launch.sh
+FUZZERS=fandango TARGETS="lightftp proftpd" RUNS=1 RESULTS=$PWD/results/test ./launch.sh --plan
+FUZZERS=fandango TARGETS="lightftp proftpd" RUNS=1 RESULTS=$PWD/results/test ./launch.sh
 ```
 
 To run a single fuzzing run:
