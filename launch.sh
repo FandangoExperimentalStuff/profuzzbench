@@ -17,40 +17,46 @@ usage() {
   cat <<EOF
 Usage: [VARIABLE=value ...] ./launch.sh [--plan | --help]
 
-  --plan   Print an estimated plan and what blocks a start. Start nothing.
-  --help   Print this text.
+  --plan   Show the core group of each run, an estimated schedule and what
+           blocks a start. The estimate counts every run as TIMEOUT seconds.
+           Start nothing.
+  --help   Show this text.
 
-Runs every target with every fuzzer RUNS times.
+Without an option, runs every target with every fuzzer RUNS times.
 
 Placement:
   A run gets one core: all CPUs of one topology/thread_siblings_list.
   Cores form a core group if they have the same L3 (cache/index3/shared_cpu_list)
   and the same cpu_capacity, rounded to 10 %.
-  All fuzzers of one target and repetition form a group. A group starts as soon
-  as its core group has a free core for each of its runs.
-  Repetitions of a target alternate between the core groups.
-  The order of the fuzzers on the cores rotates with target and repetition.
-  The estimate of --plan assumes that every run takes TIMEOUT.
+  All fuzzers of one repetition of a target run in the same core group.
+  The repetitions of a target are spread over the core groups in proportion to
+  their number of cores.
+  A run starts as soon as a core of its core group is free.
 
 Resuming:
-  Start again with the same RESULTS, also with a larger RUNS.
-  Runs with an archive are skipped. Earlier core groups come from RESULTS/runs.log.
+  Stop all runs first (see Stopping), or they start a second time.
+  Start again with the same RESULTS. RUNS, TARGETS and FUZZERS may change.
+  Runs whose .tar.gz is in RESULTS are skipped.
+  Keep CORES, RESERVED_CORES and the order of TARGETS_ALL. Otherwise the core
+  groups of the repetitions change.
 
 Variables (default):
   TARGETS         TARGETS_ALL of jobs.conf
   FUZZERS         aflnet stateafl fandango
-  RUNS            10
+  RUNS            10 (repetitions per target and fuzzer)
   TIMEOUT         86400 (seconds per run)
   RESULTS         directory of launch.sh
-  CORES           empty (cores to use, by first CPU, e.g. 1-7,9)
-  RESERVED_CORES  0 (cores left unused when CORES is empty)
-  TEST_TIMEOUT and the fuzzer options are set in jobs.conf.
+  SKIPCOUNT       5 (sessions per point of the coverage curve)
+  CORES           empty (cores to use, named by their lowest CPU; commas and
+                  ranges allowed)
+  RESERVED_CORES  core 0 (cores not to use if CORES is empty)
+  TEST_TIMEOUT    5000 (milliseconds, set in jobs.conf like the fuzzer options)
 
 A start requires:
   - /proc/sys/kernel/randomize_va_space is 0 (with stateafl)
   - /proc/sys/kernel/core_pattern does not start with |
   - governor performance on all CPUs of the used cores
-  - all images built
+  - the needed images built
 
 Stopping:
   Ctrl-C stops only launch.sh. Running runs continue. To stop them too:
@@ -127,85 +133,54 @@ for core in $(printf '%s\n' $SELECTED_CORES | sort -n); do
 done
 
 read -ra FUZZER_LIST <<< "$FUZZERS"
-GROUP_SIZE=${#FUZZER_LIST[@]}
-is_group_placeable=0
+USED_DOMAINS=()
+USED_CORE_COUNT=0
 for domain in "${DOMAINS[@]}"; do
   read -ra cores <<< "${DOMAIN_CORES[$domain]}"
-  [ "${#cores[@]}" -ge "$GROUP_SIZE" ] && is_group_placeable=1
+  [ "${#cores[@]}" -gt 0 ] || continue
+  USED_DOMAINS+=("$domain")
+  USED_CORE_COUNT=$((USED_CORE_COUNT + ${#cores[@]}))
 done
-if [ "$is_group_placeable" -eq 0 ]; then
-  echo "Aborting: no core group has $GROUP_SIZE of the selected cores, one per fuzzer"
-  exit 1
-fi
 
-PENDING_GROUPS=()
+declare -A TARGET_INDEX FREE_CORES JOB_CORE
+for target in $TARGETS_ALL $TARGETS; do
+  [ -n "${TARGET_INDEX[$target]}" ] || TARGET_INDEX[$target]=${#TARGET_INDEX[@]}
+done
+
+DOMAIN_SEQUENCE=()
+current_weights=()
+for ((k=0; k<${#USED_DOMAINS[@]}; k++)); do current_weights[k]=0; done
+for ((position=0; position<${#TARGET_INDEX[@]} + RUNS; position++)); do
+  best=0
+  for ((k=0; k<${#USED_DOMAINS[@]}; k++)); do
+    read -ra cores <<< "${DOMAIN_CORES[${USED_DOMAINS[$k]}]}"
+    current_weights[k]=$(( current_weights[k] + ${#cores[@]} ))
+    [ "${current_weights[k]}" -gt "${current_weights[best]}" ] && best=$k
+  done
+  current_weights[best]=$(( current_weights[best] - USED_CORE_COUNT ))
+  DOMAIN_SEQUENCE+=("${USED_DOMAINS[$best]}")
+done
+
+repetition_domain() {
+  echo "${DOMAIN_SEQUENCE[$(( TARGET_INDEX[$1] + $2 - 1 ))]}"
+}
+
+PENDING_RUNS=()
 for run in $(seq 1 "$RUNS"); do
   for target in $TARGETS; do
-    for fuzzer in "${FUZZER_LIST[@]}"; do
-      if [ ! -f "$(result_path "$RESULTS" "$target" "$fuzzer" "$run")" ]; then
-        PENDING_GROUPS+=("$target $run")
-        break
-      fi
+    rotation=$(( (TARGET_INDEX[$target] + run) % ${#FUZZER_LIST[@]} ))
+    for ((k=0; k<${#FUZZER_LIST[@]}; k++)); do
+      fuzzer=${FUZZER_LIST[$(( (k + rotation) % ${#FUZZER_LIST[@]} ))]}
+      [ -f "$(result_path "$RESULTS" "$target" "$fuzzer" "$run")" ] || PENDING_RUNS+=("$target $fuzzer $run")
     done
   done
 done
 
-declare -A TARGET_DOMAIN_COUNT GROUP_DOMAIN IS_PLACED TARGET_INDEX FREE_CORES JOB_CORE
-if [ -f "$RESULTS/runs.log" ]; then
-  while IFS=$'\t' read -r _ target _ run cpuset _ kind status; do
-    [ "$kind" = run ] && [ "$status" = exit=0 ] || continue
-    first_cpu=${cpuset#cpu=}
-    domain=${CORE_DOMAIN[${first_cpu%%[,-]*}]}
-    [ -n "$domain" ] && [ -z "${GROUP_DOMAIN[$target,$run]}" ] || continue
-    GROUP_DOMAIN[$target,$run]=$domain
-    TARGET_DOMAIN_COUNT[$target,$domain]=$(( ${TARGET_DOMAIN_COUNT[$target,$domain]:-0} + 1 ))
-  done < "$RESULTS/runs.log"
-fi
-for target in $TARGETS_ALL $TARGETS; do
-  [ -n "${TARGET_INDEX[$target]}" ] || TARGET_INDEX[$target]=${#TARGET_INDEX[@]}
-done
-UNPLACED_GROUPS=${#PENDING_GROUPS[@]}
+declare -A IS_STARTED
+UNSTARTED_RUNS=${#PENDING_RUNS[@]}
 PLAN_WAVE=() PLAN_CORE=() PLAN_DESCRIPTION=()
 WAVES=0
 RUNNING_JOBS=0
-
-missing_fuzzers() {
-  local target=$1 run=$2 rotation k fuzzer
-  rotation=$(( (TARGET_INDEX[$target] + run) % GROUP_SIZE ))
-  for ((k=0; k<GROUP_SIZE; k++)); do
-    fuzzer=${FUZZER_LIST[$(( (k + rotation) % GROUP_SIZE ))]}
-    [ -f "$(result_path "$RESULTS" "$target" "$fuzzer" "$run")" ] || echo "$fuzzer"
-  done
-}
-
-is_group_domain() {
-  local cores
-  read -ra cores <<< "${DOMAIN_CORES[$1]}"
-  [ "${#cores[@]}" -ge "$GROUP_SIZE" ]
-}
-
-choose_domain() {
-  local target=$1 run=$2 needed=$3 domain cores count fewest_groups="" best="" best_free=0
-  if [ -n "${GROUP_DOMAIN[$target,$run]}" ]; then
-    read -ra cores <<< "${FREE_CORES[${GROUP_DOMAIN[$target,$run]}]}"
-    [ "${#cores[@]}" -ge "$needed" ] && echo "${GROUP_DOMAIN[$target,$run]}"
-    return
-  fi
-  for domain in "${DOMAINS[@]}"; do
-    is_group_domain "$domain" || continue
-    count=${TARGET_DOMAIN_COUNT[$target,$domain]:-0}
-    [ -n "$fewest_groups" ] && [ "$fewest_groups" -le "$count" ] || fewest_groups=$count
-  done
-  for domain in "${DOMAINS[@]}"; do
-    is_group_domain "$domain" || continue
-    [ "${TARGET_DOMAIN_COUNT[$target,$domain]:-0}" -eq "$fewest_groups" ] || continue
-    read -ra cores <<< "${FREE_CORES[$domain]}"
-    if [ "${#cores[@]}" -ge "$needed" ] && [ "${#cores[@]}" -gt "$best_free" ]; then
-      best=$domain best_free=${#cores[@]}
-    fi
-  done
-  echo "$best"
-}
 
 start_run() {
   local core=$1 target=$2 fuzzer=$3 run=$4
@@ -223,45 +198,38 @@ start_run() {
   RUNNING_JOBS=$((RUNNING_JOBS + 1))
 }
 
-start_ready_groups() {
-  local group target run domain fuzzers cores k
-  for ((group=0; group<${#PENDING_GROUPS[@]}; group++)); do
-    [ -z "${IS_PLACED[$group]}" ] || continue
-    read -r target run <<< "${PENDING_GROUPS[$group]}"
-    mapfile -t fuzzers < <(missing_fuzzers "$target" "$run")
-    domain=$(choose_domain "$target" "$run" "${#fuzzers[@]}")
-    [ -n "$domain" ] || continue
+start_ready_runs() {
+  local index target fuzzer run domain cores
+  for ((index=0; index<${#PENDING_RUNS[@]}; index++)); do
+    [ -z "${IS_STARTED[$index]}" ] || continue
+    read -r target fuzzer run <<< "${PENDING_RUNS[$index]}"
+    domain=$(repetition_domain "$target" "$run")
     read -ra cores <<< "${FREE_CORES[$domain]}"
-    for ((k=0; k<${#fuzzers[@]}; k++)); do
-      start_run "${cores[$k]}" "$target" "${fuzzers[$k]}" "$run"
-    done
-    FREE_CORES[$domain]="${cores[*]:${#fuzzers[@]}}"
-    if [ -z "${GROUP_DOMAIN[$target,$run]}" ]; then
-      GROUP_DOMAIN[$target,$run]=$domain
-      TARGET_DOMAIN_COUNT[$target,$domain]=$(( ${TARGET_DOMAIN_COUNT[$target,$domain]:-0} + 1 ))
-    fi
-    IS_PLACED[$group]=1
-    UNPLACED_GROUPS=$((UNPLACED_GROUPS - 1))
+    [ "${#cores[@]}" -gt 0 ] || continue
+    start_run "${cores[0]}" "$target" "$fuzzer" "$run"
+    FREE_CORES[$domain]="${cores[*]:1}"
+    IS_STARTED[$index]=1
+    UNSTARTED_RUNS=$((UNSTARTED_RUNS - 1))
   done
 }
 
 free_all_cores() {
   local domain
-  for domain in "${DOMAINS[@]}"; do FREE_CORES[$domain]=${DOMAIN_CORES[$domain]}; done
+  for domain in "${USED_DOMAINS[@]}"; do FREE_CORES[$domain]=${DOMAIN_CORES[$domain]}; done
 }
 
 estimate_waves() {
   local first_entry domain core
-  while [ "$UNPLACED_GROUPS" -gt 0 ]; do
+  while [ "$UNSTARTED_RUNS" -gt 0 ]; do
     WAVES=$((WAVES + 1))
     free_all_cores
     first_entry=${#PLAN_CORE[@]}
-    start_ready_groups
+    start_ready_runs
     if [ "$first_entry" -eq "${#PLAN_CORE[@]}" ]; then
-      echo "Aborting: the remaining groups have to run in the core group of their finished runs, which has too few of the selected cores"
+      echo "Aborting: $UNSTARTED_RUNS runs fit in no core group"
       return 1
     fi
-    for domain in "${DOMAINS[@]}"; do
+    for domain in "${USED_DOMAINS[@]}"; do
       for core in ${FREE_CORES[$domain]}; do
         PLAN_WAVE+=("$WAVES") PLAN_CORE+=("$core") PLAN_DESCRIPTION+=(idle)
       done
@@ -270,9 +238,18 @@ estimate_waves() {
 }
 
 print_estimate() {
-  local domain entry wave=0 count_runs=0
-  for domain in "${DOMAINS[@]}"; do
-    echo "Core group CPUs ${domain%% *}, L3 ${DOMAIN_L3[$domain]}${DOMAIN_CLASS[$domain]:+, ${DOMAIN_CLASS[$domain]}}, cores used: ${DOMAIN_CORES[$domain]:-none}"
+  local domain target entry run wave=0 count_runs=0 split
+  for domain in "${USED_DOMAINS[@]}"; do
+    echo "Core group CPUs ${domain%% *}, L3 ${DOMAIN_L3[$domain]}${DOMAIN_CLASS[$domain]:+, ${DOMAIN_CLASS[$domain]}}, cores used: ${DOMAIN_CORES[$domain]}"
+  done
+  echo "Core group of each repetition, the same for every fuzzer of a target:"
+  for target in $TARGETS; do
+    split=""
+    for ((run=1; run<=RUNS; run++)); do
+      domain=$(repetition_domain "$target" "$run")
+      split+=" ${DOMAIN_L3[$domain]}"
+    done
+    printf '  %-13s%s\n' "$target" "$split"
   done
   echo "Estimate, assuming every run takes TIMEOUT:"
   for ((entry=0; entry<${#PLAN_CORE[@]}; entry++)); do
@@ -336,7 +313,7 @@ echo "$ESTIMATE" | tee "$RESULTS/plan-$(date +%Y%m%d-%H%M%S).txt"
 
 free_all_cores
 while true; do
-  start_ready_groups
+  start_ready_runs
   [ "$RUNNING_JOBS" -gt 0 ] || break
   wait -n -p finished_job
   finished_core=${JOB_CORE[$finished_job]}
@@ -345,5 +322,5 @@ while true; do
   unset "JOB_CORE[$finished_job]"
   RUNNING_JOBS=$((RUNNING_JOBS - 1))
 done
-[ "$UNPLACED_GROUPS" -eq 0 ] || echo "[$(date +%FT%T)] $UNPLACED_GROUPS groups could not be placed"
+[ "$UNSTARTED_RUNS" -eq 0 ] || echo "[$(date +%FT%T)] $UNSTARTED_RUNS runs could not be placed"
 echo "[$(date +%FT%T)] All jobs finished. Failed: $(grep -vc 'exit=0$' "$LOG" 2>/dev/null; true) (see $LOG)"
