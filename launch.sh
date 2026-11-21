@@ -47,10 +47,9 @@ Variables (default):
   TIMEOUT         86400 (seconds per run)
   RESULTS         directory of launch.sh
   SKIPCOUNT       5 (sessions per point of the coverage curve)
-  CORES           empty (cores to use, named by their lowest CPU; commas and
-                  ranges allowed)
+  CORES           empty (cores to use, by their lowest CPU, e.g. 1-7,9)
   RESERVED_CORES  core 0 (cores not to use if CORES is empty)
-  TEST_TIMEOUT    5000 (milliseconds, set in jobs.conf like the fuzzer options)
+  The fuzzer options and TEST_TIMEOUT are set in jobs.conf.
 
 A start requires:
   - /proc/sys/kernel/randomize_va_space is 0 (with stateafl)
